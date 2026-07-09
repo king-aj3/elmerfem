@@ -222,11 +222,23 @@ SUBROUTINE PoissonSolver( Model,Solver,dt,TransientSimulation )
    END DO
 !$omp end parallel do
 
-!$omp parallel do private(i,j,k,nd) reduction(+:b)
+   ! Assemble the global RHS from the per-element force vectors. This used to
+   ! be an OpenMP "reduction(+:b)" on the ALLOCATABLE array b. gfortran's
+   ! array-reduction on an allocatable makes each thread a private allocatable
+   ! copy (allocate/zero/combine/deallocate); on the MSYS2/UCRT MinGW build
+   ! that machinery intermittently corrupts the heap, and the damage only
+   ! surfaces later as a SIGSEGV inside libgfortran's setlocale/malloc during
+   ! the next formatted WRITE (the post-solve ComputeChange norm print -- i.e.
+   ! the crash appears "after the last Linear System Timing line", with all
+   ! worker threads already parked). Reproduced ~1 in 400 runs at 4 threads,
+   ! 0 in 1600+ at 1 thread. A direct atomic scatter avoids the per-thread
+   ! allocatable copies entirely and is race-free for the shared-DOF conflicts.
+!$omp parallel do private(i,j,k,nd)
    DO i=1,SIZE(ed)
      nd = SIZE(ed(i) % dofIndeces)
      DO j=1,nd
        k = ed(i) % dofIndeces(j)
+!$omp atomic
        b(k) = b(k) + ed(i) % force(j)
      END DO
    END DO
