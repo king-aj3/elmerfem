@@ -36,7 +36,7 @@ SET(solverlib_SOURCES AddrFunc.F90 NavierStokes.F90 NavierStokesGeneral.F90
   Smoothers.F90 ClusteringMethods.F90 ParallelUtils.F90
   ParallelEigenSolve.F90 solve_cmplx.F90 solve_real.F90 MGPrec.F90
   DefUtils.F90 MeshPartition.F90 MeshRemeshing.F90 CutFEMUtils.F90
-  RadiationFactors.F90 f_stubs.c
+  RadiationFactors.F90 f_stubs.c GFortranLocaleFix.c
   ExchangeCorrelations.F90 SolveHypre.c amgx.c rocalution.cpp SolverActivate_x.F90
   SolveSuperLU.c
   umf4_f77wrapper.c VankaCreate.F90 ParticleUtils.F90 Feti.F90
