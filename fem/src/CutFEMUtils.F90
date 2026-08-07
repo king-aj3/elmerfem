@@ -3638,7 +3638,11 @@ CONTAINS
       Intersects(MyPE) % Found = WorkLog
       DEALLOCATE(WorkLog)
 
-      ALLOCATE(WorkInt(Size,4))
+      ! Size2, not Size: this routine shrinks the arrays to nIntersects, so
+      ! Size2 < Size is the normal case and both assignments below were
+      ! non-conformable. Harmless in an optimised build, but a hard abort
+      ! under -fcheck=bounds. The LS and Found blocks above already use Size2.
+      ALLOCATE(WorkInt(Size2,4))
       WorkInt = Intersects(MyPE) % Elements(1:Size2,:)
       DEALLOCATE(Intersects(MyPE) % Elements)
       ALLOCATE(Intersects(MyPE) % Elements(Size2,4))
@@ -3729,7 +3733,14 @@ CONTAINS
         DO j=1, PolylineData(k) % nLines
           IF(RemoveLines(k,j)) CYCLE
           counter = counter + 1
-          WorkInt2(k,j) = counter
+          ! Index by the neighbour slot i, not by the partition number k.
+          ! WorkInt2 has NNeighbours rows and is read below as
+          ! WorkInt2(PToN(...),...), i.e. also by neighbour slot. Writing at
+          ! row k wrote outside the array whenever a neighbour's partition
+          ! number exceeded NNeighbours, and put the renumbering in the wrong
+          ! row even when it happened to stay in bounds. Serial runs were
+          ! unaffected because there k == i == 1.
+          WorkInt2(i,j) = counter
         END DO
       END DO
 
@@ -3943,9 +3954,28 @@ CONTAINS
       END DO
         
       IF(nonzero) THEN
-        phip = mindist        
+        phip = mindist
       ELSE
         phip = sgn * SQRT(mindist2)
+      END IF
+
+      ! Nothing was accepted by the loop above, so "imin", "kmin", "smin" and
+      ! "dir_final" were never set. Everything below dereferences them, e.g. as
+      ! PolylineData(kmin) % Prev(imin,1), which is undefined behaviour. This
+      ! happens when no partition holds any polyline at all, and in the nonzero
+      ! branch also when every segment is skipped by the "cosphi > cosphi0"
+      ! test. Flag the node as untrusted and leave it to CheckLSField.
+      !
+      ! NOTE for review: "phip" is returned here as the sentinel it was
+      ! initialised to (mindist / mindist2 are still HUGE), and the caller
+      ! stores it when MovingLevelset is set. CheckLSField normally recomputes
+      ! untrusted nodes, but it can also decide it has "no choice but to trust"
+      ! one, in which case that sentinel would survive. A better fallback is
+      ! probably to keep the node's previous levelset value -- left alone here
+      ! because that is an algorithmic choice, not part of fixing the crash.
+      IF( m == 0 ) THEN
+        trusted = .FALSE.
+        RETURN
       END IF
 
       trusted = .TRUE.
@@ -4059,7 +4089,12 @@ CONTAINS
       u = VecCross2D(bma,r) / rxs
 
       IF(PRESENT(Buffer)) THEN
-        err_buffer = Buffer/rxs
+        ! ABS: rxs is a cross product and is negative for half of all segment
+        ! orientations. Without it a negative rxs flipped the sign of the
+        ! tolerance below, so the buffer tightened the test instead of
+        ! loosening it, purely depending on the winding of the two segments.
+        ! No caller passes Buffer at present, so this was latent.
+        err_buffer = Buffer/ABS(rxs)
       ELSE
         err_buffer = AEPS
       END IF
