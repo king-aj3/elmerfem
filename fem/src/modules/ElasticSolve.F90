@@ -975,7 +975,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 LocalStiffMatrix,LocalForce, LoadVector, InertialLoad, ElasticModulus, &
                 PoissonRatio,Density,Damping,AxialSymmetry,PlaneStress,HeatExpansionCoeff, &
                 LocalTemperature,CurrentElement,n,ntot,ElementNodes,LocalDisplacement, &
-                Isotropic, RotateModuli, TransformMatrix)
+                Isotropic, RotateModuli, TransformMatrix, LargeDeflection)
           END IF
         END IF
 
@@ -1361,7 +1361,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
      ELSE
         CALL ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, StressPerm, &
              PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, NeoHookeanMaterial, &
-             CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, MixedFormulation)
+             CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, MixedFormulation, &
+             LargeDeflection)
      END IF
   END IF
 
@@ -2155,7 +2156,8 @@ CONTAINS
   SUBROUTINE LocalMatrix( MassMatrix,DampMatrix,StiffMatrix,ForceVector, &
        LoadVector, InertialLoad, ElasticModulus, NodalPoisson, NodalDensity, NodalDamping, &
        AxialSymmetry,PlaneStress,NodalHeatExpansion, NodalTemperature, Element, n, ntot, &
-       Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix )
+       Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
+       LargeDeflection )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
@@ -2165,7 +2167,7 @@ CONTAINS
     REAL(KIND=dp) :: LocalDisplacement(:,:), TransformMatrix(3,3)
     REAL(KIND=dp), DIMENSION(:) :: ForceVector, NodalPoisson
 
-    LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli
+    LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli, LargeDeflection
 
     TYPE(Element_t) :: Element
     TYPE(Nodes_t) :: Nodes
@@ -2291,8 +2293,15 @@ CONTAINS
           ELSE           
              Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
           END IF
-          DefG = Identity + Grad
-          Strain = (TRANSPOSE(Grad)+Grad+MATMUL(TRANSPOSE(Grad),Grad))/2.0D0
+          ! Small strain keeps the reference and current configurations
+          ! coincident, which also makes DetDefG come out as one below.
+          IF (LargeDeflection) THEN
+             DefG = Identity + Grad
+          ELSE
+             DefG = Identity
+          END IF
+          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
+          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
           Stress2 = 2.0D0*Lame2*Strain + Lame1*TRACE(Strain,dim)*Identity
           Stress1 = MATMUL(DefG,Stress2)
 
@@ -2314,7 +2323,8 @@ CONTAINS
           dStrainU = (MATMUL(TRANSPOSE(DefG),dDefGU) &
                + MATMUL(TRANSPOSE(dDefGU),DefG))/2.0D0
           dStress2U = 2.0D0*Lame2*dStrainU + Lame1*TRACE(dStrainU,dim)*Identity
-          dStress1U = MATMUL(dDefGU,Stress2) + MATMUL(DefG,dStress2U)
+          dStress1U = MATMUL(DefG,dStress2U)
+          IF (LargeDeflection) dStress1U = dStress1U + MATMUL(dDefGU,Stress2)
 
           !----------------------------------------------------------------------------
           ! Loop over the test functions (stiffness matrix for Newton linearization):
@@ -2342,7 +2352,8 @@ CONTAINS
                 dStrain = (MATMUL(TRANSPOSE(DefG),dDefG) &
                      + MATMUL(TRANSPOSE(dDefG),DefG))/2.0D0
                 dStress2 = 2.0D0*Lame2*dStrain + Lame1*TRACE(dStrain,dim)*Identity
-                dStress1 = MATMUL(dDefG,Stress2) + MATMUL(DefG,dStress2)
+                dStress1 = MATMUL(DefG,dStress2)
+                IF (LargeDeflection) dStress1 = dStress1 + MATMUL(dDefG,Stress2)
 
                 IF (AxialSymmetry) THEN
 
@@ -2412,8 +2423,15 @@ CONTAINS
           ! Compute the formulation variables for the current solution iterate
           !--------------------------------------------------------------------
           Grad = MATMUL(LocalDisplacement(:,1:ntot),dBasisdx)
-          DefG = Identity + Grad
-          Strain = (TRANSPOSE(Grad)+Grad+MATMUL(TRANSPOSE(Grad),Grad))/2.0D0
+          ! Small strain keeps the reference and current configurations
+          ! coincident, which also makes DetDefG come out as one below.
+          IF (LargeDeflection) THEN
+             DefG = Identity + Grad
+          ELSE
+             DefG = Identity
+          END IF
+          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
+          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
 
           SELECT CASE( dim )
           CASE( 1 )
@@ -2448,7 +2466,8 @@ CONTAINS
           ! dStress1U presents the derivative term DS(F_k)[grad u_k] with
           ! S the first  Piola-Kirchhoff stress
           !-------------------------------------------------------------
-          dStress1U = MATMUL(Grad,Stress2) + MATMUL(DefG,dStress2U)
+          dStress1U = MATMUL(DefG,dStress2U)
+          IF (LargeDeflection) dStress1U = dStress1U + MATMUL(Grad,Stress2)
 
           !---------------------------------------------------------
           ! Newton iteration:
@@ -2476,7 +2495,8 @@ CONTAINS
                 ! the derivative DS(F_k)[grad u_{k+1}] with S the first  
                 ! Piola-Kirchhoff stress.
                 !-------------------------------------------------------------
-                dStress1 = MATMUL(Grad,Stress2) + MATMUL(DefG,dStress2)
+             dStress1 = MATMUL(DefG,dStress2)
+             IF (LargeDeflection) dStress1 = dStress1 + MATMUL(Grad,Stress2)
 
                 ForceVector(dim*(p-1)+i) = ForceVector(dim*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
@@ -3860,13 +3880,13 @@ CONTAINS
   SUBROUTINE ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, Perm, &
        PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, &
        NeoHookeanMaterial, CalculateStrains, CalculateStresses, CalcPrincipal, &
-       CalcPrincipalAngle, MixedFormulation)
+       CalcPrincipalAngle, MixedFormulation, LargeDeflection)
 !--------------------------------------------------------------------------------
     REAL(KIND=dp) :: Displacement(:), NodalStrain(:), NodalStress(:), VonMises(:), &
          PrincipalStress(:), PrincipalStrain(:), Tresca(:), PrincipalAngle(:) 
     INTEGER, POINTER :: Perm(:)
     LOGICAL :: CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, &
-         NeoHookeanMaterial, AxialSymmetry, MixedFormulation
+         NeoHookeanMaterial, AxialSymmetry, MixedFormulation, LargeDeflection
 !--------------------------------------------------------------------------------
     TYPE(Solver_t), POINTER :: StSolver
     TYPE(Nodes_t) :: Nodes
@@ -4161,7 +4181,11 @@ CONTAINS
              r = SUM(Basis(1:n) * Nodes % x(1:n))
              Grad(3,3) = 1.0d0/r * SUM(LocalDisplacement(1,1:nd) * Basis(1:nd))
           END IF
-          DefG = Identity + Grad
+          IF (LargeDeflection) THEN
+             DefG = Identity + Grad
+          ELSE
+             DefG = Identity
+          END IF
 
           SELECT CASE( dim )
           CASE( 1 )
@@ -4174,7 +4198,8 @@ CONTAINS
                   DefG(1,3) * ( DefG(2,1)*DefG(3,2) - DefG(2,2)*DefG(3,1) )
           END SELECT
 
-          Strain = (TRANSPOSE(Grad)+Grad+MATMUL(TRANSPOSE(Grad),Grad))/2.0D0
+          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
+          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
           IF (Isotropic .AND. PlaneStress) &
                Strain(3,3) = -nu/(1.0d0-nu)*(Strain(1,1)+Strain(2,2))
 
