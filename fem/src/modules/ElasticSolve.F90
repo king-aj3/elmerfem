@@ -3336,8 +3336,20 @@ CONTAINS
          Basis(n), &
          dBasisdx(n,3) )
 
-    IF (FirstTime) THEN
-       ALLOCATE( StSolver )
+    ! The saved matrix and permutation describe the mesh we last ran on. After a
+    ! refinement they are stale, and gluing element contributions into them
+    ! corrupts memory, so rebuild. As in ComputeStress the auxiliary solver object
+    ! is kept and reassigned rather than freed: the variable added below records it
+    ! as its owner, and VariableGet dereferences that owner
+    ! (ListGetString(PVar % Solver % Values,'Equation')), so releasing it would
+    ! leave the previous mesh's variable list pointing at freed memory.
+    IF ( FirstTime .OR. Solver % MeshChanged ) THEN
+       IF ( FirstTime ) THEN
+          ALLOCATE( StSolver )
+       ELSE
+          IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
+          CALL FreeMatrix( StSolver % Matrix )
+       END IF
        StSolver = Solver
 
        ALLOCATE( Permutation( SIZE(Solver % Variable % Perm) ) )
@@ -3606,8 +3618,14 @@ CONTAINS
          SForce(6*n), &
          Basis(n) )
 
-    IF (FirstTime) THEN
-       ALLOCATE( StSolver )
+    ! Rebuilt on mesh change -- see the note in GenerateStrainVariable.
+    IF ( FirstTime .OR. Solver % MeshChanged ) THEN
+       IF ( FirstTime ) THEN
+          ALLOCATE( StSolver )
+       ELSE
+          IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
+          CALL FreeMatrix( StSolver % Matrix )
+       END IF
        StSolver = Solver
 
        ALLOCATE( Permutation( SIZE(Solver % Variable % Perm) ) )
@@ -3896,8 +3914,15 @@ CONTAINS
          NodalLame1(n), &
          NodalLame2(n) )   
 
-    IF (FirstTime) THEN
-       ALLOCATE( StSolver )
+    ! Rebuilt on mesh change -- see the note in GenerateStrainVariable.
+    IF ( FirstTime .OR. Solver % MeshChanged ) THEN
+       IF ( FirstTime ) THEN
+          ALLOCATE( StSolver )
+       ELSE
+          IF ( ALLOCATED(ForceG) ) DEALLOCATE( ForceG )
+          IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
+          CALL FreeMatrix( StSolver % Matrix )
+       END IF
        StSolver = Solver
 
        ALLOCATE( Permutation( SIZE(Solver % Variable % Perm) ) )
