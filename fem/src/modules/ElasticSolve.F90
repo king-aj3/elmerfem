@@ -3304,6 +3304,7 @@ CONTAINS
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
     LOGICAL :: Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize
+    LOGICAL :: SkipChange, FoundSkipChange
     INTEGER, POINTER :: Permutation(:), Indices(:)
     INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(9), StrainDim
 
@@ -3494,6 +3495,8 @@ CONTAINS
     CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
     CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
 
+    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
+        FoundSkipChange )
     CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
     n = SIZE(StSolver % Variable % Values)
 
@@ -3552,7 +3555,11 @@ CONTAINS
        CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
     END IF
 
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .FALSE.)
+    IF ( FoundSkipChange ) THEN
+       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
+    ELSE
+       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
+    END IF
 
     DEALLOCATE( Indices, &
          LocalDisplacement, &
@@ -3590,6 +3597,7 @@ CONTAINS
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
     LOGICAL :: Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize
+    LOGICAL :: SkipChange, FoundSkipChange
 
     INTEGER, POINTER :: Permutation(:), Indices(:)
     INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(6) 
@@ -3768,6 +3776,8 @@ CONTAINS
     CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
     CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
 
+    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
+        FoundSkipChange )
     CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
 
     n = SIZE(StSolver % Variable % Values)
@@ -3825,7 +3835,11 @@ CONTAINS
        CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
     END IF
 
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .FALSE.)
+    IF ( FoundSkipChange ) THEN
+       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
+    ELSE
+       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
+    END IF
 
     DEALLOCATE( Indices, &
          MASS, &
@@ -3875,6 +3889,7 @@ CONTAINS
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, &
          Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize, PlaneStress, &
+         SkipChange, FoundSkipChange, &
          Isotropic, UseMask, LimiterOn, ContactOn, ResidualOn
 
     CHARACTER(LEN=MAX_NAME_LEN) :: eqname
@@ -4265,6 +4280,8 @@ CONTAINS
 
     CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
     CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
+    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
+        FoundSkipChange )
     CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
 
     n = SIZE(StSolver % Variable % Values)
@@ -4413,7 +4430,11 @@ CONTAINS
     ELSE
        CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
     END IF
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .FALSE.)
+    IF ( FoundSkipChange ) THEN
+       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
+    ELSE
+       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
+    END IF
 
 
     !----------------------------------------------
