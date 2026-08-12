@@ -1175,7 +1175,7 @@ CONTAINS
      INTEGER :: i,j,p,q,ic
      LOGICAL :: Found, Incompressible, FirstTime=.TRUE., PreBuiltC
      REAL(KIND=dp) :: C(6,6), Young, LGrad(3,3), Poisson, S(6), &
-          Pressure, Radius, HEXP(3,3)
+          Pressure, Radius, HEXP(3,3), EzzC(3)
      TYPE(ValueHandle_t), SAVE :: BetaIP_h, EIP_h, nuIP_h, Load_h(4), Load_h_im(4)
      TYPE(Element_t), POINTER :: Element
      CHARACTER :: DimensionString
@@ -1243,6 +1243,8 @@ CONTAINS
      PreBuiltC = .FALSE.
      IF ( PRESENT(argC) ) PreBuiltC = Isotropic(1)
 
+     EzzC = 0.0_dp
+
      IF ( PreBuiltC ) THEN
        C = argC
        Young = argYoung
@@ -1306,6 +1308,14 @@ CONTAINS
             END IF
          ELSE
             IF ( PlaneStress ) THEN
+!              Coefficients recovering the out-of-plane strain from the in-plane
+!              ones, from the plane stress condition Stress_zz = 0. Taken before
+!              the condensation below overwrites the out-of-plane row. The third
+!              multiplies the engineering shear, which is how C is indexed.
+               EzzC(1) = -C(3,1) / C(3,3)
+               EzzC(2) = -C(3,2) / C(3,3)
+               EzzC(3) = -C(3,4) / C(3,3)
+
                C(1,1) = C(1,1) - C(1,3) * C(3,1) / C(3,3)
                C(1,2) = C(1,2) - C(1,3) * C(2,3) / C(3,3)
                C(2,1) = C(2,1) - C(2,3) * C(1,3) / C(3,3)
@@ -1366,11 +1376,25 @@ CONTAINS
        CALL Strain2Stress( Stress, Strain, C, dim, CSymmetry )
      END IF
 
-     IF ( dim==2 .AND. .NOT. CSymmetry .AND. .NOT. PlaneStress ) THEN
-        S(1) = Strain(1,1)
-        S(2) = Strain(2,2)
-        S(3) = Strain(1,2)
-        Stress(3,3) = Stress(3,3) + SUM( C(4,1:3) * S(1:3) )
+!    In two dimensions one out-of-plane component is not carried by the plane
+!    system but is still determined by it, and which one depends on the
+!    assumption: plane strain leaves Stress_zz to be recovered, plane stress
+!    leaves Strain_zz. Neither does any virtual work here -- the plane weak form
+!    cannot see them -- but both are reportable, so fill them in for output.
+     IF ( dim==2 .AND. .NOT. CSymmetry ) THEN
+       IF ( .NOT. PlaneStress ) THEN
+         S(1) = Strain(1,1)
+         S(2) = Strain(2,2)
+         S(3) = Strain(1,2)
+         Stress(3,3) = Stress(3,3) + SUM( C(4,1:3) * S(1:3) )
+       ELSE
+         IF ( Isotropic(1) ) THEN
+           Strain(3,3) = -Poisson / ( 1.0_dp - Poisson ) * ( Strain(1,1) + Strain(2,2) )
+         ELSE
+           Strain(3,3) = EzzC(1) * Strain(1,1) + EzzC(2) * Strain(2,2) + &
+               EzzC(3) * 2.0_dp * Strain(1,2)
+         END IF
+       END IF
      END IF
    END SUBROUTINE LocalStress
 !------------------------------------------------------------------------------
@@ -1431,10 +1455,107 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
-!> Number of independent components of a symmetric stress tensor, i.e. the length
-!> of the vector that Tensor26Vector fills and Vector62Tensor reads back:
-!> (11,22,12) in plane, (11,22,33,12) in axisymmetric and (11,22,33,12,23,13) in
-!> three dimensions.
+!> Number of components of a stress or strain field written out for the user, in
+!> the order (11,22,33,12) in two dimensions and (11,22,33,12,23,13) in three --
+!> the same order truncated, so IND maps into both.
+!>
+!> This is deliberately NOT SymTensorComponents, which answers a different
+!> question. That one gives the length of the vector the weak form contracts, and
+!> so drops the out-of-plane component in the plane case, where it does no virtual
+!> work. Here the question is what is *reportable*, and the out-of-plane component
+!> very much is: in plane strain Stress_zz is nonzero and of the same order as
+!> Stress_xx, and in plane stress Strain_zz is. Only the 23 and 13 shears are
+!> identically zero in two dimensions, so 6 -> 4 is the whole of the reduction.
+!------------------------------------------------------------------------------
+   FUNCTION SymTensorOutputComponents( dim ) RESULT( ncomp )
+!------------------------------------------------------------------------------
+     INTEGER :: dim, ncomp
+!------------------------------------------------------------------------------
+     ncomp = MERGE( 4, 6, dim <= 2 )
+!------------------------------------------------------------------------------
+   END FUNCTION SymTensorOutputComponents
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The tensor index pair a stored slot corresponds to, as "11", "23" and so on,
+!> for progress messages. Slot 3 is always the out-of-plane component, which under
+!> axial symmetry is the hoop.
+!------------------------------------------------------------------------------
+   FUNCTION SymTensorComponentName( slot ) RESULT( Name )
+!------------------------------------------------------------------------------
+     INTEGER :: slot
+     CHARACTER(LEN=2) :: Name
+!------------------------------------------------------------------------------
+     CHARACTER(LEN=2), PARAMETER :: Names(6) = [ '11','22','33','12','23','13' ]
+!------------------------------------------------------------------------------
+     Name = Names(slot)
+!------------------------------------------------------------------------------
+   END FUNCTION SymTensorComponentName
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The "Exported Variable" definition of a stress or strain field, naming exactly
+!> the components SymTensorOutputComponents keeps, in that order. Built here so
+!> that the declaration and the assembly that indexes into it cannot drift apart.
+!------------------------------------------------------------------------------
+   FUNCTION StressFieldDefinition( Name, dim ) RESULT( Str )
+!------------------------------------------------------------------------------
+     CHARACTER(LEN=*) :: Name
+     INTEGER :: dim
+     CHARACTER(LEN=MAX_NAME_LEN) :: Str
+!------------------------------------------------------------------------------
+     CHARACTER(LEN=2), PARAMETER :: Comp(6) = [ 'xx','yy','zz','xy','yz','xz' ]
+     INTEGER :: i, ncomp
+!------------------------------------------------------------------------------
+     ncomp = SymTensorOutputComponents( dim )
+
+     Str = TRIM(Name)//'['//TRIM(Name)//'_'//Comp(1)//':1'
+     DO i=2,ncomp
+       Str = TRIM(Str)//' '//TRIM(Name)//'_'//Comp(i)//':1'
+     END DO
+     Str = TRIM(Str)//']'
+!------------------------------------------------------------------------------
+   END FUNCTION StressFieldDefinition
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Expand one node's stored components, as laid out by SymTensorOutputComponents,
+!> back into a full 3x3 tensor. V is that node's slice alone. A slot the layout
+!> does not carry is one that is identically zero, so it reads back as zero and
+!> the tensor is fully defined either way.
+!------------------------------------------------------------------------------
+   SUBROUTINE OutputVector2Tensor( V, ncomp, T )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: V(:), T(3,3)
+     INTEGER :: ncomp
+!------------------------------------------------------------------------------
+     INTEGER, PARAMETER :: IND(9) = [ 1,4,6,4,2,5,6,5,3 ]
+     INTEGER :: i,j,p,k
+!------------------------------------------------------------------------------
+     T = 0.0_dp
+     p = 0
+     DO i=1,3
+       DO j=1,3
+         p = p + 1
+         k = IND(p)
+         IF ( k <= ncomp ) T(i,j) = V(k)
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE OutputVector2Tensor
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Number of independent components of a symmetric stress tensor as the weak form
+!> sees it, i.e. the length of the vector that Tensor26Vector fills and
+!> Vector62Tensor reads back: (11,22,12) in plane, (11,22,33,12) in axisymmetric
+!> and (11,22,33,12,23,13) in three dimensions. The plane case has no out-of-plane
+!> entry because BuildGMatrix has no column for one -- see
+!> SymTensorOutputComponents for the layout used when writing fields out.
 !------------------------------------------------------------------------------
    FUNCTION SymTensorComponents( dim, CSymmetry ) RESULT( ncomp )
 !------------------------------------------------------------------------------

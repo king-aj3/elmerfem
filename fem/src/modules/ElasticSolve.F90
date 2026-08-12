@@ -70,6 +70,7 @@ END SUBROUTINE ElasticSolver_Init0
 SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
   USE DefUtils
+  USE StressLocal, ONLY: StressFieldDefinition
   IMPLICIT NONE
 
   TYPE(Model_t)  :: Model
@@ -138,15 +139,13 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
 
 
   IF ( CalculateStresses ) THEN
-     IF (AxialSymmetry) THEN
-        CALL ListAddString( SolverParams,&
-             NextFreeKeyword('Exported Variable ',SolverParams), &
-             'Stress[Stress_xx:1 Stress_zz:1 Stress_yy:1 Stress_xy:1]' )
-     ELSE
-        CALL ListAddString( SolverParams,&
-             NextFreeKeyword('Exported Variable ',SolverParams), &
-             'Stress[Stress_xx:1 Stress_yy:1 Stress_zz:1 Stress_xy:1 Stress_yz:1 Stress_xz:1]' )
-     END IF
+     ! One layout for every 2D case, axisymmetric or not, and the same one
+     ! StressSolve writes: (11,22,33,12) with the 23 and 13 shears dropped, those
+     ! being identically zero in two dimensions. The out-of-plane 33 is kept, and
+     ! is the hoop component under axial symmetry.
+     CALL ListAddString( SolverParams,&
+          NextFreeKeyword('Exported Variable ',SolverParams), &
+          TRIM(StressFieldDefinition('Stress',dim)) )
 
      CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), 'vonMises' )
@@ -168,15 +167,9 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
   END IF
 
   IF (CalculateStrains) THEN
-     IF (AxialSymmetry) THEN
-        CALL ListAddString( SolverParams,&
-             NextFreeKeyword('Exported Variable ',SolverParams), &
-             'Strain[Strain_xx:1 Strain_zz:1 Strain_yy:1 Strain_xy:1]' )
-     ELSE
-        CALL ListAddString( SolverParams,&
-             NextFreeKeyword('Exported Variable ',SolverParams), &
-             'Strain[Strain_xx:1 Strain_yy:1 Strain_zz:1 Strain_xy:1 Strain_yz:1 Strain_xz:1]' )
-     END IF
+     CALL ListAddString( SolverParams,&
+          NextFreeKeyword('Exported Variable ',SolverParams), &
+          TRIM(StressFieldDefinition('Strain',dim)) )
 
      IF (CalcPrincipalStrain) THEN
         CALL ListAddString( SolverParams,&
@@ -3380,11 +3373,9 @@ CONTAINS
 
     IF ( Rebuilt ) THEN
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
-       IF (AxialSymmetry) THEN
-          StrainDim = 4
-       ELSE
-          StrainDim = 6
-       END IF
+       ! Note this asks the mesh dimension, not the local "dim" above, which is the
+       ! dimensionality of the strain state and is forced to 3 off the axis.
+       StrainDim = SymTensorOutputComponents( CoordinateSystemDimension() )
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
     END IF
 
@@ -3395,8 +3386,10 @@ CONTAINS
     NodalStrain = 0.0d0
     SForceG = 0.0d0
 
+    ! Slots (11,22,33,12), the axial direction being 22 and the hoop the
+    ! out-of-plane 33, which is the tensor's (3,3) and is added separately below.
     IF (AxialSymmetry) THEN
-       Ind = (/ 1, 4, 4, 3, 0, 0, 0, 0, 0 /)
+       Ind = (/ 1, 4, 4, 2, 0, 0, 0, 0, 0 /)
     ELSE
        Ind = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
     END IF
@@ -3459,11 +3452,12 @@ CONTAINS
              DO i=1,dim
                 DO j=i,dim
                    k = Ind( dim*(i-1)+j )
+                   IF ( k > StrainDim ) CYCLE
                    SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
                 END DO
              END DO
              IF (AxialSymmetry) &
-                  SForce(StrainDim*(p-1)+2) = SForce(StrainDim*(p-1)+2) + Weight * Strain(3,3) * Basis(p)
+                  SForce(StrainDim*(p-1)+3) = SForce(StrainDim*(p-1)+3) + Weight * Strain(3,3) * Basis(p)
           END DO
        END DO
 
@@ -3498,34 +3492,10 @@ CONTAINS
     CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
     n = SIZE(StSolver % Variable % Values)
 
+    ! The names no longer branch on the coordinate system, there being one layout:
+    ! slot 3 is the out-of-plane component, the hoop under axial symmetry.
     DO i=1,StrainDim
-       IF (AxialSymmetry) THEN
-          SELECT CASE(i)
-          CASE(1)
-             CALL Info(Caller,'Strain Component 11',Level=5)
-          CASE(2)
-             CALL Info(Caller,'Strain Component 33',Level=5)
-          CASE(3)
-             CALL Info(Caller,'Strain Component 22',Level=5)                
-          CASE(4)
-             CALL Info(Caller,'Strain Component 12',Level=5)              
-          END SELECT
-       ELSE
-          SELECT CASE(i)
-          CASE(1)
-             CALL Info(Caller,'Strain Component 11',Level=5)
-          CASE(2)
-             CALL Info(Caller,'Strain Component 22',Level=5)
-          CASE(3)
-             CALL Info(Caller,'Strain Component 33',Level=5)                
-          CASE(4)
-             CALL Info(Caller,'Strain Component 12',Level=5)
-          CASE(5)
-             CALL Info(Caller,'Strain Component 23',Level=5)                
-          CASE(6)
-             CALL Info(Caller,'Strain Component 13',Level=5)
-          END SELECT
-       END IF
+       CALL Info(Caller,'Strain Component '//SymTensorComponentName(i),Level=5)
 
        StSolver % Matrix % RHS = SForceG(i::StrainDim)
        StSolver % Variable % Values = 0.0d0
@@ -3598,7 +3568,7 @@ CONTAINS
 
     INTEGER, POINTER :: Permutation(:), Indices(:)
     INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(6) 
-    INTEGER :: StressDim, StressDofs, StressComponents
+    INTEGER :: StressDim, StressDofs
     INTEGER :: ipindex
 
     REAL(KIND=dp), POINTER :: StressTemp(:)
@@ -3613,7 +3583,7 @@ CONTAINS
     LOGICAL :: Rebuilt
 
     SAVE Force, SForceG, Nodes
-    SAVE StressDim, StressComponents
+    SAVE StressDim
  !--------------------------------------------------------------------------------------------
     IF (.NOT. CalculateStress) RETURN
 
@@ -3641,20 +3611,11 @@ CONTAINS
     IF ( Rebuilt ) THEN
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
 
-       IF (AxialSymmetry .OR. dim == 2 ) THEN
-          StressDim = 4
-       ELSE
-          StressDim = 6
-       END IF
-
-       ! The number of components in the variable "Stress" 
-       ! (TO DO: Reduce the size of "Stress" for 2D cases without axial symmetry
-       ! to avoid the difference in StressDim/StressComponents):
-       IF (AxialSymmetry) THEN
-          StressComponents = 4
-       ELSE
-          StressComponents = 6
-       END IF       
+       ! One count now, where there used to be a StressDim of 4 in any 2D case
+       ! written into a StressComponents-wide variable that was 6 unless
+       ! axisymmetric -- so a plane case left two slots permanently unwritten.
+       ! That mismatch was this routine's own TO DO and it is what is gone.
+       StressDim = SymTensorOutputComponents( dim )
 
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StressDim) )
     END IF
@@ -3667,8 +3628,12 @@ CONTAINS
     NodalStress = 0.0d0
     SForceG = 0.0d0
 
+    ! Maps an output slot onto the UmatStress slot it is read from. The UMAT keeps
+    ! its own order -- (rr,hoop,axial,rz) under axial symmetry, (11,22,33,12,13,23)
+    ! otherwise -- while the output is (11,22,33,12,23,13) with 33 out-of-plane, so
+    ! axisymmetry swaps the hoop and axial slots and 3D the last two shears.
     IF (AxialSymmetry) THEN
-       Ind = (/ 1, 2, 3, 4, 5, 6 /)
+       Ind = (/ 1, 3, 2, 4, 5, 6 /)
     ELSE
        Ind = (/ 1, 2, 3, 4, 6, 5 /)
     END IF
@@ -3758,33 +3723,7 @@ CONTAINS
 
     n = SIZE(StSolver % Variable % Values)
     DO i=1,StressDim
-       IF (AxialSymmetry) THEN
-          SELECT CASE(i)
-          CASE(1)
-             CALL Info(Caller,'Stress Component 11',Level=5)
-          CASE(2)
-             CALL Info(Caller,'Stress Component 33',Level=5)
-          CASE(3)
-             CALL Info(Caller,'Stress Component 22',Level=5)                
-          CASE(4)
-             CALL Info(Caller,'Stress Component 12',Level=5)              
-          END SELECT
-       ELSE
-          SELECT CASE(i)
-          CASE(1)
-             CALL Info(Caller,'Stress Component 11',Level=5)
-          CASE(2)
-             CALL Info(Caller,'Stress Component 22',Level=5)
-          CASE(3)
-             CALL Info(Caller,'Stress Component 33',Level=5)                
-          CASE(4)
-             CALL Info(Caller,'Stress Component 12',Level=5)
-          CASE(5)
-             CALL Info(Caller,'Stress Component 23',Level=5)                
-          CASE(6)
-             CALL Info(Caller,'Stress Component 13',Level=5)
-          END SELECT
-       END IF
+       CALL Info(Caller,'Stress Component '//SymTensorComponentName(i),Level=5)
 
        StSolver % Matrix % RHS = SForceG(i::StressDim)
        StSolver % Variable % Values = 0.0d0
@@ -3795,7 +3734,7 @@ CONTAINS
 
        DO l=1,SIZE( Permutation )
           IF ( Permutation(l) <= 0 ) CYCLE
-          NodalStress(StressComponents*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
+          NodalStress(StressDim*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
        END DO
     END DO
 
@@ -3926,11 +3865,9 @@ CONTAINS
        IF ( ALLOCATED(ForceG) ) DEALLOCATE( ForceG )
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
 
-       IF (AxialSymmetry) THEN
-          StrainDim = 4
-       ELSE
-          StrainDim = 6
-       END IF
+       ! The mesh dimension, not the local "dim" above, which is the stress state's
+       ! and is forced to 3 on the axis.
+       StrainDim = SymTensorOutputComponents( cdim )
 
        IF (CalculateStrains) ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
        IF (CalculateStresses) ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
@@ -3942,8 +3879,10 @@ CONTAINS
     ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
     ! until NodalProjectorEnd.
     CALL NodalProjectorBegin( Proj, Solver )
+    ! Slots (11,22,33,12): the axial direction is 22 and the hoop the out-of-plane
+    ! 33, which is the tensor's (3,3) and is added separately in the loop.
     IF (AxialSymmetry) THEN
-       Ind = (/ 1, 4, 4, 3, 0, 0, 0, 0, 0 /)
+       Ind = (/ 1, 4, 4, 2, 0, 0, 0, 0, 0 /)
     ELSE
        Ind = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
     END IF
@@ -4158,31 +4097,36 @@ CONTAINS
                 Mass(p,q) = Mass(p,q) + Weight * Basis(q) * Basis(p)
              END DO
 
+             ! Strides are StrainDim throughout: 4 in any 2D case, 6 in 3D. Off the
+             ! axis the tensor loop still covers all six pairs and the two shears
+             ! the 2D layout does not carry -- identically zero there -- are
+             ! skipped. The out-of-plane 33 is kept in both branches.
              IF (AxialSymmetry) THEN
                 IF (CalculateStrains) THEN
                    DO i=1,2
                       DO j=i,2
                          k = Ind( 2*(i-1)+j )
-                         Force(4*(p-1)+k) = Force(4*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
+                         Force(StrainDim*(p-1)+k) = Force(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
                       END DO
                    END DO
-                   Force(4*(p-1)+2) = Force(4*(p-1)+2) + Weight * Strain(3,3) * Basis(p)
+                   Force(StrainDim*(p-1)+3) = Force(StrainDim*(p-1)+3) + Weight * Strain(3,3) * Basis(p)
                 END IF
                 IF (CalculateStresses) THEN
                    DO i=1,2
                       DO j=i,2
                          k = Ind( 2*(i-1)+j )
-                         SForce(4*(p-1)+k) = SForce(4*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
+                         SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
                       END DO
                    END DO
-                   SForce(4*(p-1)+2) = SForce(4*(p-1)+2) + Weight * Stress(3,3) * Basis(p)
+                   SForce(StrainDim*(p-1)+3) = SForce(StrainDim*(p-1)+3) + Weight * Stress(3,3) * Basis(p)
                 END IF
              ELSE
                 IF (CalculateStrains) THEN
                    DO i=1,3
                       DO j=i,3
                          k = Ind( 3*(i-1)+j )
-                         Force(6*(p-1)+k) = Force(6*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
+                         IF ( k > StrainDim ) CYCLE
+                         Force(StrainDim*(p-1)+k) = Force(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
                       END DO
                    END DO
                 END IF
@@ -4190,7 +4134,8 @@ CONTAINS
                    DO i=1,3
                       DO j=i,3
                          k = Ind( 3*(i-1)+j )
-                         SForce(6*(p-1)+k) = SForce(6*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
+                         IF ( k > StrainDim ) CYCLE
+                         SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
                       END DO
                    END DO
                 END IF
@@ -4240,33 +4185,7 @@ CONTAINS
     IF (CalculateStrains) THEN
        CALL Info(Caller,'Calculating strain components',Level=7)
        DO i=1,StrainDim
-          IF (AxialSymmetry) THEN
-             SELECT CASE(i)
-             CASE(1)
-                CALL Info(Caller,'Strain Component 11',Level=5)
-             CASE(2)
-                CALL Info(Caller,'Strain Component 33',Level=5)
-             CASE(3)
-                CALL Info(Caller,'Strain Component 22',Level=5)                
-             CASE(4)
-                CALL Info(Caller,'Strain Component 12',Level=5)              
-             END SELECT
-          ELSE
-             SELECT CASE(i)
-             CASE(1)
-                CALL Info(Caller,'Strain Component 11',Level=5)
-             CASE(2)
-                CALL Info(Caller,'Strain Component 22',Level=5)
-             CASE(3)
-                CALL Info(Caller,'Strain Component 33',Level=5)                
-             CASE(4)
-                CALL Info(Caller,'Strain Component 12',Level=5)
-             CASE(5)
-                CALL Info(Caller,'Strain Component 23',Level=5)                
-             CASE(6)
-                CALL Info(Caller,'Strain Component 13',Level=5)
-             END SELECT
-          END IF
+          CALL Info(Caller,'Strain Component '//SymTensorComponentName(i),Level=5)
 
           StSolver % Matrix % RHS = ForceG(i::StrainDim)
           StSolver % Variable % Values = 0.0d0
@@ -4285,33 +4204,7 @@ CONTAINS
     IF (CalculateStresses) THEN
        CALL Info(Caller,'Calculating stress components',Level=7)
        DO i=1,StrainDim
-          IF (AxialSymmetry) THEN
-             SELECT CASE(i)
-             CASE(1)
-                CALL Info(Caller,'Stress Component 11',Level=5)
-             CASE(2)
-                CALL Info(Caller,'Stress Component 33',Level=5)
-             CASE(3)
-                CALL Info(Caller,'Stress Component 22',Level=5)                
-             CASE(4)
-                CALL Info(Caller,'Stress Component 12',Level=5)              
-             END SELECT
-          ELSE
-             SELECT CASE(i)
-             CASE(1)
-                CALL Info(Caller,'Stress Component 11',Level=5)
-             CASE(2)
-                CALL Info(Caller,'Stress Component 22',Level=5)
-             CASE(3)
-                CALL Info(Caller,'Stress Component 33',Level=5)                
-             CASE(4)
-                CALL Info(Caller,'Stress Component 12',Level=5)
-             CASE(5)
-                CALL Info(Caller,'Stress Component 23',Level=5)                
-             CASE(6)
-                CALL Info(Caller,'Stress Component 13',Level=5)
-             END SELECT
-          END IF
+          CALL Info(Caller,'Stress Component '//SymTensorComponentName(i),Level=5)
 
           StSolver % Matrix % RHS = SForceG(i::StrainDim)
           StSolver % Variable % Values = 0.0d0
@@ -4335,27 +4228,8 @@ CONTAINS
        DO i=1,SIZE( Perm )
           IF ( Perm(i) <= 0 ) CYCLE
 
-          IF (AxialSymmetry) THEN
-             p = 0
-             DO j=1,2
-                DO k=1,2
-                   p = p + 1
-                   q = 4 * (Perm(i)-1) + IND(p)
-                   Stress(j,k) = NodalStress(q)
-                END DO
-             END DO
-             q = 4 * (Perm(i)-1) + 2
-             Stress(3,3) = NodalStress(q)
-          ELSE
-             p = 0
-             DO j=1,3
-                DO k=1,3
-                   p = p + 1
-                   q = 6 * (Perm(i)-1) + IND(p)
-                   Stress(j,k) = NodalStress(q)
-                END DO
-             END DO
-          END IF
+          q = StrainDim * (Perm(i)-1)
+          CALL OutputVector2Tensor( NodalStress(q+1:q+StrainDim), StrainDim, Stress )
 
           Stress(:,:) = Stress(:,:) - TRACE(Stress(:,:),3) * Identity/3
           DO j=1,3
@@ -4393,33 +4267,9 @@ CONTAINS
        CALL Info(Caller,'Calculating principal stresses',Level=7)
        PriCache = 0.0d0
        DO i=1,SIZE( Perm )
-          IF ( Perm(i) <= 0 ) CYCLE       
-          IF (AxialSymmetry) THEN
-             DO j=1,4
-                q = 4 * (Perm(i)-1) + j
-                IF (j==4) THEN
-                   PriCache(1,3) = NodalStress(q)
-                ELSE
-                   PriCache(j,j) = NodalStress(q)
-                END IF
-             END DO
-          ELSE          
-             DO j=1,6
-                q = 6 * (Perm(i)-1) + j
-                IF (j>3) THEN
-                   SELECT CASE(j)
-                   CASE(4)
-                      PriCache(1,2) = NodalStress(q)
-                   CASE(5)
-                      PriCache(2,3) = NodalStress(q)
-                   CASE(6)
-                      PriCache(1,3) = NodalStress(q)
-                   END SELECT
-                ELSE
-                   PriCache(j,j) = NodalStress(q)
-                END IF
-             END DO
-          END IF
+          IF ( Perm(i) <= 0 ) CYCLE
+          q = StrainDim * (Perm(i)-1)
+          CALL OutputVector2Tensor( NodalStress(q+1:q+StrainDim), StrainDim, PriCache )
 
           !-----------------------------------------------------------------------------
           ! Use lapack to solve the eigenvalues (i.e. the principal stresses)
@@ -4461,32 +4311,8 @@ CONTAINS
        PriCache = 0.0d0
        DO i=1,SIZE( Perm )
           IF ( Perm(i) <= 0 ) CYCLE
-          IF (AxialSymmetry) THEN
-             DO j=1,4
-                q = 4 * (Perm(i)-1) + j
-                IF (j==4) THEN
-                   PriCache(1,3) = NodalStrain(q)
-                ELSE
-                   PriCache(j,j) = NodalStrain(q)
-                END IF
-             END DO
-          ELSE
-             DO j=1,6
-                q = 6 * (Perm(i)-1) + j
-                IF (j>3) THEN
-                   SELECT CASE(j)
-                   CASE(4)
-                      PriCache(1,2) = NodalStrain(q)
-                   CASE(5)
-                      PriCache(2,3) = NodalStrain(q)
-                   CASE(6)
-                      PriCache(1,3) = NodalStrain(q)
-                   END SELECT
-                ELSE
-                   PriCache(j,j) = NodalStrain(q)
-                END IF
-             END DO
-          END IF
+          q = StrainDim * (Perm(i)-1)
+          CALL OutputVector2Tensor( NodalStrain(q+1:q+StrainDim), StrainDim, PriCache )
 
           ! Use lapack to solve eigenvalues:
           CALL DSYEV( 'N', 'U', 3, PriCache, 3, PriW, PriWork, PriLWork, PriInfo )

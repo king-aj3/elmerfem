@@ -69,7 +69,7 @@ SUBROUTINE StressSolver_Init0( Model,Solver,dt,Transient )
 SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
     USE DefUtils
-    USE StressLocal, ONLY: SymTensorComponents
+    USE StressLocal, ONLY: SymTensorComponents, StressFieldDefinition
     IMPLICIT NONE
 
     TYPE(Model_t)  :: Model
@@ -172,9 +172,12 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
     END IF
 
     IF ( CalcStressAll ) THEN
+      ! The 23 and 13 shears are identically zero in two dimensions and are not
+      ! stored there; zz is, being nonzero under plane strain. See
+      ! SymTensorOutputComponents, which the assembly indexes with.
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
-          'Stress[Stress_xx:1 Stress_yy:1 Stress_zz:1 Stress_xy:1 Stress_yz:1 Stress_xz:1]' )
+          TRIM(StressFieldDefinition('Stress',dim)) )
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
           'vonMises' )
@@ -198,7 +201,7 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
     IF (CalculateStrains) THEN
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
-          'Strain[Strain_xx:1 Strain_yy:1 Strain_zz:1 Strain_xy:1 Strain_yz:1 Strain_xz:1]' )
+          TRIM(StressFieldDefinition('Strain',dim)) )
       IF (CalcPrincipalStrain) THEN
         CALL ListAddString( SolverParams,&
             NextFreeKeyword('Exported Variable ',SolverParams), &
@@ -1796,7 +1799,7 @@ CONTAINS
      INTEGER :: n,nd
      TYPE(Element_t), POINTER :: Element
 
-     INTEGER :: i,j,k,l,p,q, t, dim,sdim,elem, IND(9), BodyId,EqId
+     INTEGER :: i,j,k,l,p,q, t, dim,sdim,elem, IND(9), BodyId,EqId, ncomp
      LOGICAL :: stat, CSymmetry, Isotropic(2), UseMask, ContactOn
      INTEGER, POINTER :: Visited(:), Indexes(:), Permutation(:)
      REAL(KIND=dp) :: u,v,w,x,y,z,Strain(3,3),Stress(3,3),LGrad(3,3),detJ, &
@@ -1828,6 +1831,12 @@ CONTAINS
 
      dim = CoordinateSystemDimension()
 
+     ! Components stored per node, 4 in two dimensions and 6 in three. IND maps a
+     ! tensor index pair onto a slot in either, the 2D layout being the 3D one
+     ! truncated, so a slot beyond ncomp is one that is identically zero here and
+     ! simply not stored.
+     ncomp = SymTensorOutputComponents( dim )
+
      CALL Info('StressSolver','------------------------------------------',Level=5)
      CALL Info('StressSolver','Starting Stress Computation',Level=5)
 
@@ -1835,8 +1844,8 @@ CONTAINS
 
      n = MAX( Mesh % MaxElementDOFs, Mesh % MaxElementNodes )
      ALLOCATE( Indexes(n), LocalDisplacement(4,n), &
-         MASS(n,n), FORCE(6*n), &
-         SFORCE(6*n), &
+         MASS(n,n), FORCE(ncomp*n), &
+         SFORCE(ncomp*n), &
          Basis(n), dBasisdx(n,3) )
 
      ! Derived rather than assumed true: SetGlobalBubblesFlag falls back to the
@@ -1856,8 +1865,8 @@ CONTAINS
      IF ( Rebuilt ) THEN
        IF ( ALLOCATED(ForceG) ) DEALLOCATE( ForceG )
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
-       ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*6) )
-       ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*6) )
+       ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*ncomp) )
+       ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*ncomp) )
      END IF
 
      ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
@@ -1990,8 +1999,9 @@ CONTAINS
             DO i=1,3
             DO j=i,3
               k = Ind( 3*(i-1)+j )
-              FORCE(6*(p-1)+k) = FORCE(6*(p-1)+k) + Weight*Stress(i,j)*Basis(p)
-              SFORCE(6*(p-1)+k) = SFORCE(6*(p-1)+k) + Weight*Strain(i,j)*Basis(p)                  
+              IF ( k > ncomp ) CYCLE
+              FORCE(ncomp*(p-1)+k) = FORCE(ncomp*(p-1)+k) + Weight*Stress(i,j)*Basis(p)
+              SFORCE(ncomp*(p-1)+k) = SFORCE(ncomp*(p-1)+k) + Weight*Strain(i,j)*Basis(p)
             END DO
             END DO
           END DO
@@ -2004,8 +2014,9 @@ CONTAINS
           DO i=1,3
           DO j=i,3
              k = Ind(3*(i-1)+j)
-             ForceG(6*(l-1)+k) = ForceG(6*(l-1)+k) + FORCE(6*(p-1)+k)
-             SForceG(6*(l-1)+k) = SForceG(6*(l-1)+k) + SFORCE(6*(p-1)+k)
+             IF ( k > ncomp ) CYCLE
+             ForceG(ncomp*(l-1)+k) = ForceG(ncomp*(l-1)+k) + FORCE(ncomp*(p-1)+k)
+             SForceG(ncomp*(l-1)+k) = SForceG(ncomp*(l-1)+k) + SFORCE(ncomp*(p-1)+k)
           END DO
           END DO
         END DO
@@ -2024,14 +2035,15 @@ CONTAINS
       DO i=1,3
         DO j=i,3
           k = IND(3*(i-1)+j)
-          
-          StSolver % Matrix % RHS = ForceG(k::6)
-          
+          IF ( k > ncomp ) CYCLE
+
+          StSolver % Matrix % RHS = ForceG(k::ncomp)
+
           DO l=1,SIZE( Permutation )
             IF ( Permutation(l) <= 0 ) CYCLE
-            StSolver % Variable % Values(Permutation(l)) = NodalStress(6*(StressPerm(l)-1)+k)
+            StSolver % Variable % Values(Permutation(l)) = NodalStress(ncomp*(StressPerm(l)-1)+k)
           END DO
-          
+
           WRITE( Message,'(A,I0,A,I0,A)') 'Solving for Stress(',i,',',j,')'
           CALL Info('StressSolver',Message,Level=5)
 
@@ -2039,14 +2051,14 @@ CONTAINS
 
           DO l=1,SIZE( Permutation )
             IF ( Permutation(l) <= 0 ) CYCLE
-            NodalStress(6*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
+            NodalStress(ncomp*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
           END DO
-          
+
           IF(CalculateStrains) THEN
-            StSolver % Matrix % RHS = SForceG(k::6)
+            StSolver % Matrix % RHS = SForceG(k::ncomp)
             DO l=1,SIZE( Permutation )
               IF ( Permutation(l) <= 0 ) CYCLE
-              StSolver % Variable % Values(Permutation(l)) = NodalStrain(6*(StressPerm(l)-1)+k)            
+              StSolver % Variable % Values(Permutation(l)) = NodalStrain(ncomp*(StressPerm(l)-1)+k)
             END DO
             ! this solves some convergence problems at the expense of bad convergence      
             ! StSolver % Variable % Values = 0
@@ -2057,7 +2069,7 @@ CONTAINS
           
             DO l=1,SIZE( Permutation )
               IF ( Permutation(l) <= 0 ) CYCLE
-              NodalStrain(6*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
+              NodalStrain(ncomp*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
             END DO
           END IF !CalculateStrains
         END DO
@@ -2087,14 +2099,8 @@ CONTAINS
       DO i=1,SIZE( StressPerm )
          IF ( StressPerm(i) <= 0 ) CYCLE
 
-         p = 0
-         DO j=1,3
-            DO k=1,3
-              p = p + 1
-              q = 6 * (StressPerm(i)-1) + IND(p)
-              Stress(j,k) = NodalStress(q)
-            END DO
-         END DO
+         q = ncomp * (StressPerm(i)-1)
+         CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, Stress )
 
          Stress(:,:) = Stress(:,:) - TRACE(Stress(:,:),3) * Ident/3
 
@@ -2110,20 +2116,13 @@ CONTAINS
       !Principal stresses and Tresca
       IF(CalcPrincipalAll) THEN
         DO i=1,SIZE( StressPerm )
-          IF ( StressPerm(i) <= 0 ) CYCLE       
-          !Stresses: 
-          p = 0
-
+          IF ( StressPerm(i) <= 0 ) CYCLE
+          !Stresses:
           sdim=3
           IF (dim==2.AND.PlaneStress) sdim=2
 
-          DO j=1,3
-            DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-              p = p+1
-              q = 6 * (StressPerm(i)-1) + IND(p)
-              PriCache(j,k) = NodalStress(q)
-            END DO
-          END DO
+          q = ncomp * (StressPerm(i)-1)
+          CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, PriCache )
 
           !Use lapack function to do solve eigenvalues (i.e. principal stresses)
           CALL DSYEV( 'N', 'U', sdim, PriCache, 3, PriW, PriWork, PriLWork, PriInfo )
@@ -2138,14 +2137,8 @@ CONTAINS
 
           IF(CalcPrincipalAngle) THEN
             !DSYEV has changed the vector, so well copy it again from NodalStress
-            p=0
-            DO j=1,3
-              DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-                 p = p+1
-                 q = 6 * (StressPerm(i)-1) + IND(p)
-                 PriCache(j,k) = NodalStress(q)
-              END DO
-            END DO
+            q = ncomp * (StressPerm(i)-1)
+            CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, PriCache )
 
             DO k=1,3 ! for all principal stresses
               ! This is where things get _very_ heary. The code below
@@ -2194,15 +2187,9 @@ CONTAINS
           
           !Strain:
           IF (CalcPrincipalStrain) THEN
-            p=0
-            DO j=1,3
-              DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-                p = p+1
-                q = 6 * (StressPerm(i)-1) + IND(p)
-                PriCache(j,k) = NodalStrain(q)
-              END DO
-            END DO
-      
+            q = ncomp * (StressPerm(i)-1)
+            CALL OutputVector2Tensor( NodalStrain(q+1:q+ncomp), ncomp, PriCache )
+
             sdim=3; IF(dim==2.AND..NOT.PlaneStress) sdim=2
 
             !Use lapack function to do solve eigenvalues
