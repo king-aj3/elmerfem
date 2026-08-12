@@ -53,6 +53,21 @@ MODULE StressLocal
   INTEGER, PARAMETER :: VOIGT_I1(6) = [1,2,3,1,2,1], VOIGT_I2(6) = [1,2,3,2,3,3]
 
 !------------------------------------------------------------------------------
+!> Persistent state of a nodal projection. Stress and strain fields are recovered
+!> from their integration point values by an L2 projection, which needs a solver
+!> of its own: a scalar mass matrix, a permutation, and a hidden variable to run
+!> the component solves through. All of it survives between calls, so it is kept
+!> here rather than in a pile of SAVEd locals.
+!------------------------------------------------------------------------------
+  TYPE :: NodalProjector_t
+    TYPE(Solver_t), POINTER :: PSolver => NULL()
+    INTEGER, POINTER :: Perm(:) => NULL()
+    CHARACTER(LEN=MAX_NAME_LEN) :: EqName = ' '
+    LOGICAL :: UseMask = .FALSE.
+    LOGICAL :: Initialized = .FALSE.
+  END TYPE NodalProjector_t
+
+!------------------------------------------------------------------------------
   CONTAINS
 
 !------------------------------------------------------------------------------
@@ -1906,6 +1921,76 @@ CONTAINS
 !------------------------------------------------------------------------------
   END SUBROUTINE BuildGMatrix
 !------------------------------------------------------------------------------
+
+!------------------------------------------------------------------------------
+!> Build, or rebuild after a mesh change, the auxiliary solver that a nodal
+!> projection runs through: a scalar CRS matrix over the same mesh, its own right
+!> hand side and communicator, and a hidden variable that the component solves are
+!> written into. The keyword namespace is left active on return; the caller clears
+!> it when the projection is finished.
+!>
+!> Rebuilt reports that the matrix was created afresh, so that force vectors the
+!> caller keeps between calls have to be reallocated to the new row count.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorSetup( Proj, Solver, NameSpace, MaskKeyword, TempName, &
+       GlobalBubbles, Rebuilt )
+!------------------------------------------------------------------------------
+     TYPE(NodalProjector_t) :: Proj
+     TYPE(Solver_t) :: Solver
+     CHARACTER(LEN=*) :: NameSpace, MaskKeyword, TempName
+     LOGICAL :: GlobalBubbles
+     LOGICAL, INTENT(OUT) :: Rebuilt
+!------------------------------------------------------------------------------
+     LOGICAL :: Found, OptimizeBW
+     REAL(KIND=dp), POINTER :: TempValues(:)
+!------------------------------------------------------------------------------
+     CALL ListSetNameSpace( NameSpace )
+
+     Rebuilt = ( .NOT. Proj % Initialized ) .OR. Solver % MeshChanged
+     IF ( .NOT. Rebuilt ) RETURN
+
+     ! The auxiliary solver object is reassigned rather than freed. The variable
+     ! added below records it as its owner and VariableGet dereferences that owner
+     ! on its interpolation path, so releasing it would leave the previous mesh's
+     ! variable list pointing at freed memory.
+     IF ( Proj % Initialized ) THEN
+       CALL FreeMatrix( Proj % PSolver % Matrix )
+     ELSE
+       ALLOCATE( Proj % PSolver )
+     END IF
+     Proj % PSolver = Solver
+
+     ALLOCATE( Proj % Perm( SIZE(Solver % Variable % Perm) ) )
+
+     OptimizeBW = GetLogical( Proj % PSolver % Values, 'Optimize Bandwidth', Found )
+     IF ( .NOT. Found ) OptimizeBW = .TRUE.
+
+     ! Restrict the projection to the bodies that asked for it, when any did.
+     IF ( ListGetLogicalAnyEquation( CurrentModel, MaskKeyword ) ) THEN
+       Proj % UseMask = .TRUE.
+       Proj % EqName = MaskKeyword
+     ELSE
+       Proj % UseMask = .FALSE.
+       Proj % EqName = TRIM( ListGetString( Proj % PSolver % Values,'Equation') )
+     END IF
+
+     Proj % PSolver % Matrix => CreateMatrix( CurrentModel, Solver, Solver % Mesh, &
+         Proj % Perm, 1, MATRIX_CRS, OptimizeBW, Proj % EqName, GlobalBubbles=GlobalBubbles )
+
+     ALLOCATE( Proj % PSolver % Matrix % RHS(Proj % PSolver % Matrix % NumberOfRows) )
+     Proj % PSolver % Matrix % Comm = Solver % Matrix % Comm
+
+     ALLOCATE( TempValues(Proj % PSolver % Matrix % NumberOfRows) )
+     TempValues = 0.0_dp
+     CALL VariableAdd( Proj % PSolver % Mesh % Variables, Proj % PSolver % Mesh, &
+         Proj % PSolver, TempName, 1, TempValues, Proj % Perm, Output=.FALSE. )
+     Proj % PSolver % Variable => VariableGet( Proj % PSolver % Mesh % Variables, TempName )
+
+     Proj % Initialized = .TRUE.
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorSetup
+!------------------------------------------------------------------------------
+
 
 END MODULE StressLocal
 
