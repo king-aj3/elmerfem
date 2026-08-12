@@ -1385,7 +1385,9 @@ CONTAINS
        IF ( .NOT. PlaneStress ) THEN
          S(1) = Strain(1,1)
          S(2) = Strain(2,2)
-         S(3) = Strain(1,2)
+         ! The engineering shear: C is indexed for it throughout, as Strain2Stress
+         ! shows by doubling this same component before contracting with C.
+         S(3) = 2.0_dp * Strain(1,2)
          Stress(3,3) = Stress(3,3) + SUM( C(4,1:3) * S(1:3) )
        ELSE
          IF ( Isotropic(1) ) THEN
