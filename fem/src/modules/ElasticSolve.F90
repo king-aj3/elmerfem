@@ -91,7 +91,12 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
   CHARACTER(*), PARAMETER :: Caller = 'ElasticSolver_init'
 !------------------------------------------------------------------------------
   SolverParams => GetSolverParams()
-  AxialSymmetry = CurrentCoordinateSystem() == AxisSymmetric
+  ! Cylindric Symmetric means axisymmetric with a swirling component, which this
+  ! solver has no degree of freedom for -- there is no u_theta in a 2D run. It is
+  ! accepted as a synonym because sifs use it as one: fem/tests/CylComAxi is a pure
+  ! axisymmetric benchmark, by its own header, that declares Cylindric Symmetric.
+  AxialSymmetry = CurrentCoordinateSystem() == AxisSymmetric .OR. &
+      CurrentCoordinateSystem() == CylindricSymmetric
   MixedFormulation = GetLogical(SolverParams, 'Mixed Formulation', Found) .AND. &
       GetLogical(SolverParams, 'Neo-Hookean Material', Found)
 
@@ -393,7 +398,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   Mesh => GetMesh()
   dim = CoordinateSystemDimension()
   CoordinateSystem = CurrentCoordinateSystem()
-  AxialSymmetry = CoordinateSystem == AxisSymmetric
+  AxialSymmetry = CoordinateSystem == AxisSymmetric .OR. &
+      CoordinateSystem == CylindricSymmetric
   
   IF ( .NOT. ( CoordinateSystem == Cartesian .OR. AxialSymmetry) ) THEN
     CALL Fatal(Caller, 'Unsupported coordinate system')
@@ -4070,7 +4076,8 @@ SUBROUTINE ElasticStrainAtIP( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T
     ! once keeps this correct if either changes between calls.
     LargeDeflection = ListGetLogical( Proj % Solver % Values, 'Large Deflection', Found )
     IF ( .NOT. Found ) LargeDeflection = .TRUE.
-    AxialSymmetry = ( CurrentCoordinateSystem() == AxisSymmetric )
+    AxialSymmetry = ( CurrentCoordinateSystem() == AxisSymmetric .OR. &
+        CurrentCoordinateSystem() == CylindricSymmetric )
 
     CALL GetVectorLocalSolution( LocalDisplacement, USolver = Proj % Solver )
   END IF
