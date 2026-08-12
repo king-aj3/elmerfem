@@ -52,6 +52,11 @@ MODULE StressLocal
 
   INTEGER, PARAMETER :: VOIGT_I1(6) = [1,2,3,1,2,1], VOIGT_I2(6) = [1,2,3,2,3,3]
 
+!> Tensor index pair (i,j) at 3*(i-1)+j -> the slot it is stored in, for the output
+!> layout SymTensorOutputComponents describes. A slot beyond that layout's length is
+!> one the layout does not carry.
+  INTEGER, PARAMETER :: SYMTENSOR_IND(9) = [ 1,4,6,4,2,5,6,5,3 ]
+
 !------------------------------------------------------------------------------
 !> Persistent state of a nodal projection. Stress and strain fields are recovered
 !> from their integration point values by an L2 projection, which needs a solver
@@ -1537,7 +1542,6 @@ CONTAINS
      REAL(KIND=dp) :: V(:), T(3,3)
      INTEGER :: ncomp
 !------------------------------------------------------------------------------
-     INTEGER, PARAMETER :: IND(9) = [ 1,4,6,4,2,5,6,5,3 ]
      INTEGER :: i,j,p,k
 !------------------------------------------------------------------------------
      T = 0.0_dp
@@ -1545,12 +1549,109 @@ CONTAINS
      DO i=1,3
        DO j=1,3
          p = p + 1
-         k = IND(p)
+         k = SYMTENSOR_IND(p)
          IF ( k <= ncomp ) T(i,j) = V(k)
        END DO
      END DO
 !------------------------------------------------------------------------------
    END SUBROUTINE OutputVector2Tensor
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Add one integration point's contribution to the local mass matrix of a nodal
+!> projection. Every component is fitted against this same Galerkin mass, which is
+!> why one matrix serves them all and they differ only in the right hand side.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorMass( Mass, Basis, nd, Weight )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: Mass(:,:), Basis(:), Weight
+     INTEGER :: nd
+!------------------------------------------------------------------------------
+     INTEGER :: p,q
+!------------------------------------------------------------------------------
+     DO p=1,nd
+       DO q=1,nd
+         Mass(p,q) = Mass(p,q) + Weight * Basis(q) * Basis(p)
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorMass
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Add one integration point's contribution of a symmetric tensor to the local
+!> projection right hand side, packed in the stored component order.
+!>
+!> Slots the layout does not carry are skipped rather than special cased. In two
+!> dimensions those are the 23 and 13 shears, identically zero there; the
+!> out-of-plane 33 is carried, and under axial symmetry it is the hoop, which the
+!> tensor holds at (3,3) like any other out-of-plane component. That is why this
+!> needs no axisymmetric branch, where the callers each used to have one.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorTensor( Force, Basis, nd, ncomp, Weight, T )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: Force(:), Basis(:), Weight, T(:,:)
+     INTEGER :: nd, ncomp
+!------------------------------------------------------------------------------
+     INTEGER :: p,i,j,k
+!------------------------------------------------------------------------------
+     DO p=1,nd
+       DO i=1,3
+         DO j=i,3
+           k = SYMTENSOR_IND( 3*(i-1)+j )
+           IF ( k > ncomp ) CYCLE
+           Force(ncomp*(p-1)+k) = Force(ncomp*(p-1)+k) + Weight * T(i,j) * Basis(p)
+         END DO
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorTensor
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> As NodalProjectorTensor, but for a source already held as a component vector in
+!> the stored order rather than as a tensor -- which is how a UMAT hands its stress
+!> back.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorVector( Force, Basis, nd, ncomp, Weight, V )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: Force(:), Basis(:), Weight, V(:)
+     INTEGER :: nd, ncomp
+!------------------------------------------------------------------------------
+     INTEGER :: p,i
+!------------------------------------------------------------------------------
+     DO p=1,nd
+       DO i=1,ncomp
+         Force(ncomp*(p-1)+i) = Force(ncomp*(p-1)+i) + Weight * V(i) * Basis(p)
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorVector
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Add an element's local projection right hand side into the global one, the
+!> components staying interleaved with stride ncomp.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorGlue( ForceG, Force, Perm, Indexes, nd, ncomp )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: ForceG(:), Force(:)
+     INTEGER :: Perm(:), Indexes(:), nd, ncomp
+!------------------------------------------------------------------------------
+     INTEGER :: p,i,l
+!------------------------------------------------------------------------------
+     DO p=1,nd
+       l = Perm(Indexes(p))
+       DO i=1,ncomp
+         ForceG(ncomp*(l-1)+i) = ForceG(ncomp*(l-1)+i) + Force(ncomp*(p-1)+i)
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorGlue
 !------------------------------------------------------------------------------
 
 

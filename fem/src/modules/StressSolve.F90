@@ -1990,35 +1990,15 @@ CONTAINS
               Basis, dBasisdx, Nodes, dim, n, nd, .TRUE.,&
               argEvaluateAtIP=EvaluateAtIP, argEvaluateLoadAtIP=EvaluateLoadAtIP,GaussPoint=t )
 
-          DO p=1,nd
-            DO q=1,nd
-              MASS(p,q) = MASS(p,q) + Weight*Basis(q)*Basis(p)
-            END DO
-
-            DO i=1,3
-            DO j=i,3
-              k = Ind( 3*(i-1)+j )
-              IF ( k > ncomp ) CYCLE
-              FORCE(ncomp*(p-1)+k) = FORCE(ncomp*(p-1)+k) + Weight*Stress(i,j)*Basis(p)
-              SFORCE(ncomp*(p-1)+k) = SFORCE(ncomp*(p-1)+k) + Weight*Strain(i,j)*Basis(p)
-            END DO
-            END DO
-          END DO
+          CALL NodalProjectorMass( MASS, Basis, nd, Weight )
+          CALL NodalProjectorTensor( FORCE, Basis, nd, ncomp, Weight, Stress )
+          CALL NodalProjectorTensor( SFORCE, Basis, nd, ncomp, Weight, Strain )
         END DO
 
         CALL DefaultUpdateEquations( MASS, FORCE )
 
-        DO p=1,nd
-          l = Permutation(Indexes(p))
-          DO i=1,3
-          DO j=i,3
-             k = Ind(3*(i-1)+j)
-             IF ( k > ncomp ) CYCLE
-             ForceG(ncomp*(l-1)+k) = ForceG(ncomp*(l-1)+k) + FORCE(ncomp*(p-1)+k)
-             SForceG(ncomp*(l-1)+k) = SForceG(ncomp*(l-1)+k) + SFORCE(ncomp*(p-1)+k)
-          END DO
-          END DO
-        END DO
+        CALL NodalProjectorGlue( ForceG, FORCE, Permutation, Indexes, nd, ncomp )
+        CALL NodalProjectorGlue( SForceG, SFORCE, Permutation, Indexes, nd, ncomp )
       END DO
 
       CALL NodalProjectorSolve( Proj, 'Stress', ncomp, ForceG, NodalStress, StressPerm )

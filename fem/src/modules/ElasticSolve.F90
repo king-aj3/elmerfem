@@ -3317,7 +3317,7 @@ CONTAINS
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
     INTEGER, POINTER :: Permutation(:), Indices(:)
-    INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(9), StrainDim
+    INTEGER :: dim, elem, n, nd, i, k, l, p, q, StrainDim
 
     REAL(KIND=dp), POINTER :: StrainTemp(:)
     REAL(KIND=dp), ALLOCATABLE :: SForceG(:), LocalDisplacement(:,:)
@@ -3384,14 +3384,6 @@ CONTAINS
     NodalStrain = 0.0d0
     SForceG = 0.0d0
 
-    ! Slots (11,22,33,12), the axial direction being 22 and the hoop the
-    ! out-of-plane 33, which is the tensor's (3,3) and is added separately below.
-    IF (AxialSymmetry) THEN
-       Ind = (/ 1, 4, 4, 2, 0, 0, 0, 0, 0 /)
-    ELSE
-       Ind = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
-    END IF
-
     CALL DefaultInitialize()
     !------------------------------------------------------------------------
     ! Assembly loop 
@@ -3442,21 +3434,8 @@ CONTAINS
           Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
           IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
 
-          DO p=1,nd
-             DO q=1,nd
-                Mass(p,q) = Mass(p,q) + Weight * Basis(q) * Basis(p)
-             END DO
-
-             DO i=1,dim
-                DO j=i,dim
-                   k = Ind( dim*(i-1)+j )
-                   IF ( k > StrainDim ) CYCLE
-                   SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
-                END DO
-             END DO
-             IF (AxialSymmetry) &
-                  SForce(StrainDim*(p-1)+3) = SForce(StrainDim*(p-1)+3) + Weight * Strain(3,3) * Basis(p)
-          END DO
+          CALL NodalProjectorMass( Mass, Basis, nd, Weight )
+          CALL NodalProjectorTensor( SForce, Basis, nd, StrainDim, Weight, Strain )
        END DO
 
        CALL DefaultUpdateEquations( Mass, Force ) 
@@ -3464,12 +3443,7 @@ CONTAINS
        !--------------------------------
        ! Assemble global RHS vectors:
        !--------------------------------
-       DO p=1,nd
-          l = Permutation(Indices(p))
-          DO i=1,StrainDim
-             SForceG(StrainDim*(l-1)+i) = SForceG(StrainDim*(l-1)+i) + SForce(StrainDim*(p-1)+i)
-          END DO
-       END DO
+       CALL NodalProjectorGlue( SForceG, SForce, Permutation, Indices, nd, StrainDim )
     END DO
 
 
@@ -3521,6 +3495,9 @@ CONTAINS
     INTEGER :: ipindex
 
     REAL(KIND=dp), POINTER :: StressTemp(:)
+    ! One integration point's stress, permuted from the UMAT's own component order
+    ! into the stored one.
+    REAL(KIND=dp) :: UmatComp(6)
     REAL(KIND=dp), ALLOCATABLE :: SForceG(:)
     REAL(KIND=dp), ALLOCATABLE :: Mass(:,:), Force(:), SForce(:), Basis(:)
 
@@ -3629,16 +3606,11 @@ CONTAINS
            ! component comes out different from the correctly weighted one.
            IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
 
-          DO p=1,nd
-             DO q=1,nd
-                Mass(p,q) = Mass(p,q) + Weight * Basis(q) * Basis(p)
-             END DO
-
-             DO i=1,StressDim
-               SForce(StressDim*(p-1)+i) = SForce(StressDim*(p-1)+i) + Weight * &
-                     UMatStress(StressDofs*(ipIndex-1)+Ind(i)) * Basis(p)
-             END DO
+          DO i=1,StressDim
+            UmatComp(i) = UMatStress(StressDofs*(ipIndex-1)+Ind(i))
           END DO
+          CALL NodalProjectorMass( Mass, Basis, nd, Weight )
+          CALL NodalProjectorVector( SForce, Basis, nd, StressDim, Weight, UmatComp )
        END DO
 
        CALL DefaultUpdateEquations( Mass, Force ) 
@@ -3646,12 +3618,7 @@ CONTAINS
        !--------------------------------
        ! Assemble global RHS vectors:
        !--------------------------------
-       DO p=1,nd
-          l = Permutation(Indices(p))
-          DO i=1,StressDim
-             SForceG(StressDim*(l-1)+i) = SForceG(StressDim*(l-1)+i) + SForce(StressDim*(p-1)+i)
-          END DO
-       END DO
+       CALL NodalProjectorGlue( SForceG, SForce, Permutation, Indices, nd, StressDim )
     END DO
 
     !----------------------------------------------------------------------
@@ -3695,7 +3662,7 @@ CONTAINS
 
     INTEGER, POINTER :: Permutation(:), Indices(:)
 
-    INTEGER :: dim, cdim, n, nd, elem, i, j, k, l, p, q, t, Ind(9), StrainDim, DOFs
+    INTEGER :: dim, cdim, n, nd, elem, i, j, k, l, p, q, t, StrainDim, DOFs
 
     REAL(KIND=dp), POINTER :: StressTemp(:)
     REAL(KIND=dp), ALLOCATABLE :: ForceG(:), SForceG(:), LocalDisplacement(:,:), &
@@ -3783,13 +3750,6 @@ CONTAINS
     ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
     ! until NodalProjectorEnd.
     CALL NodalProjectorBegin( Proj, Solver )
-    ! Slots (11,22,33,12): the axial direction is 22 and the hoop the out-of-plane
-    ! 33, which is the tensor's (3,3) and is added separately in the loop.
-    IF (AxialSymmetry) THEN
-       Ind = (/ 1, 4, 4, 2, 0, 0, 0, 0, 0 /)
-    ELSE
-       Ind = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
-    END IF
     IF (CalculateStrains) THEN
        NodalStrain = 0.0d0
        ForceG      = 0.0d0
@@ -3996,55 +3956,11 @@ CONTAINS
           END IF
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
 
-          DO p=1,nd
-             DO q=1,nd
-                Mass(p,q) = Mass(p,q) + Weight * Basis(q) * Basis(p)
-             END DO
-
-             ! Strides are StrainDim throughout: 4 in any 2D case, 6 in 3D. Off the
-             ! axis the tensor loop still covers all six pairs and the two shears
-             ! the 2D layout does not carry -- identically zero there -- are
-             ! skipped. The out-of-plane 33 is kept in both branches.
-             IF (AxialSymmetry) THEN
-                IF (CalculateStrains) THEN
-                   DO i=1,2
-                      DO j=i,2
-                         k = Ind( 2*(i-1)+j )
-                         Force(StrainDim*(p-1)+k) = Force(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
-                      END DO
-                   END DO
-                   Force(StrainDim*(p-1)+3) = Force(StrainDim*(p-1)+3) + Weight * Strain(3,3) * Basis(p)
-                END IF
-                IF (CalculateStresses) THEN
-                   DO i=1,2
-                      DO j=i,2
-                         k = Ind( 2*(i-1)+j )
-                         SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
-                      END DO
-                   END DO
-                   SForce(StrainDim*(p-1)+3) = SForce(StrainDim*(p-1)+3) + Weight * Stress(3,3) * Basis(p)
-                END IF
-             ELSE
-                IF (CalculateStrains) THEN
-                   DO i=1,3
-                      DO j=i,3
-                         k = Ind( 3*(i-1)+j )
-                         IF ( k > StrainDim ) CYCLE
-                         Force(StrainDim*(p-1)+k) = Force(StrainDim*(p-1)+k) + Weight * Strain(i,j) * Basis(p)
-                      END DO
-                   END DO
-                END IF
-                IF (CalculateStresses) THEN
-                   DO i=1,3
-                      DO j=i,3
-                         k = Ind( 3*(i-1)+j )
-                         IF ( k > StrainDim ) CYCLE
-                         SForce(StrainDim*(p-1)+k) = SForce(StrainDim*(p-1)+k) + Weight * Stress(i,j) * Basis(p)
-                      END DO
-                   END DO
-                END IF
-             END IF
-          END DO
+          CALL NodalProjectorMass( Mass, Basis, nd, Weight )
+          IF (CalculateStrains) &
+              CALL NodalProjectorTensor( Force, Basis, nd, StrainDim, Weight, Strain )
+          IF (CalculateStresses) &
+              CALL NodalProjectorTensor( SForce, Basis, nd, StrainDim, Weight, Stress )
        END DO
 
        CALL DefaultUpdateEquations( Mass, Force )
@@ -4052,23 +3968,10 @@ CONTAINS
        !--------------------------------
        ! Assemble global RHS vectors:
        !--------------------------------   
-       IF (CalculateStrains) THEN
-          DO p=1,nd
-             l = Permutation(Indices(p))
-             DO i=1,StrainDim
-                ForceG(StrainDim*(l-1)+i) = ForceG(StrainDim*(l-1)+i) + Force(StrainDim*(p-1)+i)
-             END DO
-          END DO
-       END IF
-
-       IF (CalculateStresses) THEN
-          DO p=1,nd
-             l = Permutation(Indices(p))
-             DO i=1,StrainDim
-                SForceG(StrainDim*(l-1)+i) = SForceG(StrainDim*(l-1)+i) + SForce(StrainDim*(p-1)+i)
-             END DO
-          END DO
-       END IF
+       IF (CalculateStrains) &
+           CALL NodalProjectorGlue( ForceG, Force, Permutation, Indices, nd, StrainDim )
+       IF (CalculateStresses) &
+           CALL NodalProjectorGlue( SForceG, SForce, Permutation, Indices, nd, StrainDim )
 
     END DO
 
