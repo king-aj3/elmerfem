@@ -1933,16 +1933,21 @@ CONTAINS
 !> caller keeps between calls have to be reallocated to the new row count.
 !------------------------------------------------------------------------------
    SUBROUTINE NodalProjectorSetup( Proj, Solver, NameSpace, MaskKeyword, TempName, &
-       GlobalBubbles, Rebuilt )
+       GlobalBubbles, Rebuilt, VarPerm )
 !------------------------------------------------------------------------------
      TYPE(NodalProjector_t) :: Proj
      TYPE(Solver_t) :: Solver
      CHARACTER(LEN=*) :: NameSpace, MaskKeyword, TempName
      LOGICAL :: GlobalBubbles
      LOGICAL, INTENT(OUT) :: Rebuilt
+     !> Permutation recorded on the hidden variable. Defaults to the projection's
+     !> own, which is what the component solves index with; callers that register
+     !> it against the field permutation instead pass theirs.
+     INTEGER, POINTER, OPTIONAL :: VarPerm(:)
 !------------------------------------------------------------------------------
      LOGICAL :: Found, OptimizeBW
      REAL(KIND=dp), POINTER :: TempValues(:)
+     INTEGER, POINTER :: PermForVar(:)
 !------------------------------------------------------------------------------
      CALL ListSetNameSpace( NameSpace )
 
@@ -1982,8 +1987,10 @@ CONTAINS
 
      ALLOCATE( TempValues(Proj % PSolver % Matrix % NumberOfRows) )
      TempValues = 0.0_dp
+     PermForVar => Proj % Perm
+     IF ( PRESENT(VarPerm) ) PermForVar => VarPerm
      CALL VariableAdd( Proj % PSolver % Mesh % Variables, Proj % PSolver % Mesh, &
-         Proj % PSolver, TempName, 1, TempValues, Proj % Perm, Output=.FALSE. )
+         Proj % PSolver, TempName, 1, TempValues, PermForVar, Output=.FALSE. )
      Proj % PSolver % Variable => VariableGet( Proj % PSolver % Mesh % Variables, TempName )
 
      Proj % Initialized = .TRUE.
