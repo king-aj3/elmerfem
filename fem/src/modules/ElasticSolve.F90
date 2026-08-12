@@ -3463,6 +3463,11 @@ CONTAINS
 
           stat = ElementInfo( Element, Nodes, u, v, w, detJ, Basis, dBasisdx ) 
           Weight = Weight * detJ
+           ! The projection is an L2 fit, so in axisymmetric coordinates it has to
+           ! be weighted by the radius like any other volume integral. Without this
+           ! the fit is made in the Cartesian metric and every spatially varying
+           ! component comes out different from the correctly weighted one.
+           IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
 
           Grad = MATMUL( LocalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
           IF (AxialSymmetry) THEN
@@ -3758,6 +3763,11 @@ CONTAINS
 
           stat = ElementInfo( Element, Nodes, u, v, w, detJ, Basis )
           Weight = Weight * detJ
+           ! The projection is an L2 fit, so in axisymmetric coordinates it has to
+           ! be weighted by the radius like any other volume integral. Without this
+           ! the fit is made in the Cartesian metric and every spatially varying
+           ! component comes out different from the correctly weighted one.
+           IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
 
           DO p=1,nd
              DO q=1,nd
@@ -4157,6 +4167,11 @@ CONTAINS
 
           stat = ElementInfo( Element, Nodes, u, v, w, detJ, Basis, dBasisdx ) 
           Weight = Weight * detJ
+           ! The projection is an L2 fit, so in axisymmetric coordinates it has to
+           ! be weighted by the radius like any other volume integral. Without this
+           ! the fit is made in the Cartesian metric and every spatially varying
+           ! component comes out different from the correctly weighted one.
+           IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
 
           IF (Isotropic) THEN
              Lame1 = SUM( NodalLame1(1:n)*Basis(1:n) )
