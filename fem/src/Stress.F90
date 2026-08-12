@@ -65,6 +65,11 @@ MODULE StressLocal
     CHARACTER(LEN=MAX_NAME_LEN) :: EqName = ' '
     LOGICAL :: UseMask = .FALSE.
     LOGICAL :: Initialized = .FALSE.
+    ! Solver state held aside while the projection runs, see NodalProjectorBegin.
+    LOGICAL :: LimiterOn = .FALSE., ContactOn = .FALSE.
+    LOGICAL :: EigenOn = .FALSE., HarmonicOn = .FALSE., ResidualOn = .FALSE.
+    REAL(KIND=dp) :: Relax = 1.0_dp
+    LOGICAL :: RelaxFound = .FALSE.
   END TYPE NodalProjector_t
 
 !------------------------------------------------------------------------------
@@ -2022,6 +2027,85 @@ CONTAINS
      Proj % Initialized = .TRUE.
 !------------------------------------------------------------------------------
    END SUBROUTINE NodalProjectorSetup
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Hand the solver over to the projection. Several things the primary solve wants
+!> are meaningless for an L2 fit and actively harmful if left on -- limiters and
+!> contact conditions would be applied to a stress component, an eigen or harmonic
+!> setting would send the component solves down the wrong path, and a relaxation
+!> factor would damp a solve that is not iterating on anything. Each is put aside
+!> here and restored by NodalProjectorEnd.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorBegin( Proj, Solver )
+!------------------------------------------------------------------------------
+     TYPE(NodalProjector_t) :: Proj
+     TYPE(Solver_t), TARGET :: Solver
+!------------------------------------------------------------------------------
+     LOGICAL :: Found
+     TYPE(ValueList_t), POINTER :: Params
+!------------------------------------------------------------------------------
+     Params => Solver % Values
+
+     Proj % LimiterOn = ListGetLogical( Params, 'Apply Limiter', Found )
+     IF ( Proj % LimiterOn ) CALL ListAddLogical( Params, 'Apply Limiter', .FALSE. )
+
+     Proj % ContactOn = ListGetLogical( Params, 'Apply Contact BCs', Found )
+     IF ( Proj % ContactOn ) CALL ListAddLogical( Params, 'Apply Contact BCs', .FALSE. )
+
+     Proj % EigenOn = ListGetLogical( Params, 'Eigen Analysis', Found )
+     IF ( Proj % EigenOn ) CALL ListAddLogical( Params, 'Eigen Analysis', .FALSE. )
+
+     Proj % HarmonicOn = ListGetLogical( Params, 'Harmonic Analysis', Found )
+     IF ( Proj % HarmonicOn ) CALL ListAddLogical( Params, 'Harmonic Analysis', .FALSE. )
+
+     Proj % ResidualOn = ListGetLogical( Params, 'Linear System Residual Mode', Found )
+     IF ( Proj % ResidualOn ) &
+         CALL ListAddLogical( Params, 'Linear System Residual Mode', .FALSE. )
+
+     Proj % Relax = GetCReal( Params, 'Nonlinear System Relaxation Factor', Proj % RelaxFound )
+     IF ( .NOT. Proj % RelaxFound ) Proj % Relax = 1.0_dp
+     CALL ListAddConstReal( Params, 'Nonlinear System Relaxation Factor', 1.0_dp )
+
+     Proj % PSolver % NOFEigenValues = 0
+     CurrentModel % Solver => Proj % PSolver
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorBegin
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Give the solver back what NodalProjectorBegin put aside, and drop the keyword
+!> namespace the projection was reading through.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorEnd( Proj, Solver )
+!------------------------------------------------------------------------------
+     TYPE(NodalProjector_t) :: Proj
+     TYPE(Solver_t), TARGET :: Solver
+!------------------------------------------------------------------------------
+     TYPE(ValueList_t), POINTER :: Params
+!------------------------------------------------------------------------------
+     Params => Solver % Values
+
+     IF ( Proj % EigenOn ) CALL ListAddLogical( Params, 'Eigen Analysis', .TRUE. )
+     IF ( Proj % HarmonicOn ) CALL ListAddLogical( Params, 'Harmonic Analysis', .TRUE. )
+     ! Put back what was there, or take the keyword away again if it was not:
+     ! leaving one behind changes the paths that merely test for its presence.
+     IF ( Proj % RelaxFound ) THEN
+       CALL ListAddConstReal( Params, 'Nonlinear System Relaxation Factor', Proj % Relax )
+     ELSE
+       CALL ListRemove( Params, 'Nonlinear System Relaxation Factor' )
+     END IF
+     IF ( Proj % LimiterOn ) CALL ListAddLogical( Params, 'Apply Limiter', .TRUE. )
+     IF ( Proj % ContactOn ) CALL ListAddLogical( Params, 'Apply Contact BCs', .TRUE. )
+     IF ( Proj % ResidualOn ) &
+         CALL ListAddLogical( Params, 'Linear System Residual Mode', .TRUE. )
+
+     CurrentModel % Solver => Solver
+     CALL ListSetNameSpace('')
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorEnd
 !------------------------------------------------------------------------------
 
 

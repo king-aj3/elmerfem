@@ -1831,18 +1831,6 @@ CONTAINS
      CALL Info('StressSolver','------------------------------------------',Level=5)
      CALL Info('StressSolver','Starting Stress Computation',Level=5)
 
-     ! Temporarily remove application of limiters as they are not needed
-     ! for stress computation. 
-     !-------------------------------------------------------------------
-     LimiterOn = ListGetLogical( SolverParams,'Apply Limiter',Found)
-     IF( LimiterOn ) THEN
-       CALL ListAddLogical( SolverParams,'Apply Limiter',.FALSE.) 
-     END IF
-     ContactOn = ListGetLogical( SolverParams,'Apply Contact BCs',Found)
-     IF( ContactOn ) THEN
-       CALL ListAddLogical( SolverParams,'Apply Contact BCs',.FALSE.) 
-     END IF
-
      CALL ListSetNameSpace('stress:')
 
      n = MAX( Mesh % MaxElementDOFs, Mesh % MaxElementNodes )
@@ -1872,14 +1860,9 @@ CONTAINS
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*6) )
      END IF
 
-     Model % Solver => StSolver
-     IF ( EigenAnalysis ) &
-       CALL ListAddLogical( SolverParams, 'Eigen Analysis', .FALSE. )
-
-     IF( HarmonicAnalysis ) &
-       CALL ListAddLogical( SolverParams, 'Harmonic Analysis', .FALSE. ) 
-
-     StSolver % NOFEigenValues=0
+     ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
+     ! relaxation factor are put aside here and given back by NodalProjectorEnd.
+     CALL NodalProjectorBegin( Proj, Solver )
 
      Ident = 0.0d0
      DO i=1,3
@@ -1890,10 +1873,6 @@ CONTAINS
                  CurrentCoordinateSystem() == CylindricSymmetric
 
      IND = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
-
-     Relax = GetCReal( StSolver % Values,'Nonlinear System Relaxation Factor', Found )
-     IF ( .NOT. Found ) Relax = 1.0d0
-     CALL ListAddConstReal( StSolver % Values,'Nonlinear System Relaxation Factor', 1.0d0 )
 
      NodalStress  = 0.0d0
      ForceG       = 0.0d0
@@ -2240,26 +2219,10 @@ CONTAINS
       DEALLOCATE( Basis, dBasisdx )
       DEALLOCATE( Indexes, LocalDisplacement, MASS, FORCE )
 
-      IF ( EigenAnalysis ) &
-        CALL ListAddLogical( SolverParams, 'Eigen Analysis', .TRUE. )
-      IF ( HarmonicAnalysis ) &
-        CALL ListAddLogical( SolverParams, 'Harmonic Analysis', .TRUE. )
-      CALL ListAddConstReal( SolverParams,'Nonlinear System Relaxation Factor', Relax )
-
-
-      Model % Solver => Solver
-
-      IF( LimiterOn ) THEN
-        CALL ListAddLogical( SolverParams,'Apply Limiter',.TRUE.) 
-      END IF
-      IF( ContactOn ) THEN
-        CALL ListAddLogical( SolverParams,'Apply Contact BCs',.TRUE.) 
-      END IF
+      CALL NodalProjectorEnd( Proj, Solver )
 
       CALL Info('StressSolver','Finished Stress Computation',Level=7)
       CALL Info('StressSolver','------------------------------------------',Level=7)
-
-      CALL ListSetNameSpace('')
 
 !------------------------------------------------------------------------------
    END SUBROUTINE ComputeStress

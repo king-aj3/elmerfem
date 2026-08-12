@@ -3388,7 +3388,10 @@ CONTAINS
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
     END IF
 
-    Model % Solver => StSolver
+    ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
+    ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
+    ! until NodalProjectorEnd.
+    CALL NodalProjectorBegin( Proj, Solver )
     NodalStrain = 0.0d0
     SForceG = 0.0d0
 
@@ -3564,8 +3567,7 @@ CONTAINS
          Basis, &
          dBasisdx )
 
-    Model % Solver => Solver
-    CALL ListSetNameSpace('')
+    CALL NodalProjectorEnd( Proj, Solver )
 
     CALL Info(Caller,'Finished strain postprocessing',Level=7)
 !--------------------------------------------------------------------------------
@@ -3658,7 +3660,10 @@ CONTAINS
     END IF
 
     StressDofs = UMatStressVar % Dofs
-    Model % Solver => StSolver
+    ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
+    ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
+    ! until NodalProjectorEnd.
+    CALL NodalProjectorBegin( Proj, Solver )
     NodalStress = 0.0d0
     SForceG = 0.0d0
 
@@ -3818,8 +3823,7 @@ CONTAINS
          SForce, &
          Basis )
 
-    Model % Solver => Solver
-    CALL ListSetNameSpace('')
+    CALL NodalProjectorEnd( Proj, Solver )
 
     CALL Info(Caller,'Finished stress postprocessing',Level=7)
 !----------------------------------------------------------------------------------
@@ -3932,21 +3936,12 @@ CONTAINS
        IF (CalculateStresses) ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
     END IF
 
-    LimiterOn = ListGetLogical( StSolver % Values,'Apply Limiter', Found ) 
-    IF( LimiterOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Apply Limiter',.FALSE.)
-    END IF
-    ContactOn = ListGetLogical( StSolver % Values,'Apply Contact BCs', Found ) 
-    IF( ContactOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Apply Contact BCs',.FALSE.)
-    END IF
-    ResidualOn = ListGetLogical( StSolver % Values,'Linear System Residual Mode', Found ) 
-    IF( ResidualOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Linear System Residual Mode',.FALSE.)
-    END IF
     
 
-    Model % Solver => StSolver
+    ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
+    ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
+    ! until NodalProjectorEnd.
+    CALL NodalProjectorBegin( Proj, Solver )
     IF (AxialSymmetry) THEN
        Ind = (/ 1, 4, 4, 3, 0, 0, 0, 0, 0 /)
     ELSE
@@ -4515,19 +4510,8 @@ CONTAINS
          NodalLame1, &
          NodalLame2 )  
 
-    Model % Solver => Solver
+    CALL NodalProjectorEnd( Proj, Solver )
 
-    CALL ListSetNameSpace('')
-
-    IF( LimiterOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Apply Limiter',.TRUE.)
-    END IF
-    IF( ContactOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Apply Contact BCs',.TRUE.)
-    END IF
-    IF( ResidualOn ) THEN
-      CALL ListAddLogical( StSolver % Values,'Linear System Residual Mode',.TRUE.)
-    END IF
 
     CALL Info(Caller,'Finished postprocessing',Level=7)
 !--------------------------------------------------------------------------------
