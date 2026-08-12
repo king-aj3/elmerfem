@@ -1851,7 +1851,10 @@ CONTAINS
          SFORCE(6*n), &
          Basis(n), dBasisdx(n,3) )
 
-     GlobalBubbles = GetLogical(SolverParams,'Bubbles in Global System',Found, DefValue = .TRUE. )
+     ! Derived rather than assumed true: SetGlobalBubblesFlag falls back to the
+     ! solver's "Element" definition, and then to the Equation section's, so a case
+     ! with no bubbles no longer gets a projection matrix built as though it had.
+     GlobalBubbles = SetGlobalBubblesFlag( Solver )
 
      CALL NodalProjectorSetup( Proj, Solver, 'stress:', 'Calculate Stresses', &
          'StressTemp', GlobalBubbles, Rebuilt, VarPerm = StressPerm, &

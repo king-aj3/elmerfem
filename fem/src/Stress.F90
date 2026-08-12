@@ -1938,6 +1938,12 @@ CONTAINS
      TYPE(NodalProjector_t) :: Proj
      TYPE(Solver_t) :: Solver
      CHARACTER(LEN=*) :: NameSpace, MaskKeyword, TempName
+     !> Bubble handling, derived by the caller from the element definition. It is
+     !> deliberately not settable for the projection alone: the assembly loop walks
+     !> the element's DOFs, so a matrix built without the bubbles the element
+     !> actually has is glued into out of bounds and segfaults in
+     !> CRS_GlueLocalMatrix. Setting "Bubbles in Global System" without a namespace
+     !> still works and applies to the primary solver and the projection alike.
      LOGICAL :: GlobalBubbles
      LOGICAL, INTENT(OUT) :: Rebuilt
      !> Permutation recorded on the hidden variable. Defaults to the projection's
@@ -1986,6 +1992,7 @@ CONTAINS
 
      OptimizeBW = GetLogical( Proj % PSolver % Values, 'Optimize Bandwidth', Found )
      IF ( .NOT. Found ) OptimizeBW = .TRUE.
+
 
      ! Restrict the projection to the bodies that asked for it, when any did.
      IF ( ListGetLogicalAnyEquation( CurrentModel, MaskKeyword ) ) THEN

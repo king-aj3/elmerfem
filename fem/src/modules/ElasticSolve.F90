@@ -3367,14 +3367,7 @@ CONTAINS
     ! as its owner, and VariableGet dereferences that owner
     ! (ListGetString(PVar % Solver % Values,'Equation')), so releasing it would
     ! leave the previous mesh's variable list pointing at freed memory.
-    ! Resolved here rather than inside the projector so that the projector stays
-    ! free of the MainUtils dependency. StSolver % Values is Solver % Values --
-    ! the assignment below is a shallow copy -- so this is what the original code
-    ! did, just written against the solver it actually reaches.
-    GlobalBubbles = GetLogical( Solver % Values, 'Bubbles in Global System', Found )
-    IF(Found) THEN
-      CALL ListAddLogical( Solver % Values, 'Bubbles in Global System', GlobalBubbles )
-    END IF
+    ! Resolved here rather than inside the projector, which sits below MainUtils.
     GlobalBubbles = SetGlobalBubblesFlag( Solver )
 
     CALL NodalProjectorSetup( Proj, Solver, 'strain:', 'Calculate Strains', &
@@ -3632,12 +3625,7 @@ CONTAINS
          Basis(n) )
 
     ! Rebuilt on mesh change -- see the note in GenerateStrainVariable.
-    ! See the note in GenerateStrainVariable: resolved against Solver, which is the
-    ! same keyword list the shallow-copied auxiliary solver would present.
-    GlobalBubbles = GetLogical( Solver % Values, 'Bubbles in Global System', Found )
-    IF(Found) THEN
-      CALL ListAddLogical( Solver % Values, 'Bubbles in Global System', GlobalBubbles )
-    END IF
+    ! Resolved here rather than inside the projector, which sits below MainUtils.
     GlobalBubbles = SetGlobalBubblesFlag( Solver )
 
     CALL NodalProjectorSetup( Proj, Solver, 'stress:', 'Calculate Stresses', &
@@ -3916,11 +3904,7 @@ CONTAINS
          NodalLame2(n) )   
 
     ! Rebuilt on mesh change -- see the note in GenerateStrainVariable.
-    ! See the note in GenerateStrainVariable.
-    GlobalBubbles = GetLogical( Solver % Values, 'Bubbles in Global System', Found )
-    IF(Found) THEN
-      CALL ListAddLogical( Solver % Values, 'Bubbles in Global System', GlobalBubbles )
-    END IF
+    ! Resolved here rather than inside the projector, which sits below MainUtils.
     GlobalBubbles = SetGlobalBubblesFlag( Solver )
 
     ! Unlike the other two callers this one registers the hidden variable against
