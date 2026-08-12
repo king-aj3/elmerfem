@@ -3053,7 +3053,7 @@ CONTAINS
 
      ALLOCATE( ElasticModulus(6,6,nd), NodalDensity(n), NodalPoissonRatio(n), &
          NodalDamping(n), NodalDisplacement(3,nd), LocalHExp(3,3,n), vec(nd), &
-         Stressi(3,3,nd), LocalTemp(nd), Basis(nd), dBasisdx(3,nd), &
+         Stressi(3,3,nd), LocalTemp(nd), Basis(nd), dBasisdx(nd,3), &
          NodalForce(4,n), Veloc(3,nd), Accel(3,nd) )
 
      LocalTemp = 0
