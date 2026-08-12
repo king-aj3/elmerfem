@@ -4109,13 +4109,20 @@ END SUBROUTINE ElasticStrainAtIP
      TYPE( Element_t ) :: Edge
      REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
 !------------------------------------------------------------------------------
-     ! Unconditionally geometrically nonlinear, which is what these estimators have
-     ! always been. Note this disagrees with the assembly, which honours
-     ! "Large Deflection" since it was taught to; passing that keyword through here
-     ! instead is a deliberate follow-up, not an oversight, and would change what
-     ! gets refined in any case that sets it false.
+     LOGICAL :: LargeDeflection, Found
+!------------------------------------------------------------------------------
+     ! These estimators used to be unconditionally geometrically nonlinear, which
+     ! disagreed with the assembly from the moment that learned to honour the
+     ! keyword: a case asking for small strain got a small-strain solution graded
+     ! by a large-deflection error estimate. Same default as ElasticSolver's own
+     ! reading, so a sif that does not mention it is unaffected.
+     LargeDeflection = .TRUE.
+     IF ( ASSOCIATED( Model % Solver ) ) THEN
+       LargeDeflection = ListGetLogical( Model % Solver % Values, 'Large Deflection', Found )
+       IF ( .NOT. Found ) LargeDeflection = .TRUE.
+     END IF
      CALL ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator, &
-         LargeDeflection = .TRUE. )
+         LargeDeflection )
    END SUBROUTINE ElasticSolver_Boundary_Residual
 !------------------------------------------------------------------------------
 
@@ -4132,13 +4139,20 @@ END SUBROUTINE ElasticStrainAtIP
      TYPE(Element_t) :: Edge
      REAL(KIND=dp) :: Quant(:), Indicator(2)
 !------------------------------------------------------------------------------
-     ! Unconditionally geometrically nonlinear, which is what these estimators have
-     ! always been. Note this disagrees with the assembly, which honours
-     ! "Large Deflection" since it was taught to; passing that keyword through here
-     ! instead is a deliberate follow-up, not an oversight, and would change what
-     ! gets refined in any case that sets it false.
+     LOGICAL :: LargeDeflection, Found
+!------------------------------------------------------------------------------
+     ! These estimators used to be unconditionally geometrically nonlinear, which
+     ! disagreed with the assembly from the moment that learned to honour the
+     ! keyword: a case asking for small strain got a small-strain solution graded
+     ! by a large-deflection error estimate. Same default as ElasticSolver's own
+     ! reading, so a sif that does not mention it is unaffected.
+     LargeDeflection = .TRUE.
+     IF ( ASSOCIATED( Model % Solver ) ) THEN
+       LargeDeflection = ListGetLogical( Model % Solver % Values, 'Large Deflection', Found )
+       IF ( .NOT. Found ) LargeDeflection = .TRUE.
+     END IF
      CALL ElasticityEdgeResidual( Model, Edge, Mesh, Quant, Perm, Indicator, &
-         LargeDeflection = .TRUE. )
+         LargeDeflection )
    END SUBROUTINE ElasticSolver_Edge_Residual
 !------------------------------------------------------------------------------
 
@@ -4155,12 +4169,19 @@ END SUBROUTINE ElasticStrainAtIP
      TYPE( Element_t ) :: Element
      REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
 !------------------------------------------------------------------------------
-     ! Unconditionally geometrically nonlinear, which is what these estimators have
-     ! always been. Note this disagrees with the assembly, which honours
-     ! "Large Deflection" since it was taught to; passing that keyword through here
-     ! instead is a deliberate follow-up, not an oversight, and would change what
-     ! gets refined in any case that sets it false.
+     LOGICAL :: LargeDeflection, Found
+!------------------------------------------------------------------------------
+     ! These estimators used to be unconditionally geometrically nonlinear, which
+     ! disagreed with the assembly from the moment that learned to honour the
+     ! keyword: a case asking for small strain got a small-strain solution graded
+     ! by a large-deflection error estimate. Same default as ElasticSolver's own
+     ! reading, so a sif that does not mention it is unaffected.
+     LargeDeflection = .TRUE.
+     IF ( ASSOCIATED( Model % Solver ) ) THEN
+       LargeDeflection = ListGetLogical( Model % Solver % Values, 'Large Deflection', Found )
+       IF ( .NOT. Found ) LargeDeflection = .TRUE.
+     END IF
      CALL ElasticityInsideResidual( Model, Element, Mesh, Quant, Perm, Fnorm, Indicator, &
-         LargeDeflection = .TRUE. )
+         LargeDeflection )
    END SUBROUTINE ElasticSolver_Inside_Residual
 !------------------------------------------------------------------------------

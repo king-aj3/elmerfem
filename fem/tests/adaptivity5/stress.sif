@@ -74,6 +74,6 @@ Boundary Condition 2
   Force 1 = -20.0
 End
 
-Solver 1 :: Reference Norm = Real 0.161977494682E-03
+Solver 1 :: Reference Norm = Real 0.162429076E-03
 Solver 1 :: Reference Norm Tolerance = Real 0.05
 RUN
