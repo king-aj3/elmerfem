@@ -66,6 +66,11 @@ MODULE StressLocal
 !------------------------------------------------------------------------------
   TYPE :: NodalProjector_t
     TYPE(Solver_t), POINTER :: PSolver => NULL()
+    !> The primary solver this projection serves. Held because an assembly callback
+    !> is necessarily file scope -- see NodalProjectorAssemble -- so it cannot reach
+    !> the solver by host association and has nowhere else to get it. PSolver is no
+    !> substitute: its Variable is the projection's hidden scalar, not the field.
+    TYPE(Solver_t), POINTER :: Solver => NULL()
     INTEGER, POINTER :: Perm(:) => NULL()
     CHARACTER(LEN=MAX_NAME_LEN) :: EqName = ' '
     LOGICAL :: UseMask = .FALSE.
@@ -79,6 +84,37 @@ MODULE StressLocal
     LOGICAL :: FreeFactorize = .FALSE., FoundFreeFactorize = .FALSE.
     LOGICAL :: SkipChange = .FALSE., FoundSkipChange = .FALSE.
   END TYPE NodalProjector_t
+
+!------------------------------------------------------------------------------
+!> What a caller of NodalProjectorAssemble supplies: the tensor, or the pair of
+!> them, to be fitted at one integration point. This is the only part of a nodal
+!> projection that knows any physics -- everything around it is the same whatever
+!> is being projected.
+!>
+!> An implementation of this MUST be a file scope procedure, not an internal one.
+!> gfortran carries host association through a trampoline on the stack, which marks
+!> the shared object as needing an executable stack and makes the solver module
+!> fail to load outright ("cannot enable executable stack as shared object
+!> requires"). Check with: readelf -lW <module>.so | grep GNU_STACK -- RW is fine,
+!> RWE is this bug. That is why Proj is passed rather than reached: it is the
+!> callback's only route to the solver and hence to the material and the solution.
+!>
+!> Per-element work must not be repeated at every point; do it when t == 1.
+!>
+!> T2 is untouched unless the caller asked for two fields. Both arrive zeroed, so
+!> a component the model does not set stays zero.
+!------------------------------------------------------------------------------
+  ABSTRACT INTERFACE
+    SUBROUTINE ProjectedTensors_i( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T1, T2 )
+      IMPORT :: dp, Element_t, Nodes_t, NodalProjector_t
+      TYPE(NodalProjector_t) :: Proj
+      TYPE(Element_t), POINTER :: Element
+      TYPE(Nodes_t) :: Nodes
+      INTEGER :: n, nd, t
+      REAL(KIND=dp) :: Basis(:), dBasisdx(:,:)
+      REAL(KIND=dp) :: T1(3,3), T2(3,3)
+    END SUBROUTINE ProjectedTensors_i
+  END INTERFACE
 
 !------------------------------------------------------------------------------
   CONTAINS
@@ -2168,7 +2204,7 @@ CONTAINS
        GlobalBubbles, Rebuilt, VarPerm, ReuseExisting )
 !------------------------------------------------------------------------------
      TYPE(NodalProjector_t) :: Proj
-     TYPE(Solver_t) :: Solver
+     TYPE(Solver_t), TARGET :: Solver
      CHARACTER(LEN=*) :: NameSpace, MaskKeyword, TempName
      !> Bubble handling, derived by the caller from the element definition. It is
      !> deliberately not settable for the projection alone: the assembly loop walks
@@ -2192,6 +2228,7 @@ CONTAINS
      INTEGER, POINTER :: PermForVar(:)
 !------------------------------------------------------------------------------
      CALL ListSetNameSpace( NameSpace )
+     Proj % Solver => Solver
 
      Rebuilt = ( .NOT. Proj % Initialized ) .OR. Solver % MeshChanged
      IF ( .NOT. Rebuilt ) RETURN
@@ -2314,6 +2351,109 @@ CONTAINS
      CurrentModel % Solver => Proj % PSolver
 !------------------------------------------------------------------------------
    END SUBROUTINE NodalProjectorBegin
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Assemble a nodal projection: walk the active elements, and at every integration
+!> point add the Galerkin mass and the right hand side of whatever tensor the
+!> caller supplies. One or two fields, the second being how a caller that wants
+!> stress and strain gets both out of a single pass.
+!>
+!> GetTensors must be a file scope procedure -- see ProjectedTensors_i for why an
+!> internal one cannot be used, and what it costs if tried.
+!>
+!> CSymmetry is passed rather than asked, because the callers do not agree on it:
+!> StressSolve counts CylindricSymmetric as axisymmetric and ElasticSolve does not.
+!> That disagreement is theirs to keep until someone decides it.
+!>
+!> The right hand side handed to DefaultUpdateEquations is a zero vector: only the
+!> mass matrix is wanted from it, and each component solve overwrites the system's
+!> right hand side from ForceG before running.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorAssemble( Proj, ncomp, CSymmetry, GetTensors, ForceG, ForceG2 )
+!------------------------------------------------------------------------------
+     TYPE(NodalProjector_t) :: Proj
+     INTEGER :: ncomp
+     LOGICAL :: CSymmetry
+     PROCEDURE(ProjectedTensors_i) :: GetTensors
+     REAL(KIND=dp) :: ForceG(:)
+     REAL(KIND=dp), OPTIONAL :: ForceG2(:)
+!------------------------------------------------------------------------------
+     TYPE(Solver_t), POINTER :: PSolver
+     TYPE(Element_t), POINTER :: Element
+     TYPE(ValueList_t), POINTER :: Equation
+     TYPE(Nodes_t), SAVE :: Nodes
+     TYPE(GaussIntegrationPoints_t) :: IP
+     INTEGER, POINTER :: Indices(:)
+     REAL(KIND=dp), ALLOCATABLE :: Mass(:,:), Force(:), SForce(:), Zero(:), &
+         Basis(:), dBasisdx(:,:)
+     REAL(KIND=dp) :: T1(3,3), T2(3,3), detJ, Weight
+     INTEGER :: nmax, elem, n, nd, t
+     LOGICAL :: stat, Found, Two
+!------------------------------------------------------------------------------
+     PSolver => Proj % PSolver
+     Two = PRESENT( ForceG2 )
+
+     nmax = PSolver % Mesh % MaxElementDOFs
+     ALLOCATE( Indices(nmax), Mass(nmax,nmax), Force(ncomp*nmax), &
+         SForce(ncomp*nmax), Zero(nmax), Basis(nmax), dBasisdx(nmax,3) )
+     Zero = 0.0_dp
+
+     ForceG = 0.0_dp
+     IF ( Two ) ForceG2 = 0.0_dp
+
+     CALL InitializeToZero( PSolver % Matrix, PSolver % Matrix % RHS )
+     IF( ALLOCATED(PSolver % Matrix % ConstrainedDOF) ) &
+         PSolver % Matrix % ConstrainedDOF = .FALSE.
+     IF( ALLOCATED(PSolver % Matrix % Dvalues) ) PSolver % Matrix % Dvalues = 0.0_dp
+
+     DO elem = 1, PSolver % NumberOfActiveElements
+       Element => GetActiveElement( elem, PSolver )
+
+       ! Only the bodies that asked for this field, when any did.
+       IF ( Proj % UseMask ) THEN
+         Equation => GetEquation()
+         IF ( .NOT. GetLogical( Equation, Proj % EqName, Found ) ) CYCLE
+       END IF
+
+       n = GetElementNOFNodes()
+       nd = GetElementDOFs( Indices )
+       CALL GetElementNodes( Nodes )
+
+       Mass = 0.0_dp
+       Force = 0.0_dp
+       SForce = 0.0_dp
+
+       IP = GaussPoints( Element )
+       DO t=1,IP % n
+         stat = ElementInfo( Element, Nodes, IP % u(t), IP % v(t), IP % w(t), &
+             detJ, Basis, dBasisdx )
+
+         Weight = IP % s(t) * detJ
+         ! An L2 fit is a volume integral, so in axisymmetric coordinates it is
+         ! weighted by the radius like any other. Without this the fit is made in
+         ! the Cartesian metric and every varying component comes out wrong.
+         IF ( CSymmetry ) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
+
+         T1 = 0.0_dp
+         T2 = 0.0_dp
+         CALL GetTensors( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T1, T2 )
+
+         CALL NodalProjectorMass( Mass, Basis, nd, Weight )
+         CALL NodalProjectorTensor( Force, Basis, nd, ncomp, Weight, T1 )
+         IF ( Two ) CALL NodalProjectorTensor( SForce, Basis, nd, ncomp, Weight, T2 )
+       END DO
+
+       CALL DefaultUpdateEquations( Mass, Zero(1:nd) )
+
+       CALL NodalProjectorGlue( ForceG, Force, Proj % Perm, Indices, nd, ncomp )
+       IF ( Two ) CALL NodalProjectorGlue( ForceG2, SForce, Proj % Perm, Indices, nd, ncomp )
+     END DO
+
+     DEALLOCATE( Indices, Mass, Force, SForce, Zero, Basis, dBasisdx )
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorAssemble
 !------------------------------------------------------------------------------
 
 

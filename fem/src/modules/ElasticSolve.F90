@@ -3310,46 +3310,16 @@ CONTAINS
     LOGICAL :: CalculateStrains, AxialSymmetry, LargeDeflection
 !--------------------------------------------------------------------------------
     TYPE(Solver_t), POINTER :: StSolver
-    TYPE(Nodes_t) :: Nodes
-    TYPE(Element_t), POINTER :: Element
-    TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
-    TYPE(ValueList_t), POINTER :: Equation
-
-    LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
-    INTEGER, POINTER :: Permutation(:), Indices(:)
-    INTEGER :: dim, elem, n, nd, i, k, l, p, q, StrainDim
-
-    REAL(KIND=dp), POINTER :: StrainTemp(:)
-    REAL(KIND=dp), ALLOCATABLE :: SForceG(:), LocalDisplacement(:,:)
-    REAL(KIND=dp), ALLOCATABLE :: Mass(:,:), Force(:), SForce(:), Basis(:), dBasisdx(:,:)
-
-    REAL(KIND=dp) :: Identity(3,3), Strain(3,3), Grad(3,3)
-    REAL(KIND=dp) :: u, v, w, Weight, detJ, r, res
-
-    CHARACTER(LEN=MAX_NAME_LEN) :: eqname
+    LOGICAL :: GlobalBubbles, Rebuilt
+    INTEGER :: StrainDim
+    REAL(KIND=dp), ALLOCATABLE :: SForceG(:)
 
     TYPE(NodalProjector_t), SAVE :: Proj
-    LOGICAL :: Rebuilt
+    PROCEDURE(ProjectedTensors_i) :: ElasticStrainAtIP
 
-    SAVE Force, SForceG, Nodes
-    SAVE StrainDim
+    SAVE SForceG, StrainDim
  !--------------------------------------------------------------------------------
     IF (.NOT. CalculateStrains) RETURN
-
-    IF (AxialSymmetry) THEN
-      dim = CoordinateSystemDimension()
-    ELSE
-      dim = 3
-    END IF
-
-    n = Solver % Mesh % MaxElementDOFs
-    ALLOCATE( Indices(n), &
-         LocalDisplacement(3,n), &
-         Mass(n,n), &
-         Force(n), &
-         SForce(6*n), &
-         Basis(n), &
-         dBasisdx(n,3) )
 
     ! The saved matrix and permutation describe the mesh we last ran on. After a
     ! refinement they are stale, and gluing element contributions into them
@@ -3365,14 +3335,9 @@ CONTAINS
         'StrainTemp', GlobalBubbles, Rebuilt )
 
     StSolver => Proj % PSolver
-    Permutation => Proj % Perm
-    UseMask = Proj % UseMask
-    eqname = Proj % EqName
 
     IF ( Rebuilt ) THEN
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
-       ! Note this asks the mesh dimension, not the local "dim" above, which is the
-       ! dimensionality of the strain state and is forced to 3 off the axis.
        StrainDim = SymTensorOutputComponents( CoordinateSystemDimension() )
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StrainDim) )
     END IF
@@ -3382,69 +3347,8 @@ CONTAINS
     ! until NodalProjectorEnd.
     CALL NodalProjectorBegin( Proj, Solver )
     NodalStrain = 0.0d0
-    SForceG = 0.0d0
 
-    CALL DefaultInitialize()
-    !------------------------------------------------------------------------
-    ! Assembly loop 
-    !------------------------------------------------------------------------
-    DO elem = 1, Solver % NumberOfActiveElements
-       Element => GetActiveElement(elem, Solver)
-       n  = GetElementNOFNodes()
-       nd = GetElementDOFs( Indices )
-
-       CALL GetElementNodes( Nodes )
-       CALL GetVectorLocalSolution( LocalDisplacement, USolver=Solver )
-
-       Equation => GetEquation()
-       !---------------------------------------
-       ! Check if strains wanted for this body:
-       ! ---------------------------------------
-       IF( UseMask ) THEN
-          IF(.NOT. GetLogical( Equation, eqname, Found )) CYCLE
-       END IF
-
-       IntegStuff = GaussPoints( element )
-
-       Mass = 0.0d0
-       Force = 0.0d0
-       SForce = 0.0d0        
-       Strain = 0.0d0
-
-       DO t=1,IntegStuff % n
-          u = IntegStuff % u(t)
-          v = IntegStuff % v(t)
-          w = IntegStuff % w(t)
-          Weight = IntegStuff % s(t)
-
-          stat = ElementInfo( Element, Nodes, u, v, w, detJ, Basis, dBasisdx ) 
-          Weight = Weight * detJ
-           ! The projection is an L2 fit, so in axisymmetric coordinates it has to
-           ! be weighted by the radius like any other volume integral. Without this
-           ! the fit is made in the Cartesian metric and every spatially varying
-           ! component comes out different from the correctly weighted one.
-           IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
-
-          Grad = MATMUL( LocalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
-          IF (AxialSymmetry) THEN
-             r = SUM(Basis(1:n) * Nodes % x(1:n))
-             Grad(3,3) = 1.0d0/r * SUM(LocalDisplacement(1,1:nd) * Basis(1:nd))
-          END IF
-          
-          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
-          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
-
-          CALL NodalProjectorMass( Mass, Basis, nd, Weight )
-          CALL NodalProjectorTensor( SForce, Basis, nd, StrainDim, Weight, Strain )
-       END DO
-
-       CALL DefaultUpdateEquations( Mass, Force ) 
-
-       !--------------------------------
-       ! Assemble global RHS vectors:
-       !--------------------------------
-       CALL NodalProjectorGlue( SForceG, SForce, Permutation, Indices, nd, StrainDim )
-    END DO
+    CALL NodalProjectorAssemble( Proj, StrainDim, AxialSymmetry, ElasticStrainAtIP, SForceG )
 
 
     !----------------------------------------------------------------------
@@ -3453,14 +3357,6 @@ CONTAINS
     CALL Info(Caller,'Calculating strain components',Level=7)
 
     CALL NodalProjectorSolve( Proj, 'Strain', StrainDim, SForceG, NodalStrain, Perm )
-
-    DEALLOCATE( Indices, &
-         LocalDisplacement, &
-         MASS, &
-         Force, &
-         SForce, &
-         Basis, &
-         dBasisdx )
 
     CALL NodalProjectorEnd( Proj, Solver )
 
@@ -4133,6 +4029,62 @@ CONTAINS
 
 !------------------------------------------------------------------------------
 END SUBROUTINE ElasticSolver
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The strain at one integration point, for GenerateStrainVariable's projection.
+!>
+!> File scope on purpose, and it has to be: an internal procedure passed as a
+!> callback makes gfortran emit a stack trampoline, which marks the module as
+!> needing an executable stack and stops it loading at all. See
+!> ProjectedTensors_i. The consequence is that nothing here arrives by host
+!> association -- the solver comes through Proj, and the rest is re-derived.
+!------------------------------------------------------------------------------
+SUBROUTINE ElasticStrainAtIP( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T1, T2 )
+!------------------------------------------------------------------------------
+  USE StressLocal
+  IMPLICIT NONE
+
+  TYPE(NodalProjector_t) :: Proj
+  TYPE(Element_t), POINTER :: Element
+  TYPE(Nodes_t) :: Nodes
+  INTEGER :: n, nd, t
+  REAL(KIND=dp) :: Basis(:), dBasisdx(:,:), T1(3,3), T2(3,3)
+!------------------------------------------------------------------------------
+  REAL(KIND=dp), ALLOCATABLE, SAVE :: LocalDisplacement(:,:)
+  REAL(KIND=dp) :: Grad(3,3), r
+  LOGICAL, SAVE :: LargeDeflection, AxialSymmetry
+  LOGICAL :: Found
+!------------------------------------------------------------------------------
+  IF ( t == 1 ) THEN
+    IF ( ALLOCATED(LocalDisplacement) ) THEN
+      IF ( SIZE(LocalDisplacement,2) < Proj % Solver % Mesh % MaxElementDOFs ) &
+          DEALLOCATE( LocalDisplacement )
+    END IF
+    IF ( .NOT. ALLOCATED(LocalDisplacement) ) &
+        ALLOCATE( LocalDisplacement(3, Proj % Solver % Mesh % MaxElementDOFs) )
+
+    ! Read rather than inherited, there being no host to inherit from. Both are
+    ! cheap next to the element assembly, and reading them per element rather than
+    ! once keeps this correct if either changes between calls.
+    LargeDeflection = ListGetLogical( Proj % Solver % Values, 'Large Deflection', Found )
+    IF ( .NOT. Found ) LargeDeflection = .TRUE.
+    AxialSymmetry = ( CurrentCoordinateSystem() == AxisSymmetric )
+
+    CALL GetVectorLocalSolution( LocalDisplacement, USolver = Proj % Solver )
+  END IF
+
+  Grad = MATMUL( LocalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
+  IF ( AxialSymmetry ) THEN
+    r = SUM( Basis(1:n) * Nodes % x(1:n) )
+    Grad(3,3) = SUM( LocalDisplacement(1,1:nd) * Basis(1:nd) ) / r
+  END IF
+
+  T1 = ( TRANSPOSE(Grad) + Grad ) / 2.0_dp
+  IF ( LargeDeflection ) T1 = T1 + MATMUL( TRANSPOSE(Grad), Grad ) / 2.0_dp
+!------------------------------------------------------------------------------
+END SUBROUTINE ElasticStrainAtIP
 !------------------------------------------------------------------------------
 
 
