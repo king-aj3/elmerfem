@@ -2555,6 +2555,29 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> Double contraction of two second order tensors over their leading N by N block,
+!> A:B. Was one copy internal to StressSolve's interior residual and another named
+!> DDOT_PRODUCT in ElasticSolve, identical but for the case of the loop variables.
+!------------------------------------------------------------------------------
+  FUNCTION DDOTPROD(A,B,N) RESULT(C)
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: A(:,:), B(:,:), C
+    INTEGER :: N
+!------------------------------------------------------------------------------
+    INTEGER :: i,j
+!------------------------------------------------------------------------------
+    C = 0.0_dp
+    DO i = 1,N
+       DO j = 1,N
+          C = C + A(i,j)*B(i,j)
+       END DO
+    END DO
+!------------------------------------------------------------------------------
+  END FUNCTION DDOTPROD
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Isotropic Lame parameters at a point, from Young's modulus and Poisson ratio.
 !------------------------------------------------------------------------------
    SUBROUTINE LameParameters( Young, Poisson, PlaneStress, Lame1, Lame2 )
@@ -3332,27 +3355,6 @@ CONTAINS
          NodalDamping, NodalDisplacement, LocalHExp, vec, Stressi, &
          LocalTemp, Basis, dBasisdx, NodalForce, Veloc, Accel )
 
-
-CONTAINS
-
-!------------------------------------------------------------------------------
-  FUNCTION DDOTPROD(A,B,N) RESULT(C)
-!------------------------------------------------------------------------------
-    IMPLICIT NONE
-    DOUBLE PRECISION :: A(:,:),B(:,:),C
-    INTEGER :: N
-!------------------------------------------------------------------------------
-    INTEGER :: I,J
-!------------------------------------------------------------------------------
-    C = 0.0D0
-    DO i = 1,N
-       DO j = 1,N
-          C = C + A(i,j)*B(i,j)
-       END DO
-    END DO
-!------------------------------------------------------------------------------
-  END FUNCTION DDOTPROD
-!------------------------------------------------------------------------------
 
 !------------------------------------------------------------------------------
    END SUBROUTINE ElasticityInsideResidual

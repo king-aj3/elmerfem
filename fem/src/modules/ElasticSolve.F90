@@ -2359,8 +2359,8 @@ CONTAINS
                    ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
                         +(Basis(p)*Force(i)*DetDefG &
                         +Basis(p)*InertialForce(i)*Density &
-                        -DDOT_PRODUCT(dDefG,Stress1,dim) &
-                        +DDOT_PRODUCT(dDefG,dStress1U,dim))*s
+                        -DDOTPROD(dDefG,Stress1,dim) &
+                        +DDOTPROD(dDefG,dStress1U,dim))*s
 
                    DO q = 1,ntot
                       DO j = 1,cdim
@@ -2805,8 +2805,8 @@ CONTAINS
                 ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
                      +Basis(p)*InertialForce(i)*Density &
-                     -DDOT_PRODUCT(Grad,Stress1,dim) &
-                     +DDOT_PRODUCT(Grad,dStress1U,dim))*s
+                     -DDOTPROD(Grad,Stress1,dim) &
+                     +DDOTPROD(Grad,dStress1U,dim))*s
                 
                 DO q = 1,ntot
                    DO j = 1,cdim
@@ -2939,7 +2939,7 @@ CONTAINS
 
              ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                  + Pressure * dBasisdx(p,i) * s &
-                 - Pressure * DDOT_PRODUCT(TRANSPOSE(InvDefG),Grad,dim) * s
+                 - Pressure * DDOTPROD(TRANSPOSE(InvDefG),Grad,dim) * s
 
              IF ( AxialSymmetry .AND. (i==1) ) ForceVector(DOFs*(p-1)+i) = &
                  ForceVector(DOFs*(p-1)+i) + Pressure * Basis(p)/r * s
@@ -2970,7 +2970,7 @@ CONTAINS
                IF (q <= n) THEN
                  StiffMatrix(DOFs*(p-1)+i,DOFs*q) &
                      = StiffMatrix(DOFs*(p-1)+i,DOFs*q) - Basis(q) * &
-                     DDOT_PRODUCT(TRANSPOSE(InvDefG),Grad,dim) * s 
+                     DDOTPROD(TRANSPOSE(InvDefG),Grad,dim) * s 
                END IF
 
              END DO
@@ -4012,25 +4012,6 @@ CONTAINS
     END DO
 !------------------------------------------------------------------------------
   END FUNCTION TRACE
-!------------------------------------------------------------------------------
-
-!------------------------------------------------------------------------------
-  FUNCTION DDOT_PRODUCT(A,B,N) RESULT(C)
-!------------------------------------------------------------------------------
-    IMPLICIT NONE
-    DOUBLE PRECISION :: A(:,:),B(:,:),C
-    INTEGER :: N
-!------------------------------------------------------------------------------
-    INTEGER :: I,J
-!------------------------------------------------------------------------------
-    C = 0.0D0
-    DO I = 1,N
-       DO J = 1,N
-          C = C + A(I,J)*B(I,J)
-       END DO
-    END DO
-!------------------------------------------------------------------------------
-  END FUNCTION DDOT_PRODUCT
 !------------------------------------------------------------------------------
 
 !------------------------------------------------------------------------------
