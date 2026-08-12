@@ -4179,8 +4179,14 @@ END SUBROUTINE ElasticStrainAtIP
            dim = CoordinateSystemDimension()
      END SELECT
 
+     ! dim above is the dimensionality of the stress state, 3 on the axis. DOFs is
+     ! what the solver actually solves for, which is one fewer there: a 2D run has
+     ! no u_theta whichever of the two axisymmetric spellings was written, so both
+     ! must be tested here. Cylindric alone used to fall through and index a 2 DOF
+     ! solution with a stride of 3.
      DOFs = dim
-     IF ( CurrentCoordinateSystem() == AxisSymmetric ) DOFs = DOFs-1
+     IF ( CurrentCoordinateSystem() == AxisSymmetric .OR. &
+          CurrentCoordinateSystem() == CylindricSymmetric ) DOFs = DOFs-1
 !    
 !    --------------------------------------------------
      Element => Edge % BoundaryInfo % Left
@@ -4487,8 +4493,14 @@ CONTAINS
            dim = CoordinateSystemDimension()
      END SELECT
 
+     ! dim above is the dimensionality of the stress state, 3 on the axis. DOFs is
+     ! what the solver actually solves for, which is one fewer there: a 2D run has
+     ! no u_theta whichever of the two axisymmetric spellings was written, so both
+     ! must be tested here. Cylindric alone used to fall through and index a 2 DOF
+     ! solution with a stride of 3.
      DOFs = dim
-     IF ( CurrentCoordinateSystem() == AxisSymmetric ) DOFs = DOFs - 1
+     IF ( CurrentCoordinateSystem() == AxisSymmetric .OR. &
+          CurrentCoordinateSystem() == CylindricSymmetric ) DOFs = DOFs - 1
 
      Metric = 0.0d0
      Identity = 0.0d0
@@ -4783,8 +4795,14 @@ CONTAINS
            dim = CoordinateSystemDimension()
      END SELECT
 
-     DOFs = dim 
-     IF ( CurrentCoordinateSystem() == AxisSymmetric ) DOFs = DOFs-1
+     ! dim above is the dimensionality of the stress state, 3 on the axis. DOFs is
+     ! what the solver actually solves for, which is one fewer there: a 2D run has
+     ! no u_theta whichever of the two axisymmetric spellings was written, so both
+     ! must be tested here. Cylindric alone used to fall through and index a 2 DOF
+     ! solution with a stride of 3.
+     DOFs = dim
+     IF ( CurrentCoordinateSystem() == AxisSymmetric .OR. &
+          CurrentCoordinateSystem() == CylindricSymmetric ) DOFs = DOFs-1
 !
 !    Element nodal points:
 !    ---------------------
