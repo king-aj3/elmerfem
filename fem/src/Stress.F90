@@ -2555,6 +2555,27 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> Trace of a second order tensor over its leading dim by dim block. Was one copy
+!> in each solver, differing only in argument names and in spelling REAL(KIND=dp)
+!> as DOUBLE PRECISION.
+!------------------------------------------------------------------------------
+  FUNCTION TRACE( F, dim ) RESULT(t)
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: F(:,:), t
+    INTEGER :: dim
+!------------------------------------------------------------------------------
+    INTEGER :: i
+!------------------------------------------------------------------------------
+    t = 0.0_dp
+    DO i=1,dim
+       t = t + F(i,i)
+    END DO
+!------------------------------------------------------------------------------
+  END FUNCTION TRACE
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Double contraction of two second order tensors over their leading N by N block,
 !> A:B. Was one copy internal to StressSolve's interior residual and another named
 !> DDOT_PRODUCT in ElasticSolve, identical but for the case of the loop variables.
