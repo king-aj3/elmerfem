@@ -69,7 +69,7 @@ SUBROUTINE StressSolver_Init0( Model,Solver,dt,Transient )
 SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
     USE DefUtils
-    USE StressLocal, ONLY: SymTensorComponents
+    USE StressLocal, ONLY: SymTensorComponents, StressFieldDefinition
     IMPLICIT NONE
 
     TYPE(Model_t)  :: Model
@@ -172,9 +172,12 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
     END IF
 
     IF ( CalcStressAll ) THEN
+      ! The 23 and 13 shears are identically zero in two dimensions and are not
+      ! stored there; zz is, being nonzero under plane strain. See
+      ! SymTensorOutputComponents, which the assembly indexes with.
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
-          'Stress[Stress_xx:1 Stress_yy:1 Stress_zz:1 Stress_xy:1 Stress_yz:1 Stress_xz:1]' )
+          TRIM(StressFieldDefinition('Stress',dim)) )
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
           'vonMises' )
@@ -198,7 +201,7 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
     IF (CalculateStrains) THEN
       CALL ListAddString( SolverParams,&
           NextFreeKeyword('Exported Variable ',SolverParams), &
-          'Strain[Strain_xx:1 Strain_yy:1 Strain_zz:1 Strain_xy:1 Strain_yz:1 Strain_xz:1]' )
+          TRIM(StressFieldDefinition('Strain',dim)) )
       IF (CalcPrincipalStrain) THEN
         CALL ListAddString( SolverParams,&
             NextFreeKeyword('Exported Variable ',SolverParams), &
@@ -1796,7 +1799,7 @@ CONTAINS
      INTEGER :: n,nd
      TYPE(Element_t), POINTER :: Element
 
-     INTEGER :: i,j,k,l,p,q, t, dim,sdim,elem, IND(9), BodyId,EqId
+     INTEGER :: i,j,k,l,p,q, t, dim,sdim,elem, IND(9), BodyId,EqId, ncomp
      LOGICAL :: stat, CSymmetry, Isotropic(2), UseMask, ContactOn
      INTEGER, POINTER :: Visited(:), Indexes(:), Permutation(:)
      REAL(KIND=dp) :: u,v,w,x,y,z,Strain(3,3),Stress(3,3),LGrad(3,3),detJ, &
@@ -1807,13 +1810,15 @@ CONTAINS
      TYPE(Solver_t), POINTER :: StSolver
 
      LOGICAL :: FirstTime = .TRUE., OptimizeBW, GlobalBubbles, &
-          Factorize, FoundFactorize, FreeFactorize, FoundFreeFactorize, &
-          LimiterOn, SkipChange, FoundSkipChange
+          LimiterOn
 
      TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
      CHARACTER(LEN=MAX_NAME_LEN) :: eqname
 
-     SAVE FirstTime, Nodes, StSolver, ForceG, Permutation, SForceG, Eqname, UseMask
+     TYPE(NodalProjector_t), SAVE :: Proj
+     LOGICAL :: Rebuilt
+
+     SAVE Nodes, ForceG, SForceG
 
      ! These variables are needed for Principal stress calculation
      ! they are quite small and allocated even if principal stress calculation
@@ -1825,83 +1830,47 @@ CONTAINS
 
      dim = CoordinateSystemDimension()
 
+     ! Components stored per node, 4 in two dimensions and 6 in three. IND maps a
+     ! tensor index pair onto a slot in either, the 2D layout being the 3D one
+     ! truncated, so a slot beyond ncomp is one that is identically zero here and
+     ! simply not stored.
+     ncomp = SymTensorOutputComponents( dim )
+
      CALL Info('StressSolver','------------------------------------------',Level=5)
      CALL Info('StressSolver','Starting Stress Computation',Level=5)
-
-     ! Temporarily remove application of limiters as they are not needed
-     ! for stress computation. 
-     !-------------------------------------------------------------------
-     LimiterOn = ListGetLogical( SolverParams,'Apply Limiter',Found)
-     IF( LimiterOn ) THEN
-       CALL ListAddLogical( SolverParams,'Apply Limiter',.FALSE.) 
-     END IF
-     ContactOn = ListGetLogical( SolverParams,'Apply Contact BCs',Found)
-     IF( ContactOn ) THEN
-       CALL ListAddLogical( SolverParams,'Apply Contact BCs',.FALSE.) 
-     END IF
 
      CALL ListSetNameSpace('stress:')
 
      n = MAX( Mesh % MaxElementDOFs, Mesh % MaxElementNodes )
      ALLOCATE( Indexes(n), LocalDisplacement(4,n), &
-         MASS(n,n), FORCE(6*n), &
-         SFORCE(6*n), &
+         MASS(n,n), FORCE(ncomp*n), &
+         SFORCE(ncomp*n), &
          Basis(n), dBasisdx(n,3) )
 
-     IF ( FirstTime .OR. Solver % MeshChanged ) THEN
-       IF ( FirstTime ) THEN
-         ALLOCATE( StSolver )
-       ELSE
-         DEALLOCATE( ForceG, SForceG )
-         CALL FreeMatrix( StSolver % Matrix )
-       END IF
+     ! Derived rather than assumed true: SetGlobalBubblesFlag falls back to the
+     ! solver's "Element" definition, and then to the Equation section's, so a case
+     ! with no bubbles no longer gets a projection matrix built as though it had.
+     GlobalBubbles = SetGlobalBubblesFlag( Solver )
 
-       StSolver = Solver
-       StSolver % Variable => VariableGet( StSolver % Mesh % Variables, &
-                  'StressTemp', ThisOnly=.TRUE. )
-       IF ( ASSOCIATED( StSolver % Variable ) ) THEN
-         Permutation => StSolver % Variable % Perm
-       ELSE
-         ALLOCATE( Permutation( SIZE(Solver % Variable % Perm) ) )
-         Permutation = 0
-       END IF
+     CALL NodalProjectorSetup( Proj, Solver, 'stress:', 'Calculate Stresses', &
+         'StressTemp', GlobalBubbles, Rebuilt, VarPerm = StressPerm, &
+         ReuseExisting = .TRUE. )
 
-       OptimizeBW = GetLogical( StSolver % Values, 'Optimize Bandwidth', Found, DefValue = .TRUE. )
+     StSolver => Proj % PSolver
+     Permutation => Proj % Perm
+     UseMask = Proj % UseMask
+     eqname = Proj % EqName
 
-       GlobalBubbles = GetLogical(SolverParams,'Bubbles in Global System',Found, DefValue = .TRUE. )
-
-       IF( ListGetLogicalAnyEquation( Model,'Calculate Stresses' ) ) THEN
-         UseMask = .TRUE.
-         eqname = 'Calculate Stresses'
-       ELSE
-         UseMask = .FALSE.
-         eqname = TRIM( ListGetString( StSolver % Values,'Equation') )
-       END IF
-       StSolver % Matrix => CreateMatrix( Model, Solver, Mesh, Permutation, &
-           1, MATRIX_CRS, OptimizeBW, eqname, GlobalBubbles=GlobalBubbles )
-
-       ALLOCATE( StSolver % Matrix % RHS(StSolver % Matrix % NumberOfRows) )
-       StSolver % Matrix % Comm = Solver % Matrix % Comm
-
-       ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*6) )
-       ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*6) )
-
-       IF ( .NOT. ASSOCIATED( StSolver % Variable ) ) THEN
-          CALL VariableAddVector( StSolver % Mesh % Variables, StSolver % Mesh, StSolver, &
-                 'StressTemp', 1, Perm = StressPerm, Output=.FALSE. )
-          StSolver % Variable => VariableGet( StSolver % Mesh % Variables, 'StressTemp' )
-       END IF
-       FirstTime = .FALSE.
+     IF ( Rebuilt ) THEN
+       IF ( ALLOCATED(ForceG) ) DEALLOCATE( ForceG )
+       IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
+       ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*ncomp) )
+       ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*ncomp) )
      END IF
 
-     Model % Solver => StSolver
-     IF ( EigenAnalysis ) &
-       CALL ListAddLogical( SolverParams, 'Eigen Analysis', .FALSE. )
-
-     IF( HarmonicAnalysis ) &
-       CALL ListAddLogical( SolverParams, 'Harmonic Analysis', .FALSE. ) 
-
-     StSolver % NOFEigenValues=0
+     ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
+     ! relaxation factor are put aside here and given back by NodalProjectorEnd.
+     CALL NodalProjectorBegin( Proj, Solver )
 
      Ident = 0.0d0
      DO i=1,3
@@ -1912,10 +1881,6 @@ CONTAINS
                  CurrentCoordinateSystem() == CylindricSymmetric
 
      IND = (/ 1, 4, 6, 4, 2, 5, 6, 5, 3 /)
-
-     Relax = GetCReal( StSolver % Values,'Nonlinear System Relaxation Factor', Found )
-     IF ( .NOT. Found ) Relax = 1.0d0
-     CALL ListAddConstReal( StSolver % Values,'Nonlinear System Relaxation Factor', 1.0d0 )
 
      NodalStress  = 0.0d0
      ForceG       = 0.0d0
@@ -2025,104 +1990,20 @@ CONTAINS
               Basis, dBasisdx, Nodes, dim, n, nd, .TRUE.,&
               argEvaluateAtIP=EvaluateAtIP, argEvaluateLoadAtIP=EvaluateLoadAtIP,GaussPoint=t )
 
-          DO p=1,nd
-            DO q=1,nd
-              MASS(p,q) = MASS(p,q) + Weight*Basis(q)*Basis(p)
-            END DO
-
-            DO i=1,3
-            DO j=i,3
-              k = Ind( 3*(i-1)+j )
-              FORCE(6*(p-1)+k) = FORCE(6*(p-1)+k) + Weight*Stress(i,j)*Basis(p)
-              SFORCE(6*(p-1)+k) = SFORCE(6*(p-1)+k) + Weight*Strain(i,j)*Basis(p)                  
-            END DO
-            END DO
-          END DO
+          CALL NodalProjectorMass( MASS, Basis, nd, Weight )
+          CALL NodalProjectorTensor( FORCE, Basis, nd, ncomp, Weight, Stress )
+          CALL NodalProjectorTensor( SFORCE, Basis, nd, ncomp, Weight, Strain )
         END DO
 
         CALL DefaultUpdateEquations( MASS, FORCE )
 
-        DO p=1,nd
-          l = Permutation(Indexes(p))
-          DO i=1,3
-          DO j=i,3
-             k = Ind(3*(i-1)+j)
-             ForceG(6*(l-1)+k) = ForceG(6*(l-1)+k) + FORCE(6*(p-1)+k)
-             SForceG(6*(l-1)+k) = SForceG(6*(l-1)+k) + SFORCE(6*(p-1)+k)
-          END DO
-          END DO
-        END DO
+        CALL NodalProjectorGlue( ForceG, FORCE, Permutation, Indexes, nd, ncomp )
+        CALL NodalProjectorGlue( SForceG, SFORCE, Permutation, Indexes, nd, ncomp )
       END DO
 
-      Factorize = GetLogical( SolverParams, 'Linear System Refactorize', FoundFactorize )
-      FreeFactorize = GetLogical( SolverParams, &
-          'Linear System Free Factorization', FoundFreeFactorize )
-      SkipChange = GetLogical( SolverParams, &
-          'Skip Compute Nonlinear Change', FoundSkipChange )
-
-      CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
-      CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )
-      CALL ListAddLogical( SolverParams, 'Skip Compute Nonlinear Change', .TRUE. )
-
-      DO i=1,3
-        DO j=i,3
-          k = IND(3*(i-1)+j)
-          
-          StSolver % Matrix % RHS = ForceG(k::6)
-          
-          DO l=1,SIZE( Permutation )
-            IF ( Permutation(l) <= 0 ) CYCLE
-            StSolver % Variable % Values(Permutation(l)) = NodalStress(6*(StressPerm(l)-1)+k)
-          END DO
-          
-          WRITE( Message,'(A,I0,A,I0,A)') 'Solving for Stress(',i,',',j,')'
-          CALL Info('StressSolver',Message,Level=5)
-
-          st = DefaultSolve()
-
-          DO l=1,SIZE( Permutation )
-            IF ( Permutation(l) <= 0 ) CYCLE
-            NodalStress(6*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
-          END DO
-          
-          IF(CalculateStrains) THEN
-            StSolver % Matrix % RHS = SForceG(k::6)
-            DO l=1,SIZE( Permutation )
-              IF ( Permutation(l) <= 0 ) CYCLE
-              StSolver % Variable % Values(Permutation(l)) = NodalStrain(6*(StressPerm(l)-1)+k)            
-            END DO
-            ! this solves some convergence problems at the expense of bad convergence      
-            ! StSolver % Variable % Values = 0
-
-            WRITE( Message,'(A,I0,A,I0,A)') 'Solving for Strain(',i,',',j,')'
-            CALL Info('StressSolver',Message,Level=5)
-            st = DefaultSolve()
-          
-            DO l=1,SIZE( Permutation )
-              IF ( Permutation(l) <= 0 ) CYCLE
-              NodalStrain(6*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
-            END DO
-          END IF !CalculateStrains
-        END DO
-      END DO
-
-      IF ( FoundFactorize ) THEN
-        CALL ListAddLogical( SolverParams, 'Linear System Refactorize', Factorize )
-      ELSE
-        CALL ListRemove( SolverParams, 'Linear System Refactorize' )
-      END IF
-
-      IF ( FoundFreeFactorize ) THEN
-        CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
-      ELSE
-        CALL ListRemove( SolverParams, 'Linear System Free Factorization' )
-      END IF
-
-      IF( FoundSkipChange ) THEN
-        CALL ListAddLogical( SolverParams, 'Skip Compute Nonlinear Change',SkipChange )
-      ELSE
-        CALL ListRemove( SolverParams, 'Skip Compute Nonlinear Change' )
-      END IF
+      CALL NodalProjectorSolve( Proj, 'Stress', ncomp, ForceG, NodalStress, StressPerm )
+      IF( CalculateStrains ) &
+          CALL NodalProjectorSolve( Proj, 'Strain', ncomp, SForceG, NodalStrain, StressPerm )
 
       ! Von Mises stress from the component nodal values:
       ! -------------------------------------------------
@@ -2130,14 +2011,8 @@ CONTAINS
       DO i=1,SIZE( StressPerm )
          IF ( StressPerm(i) <= 0 ) CYCLE
 
-         p = 0
-         DO j=1,3
-            DO k=1,3
-              p = p + 1
-              q = 6 * (StressPerm(i)-1) + IND(p)
-              Stress(j,k) = NodalStress(q)
-            END DO
-         END DO
+         q = ncomp * (StressPerm(i)-1)
+         CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, Stress )
 
          Stress(:,:) = Stress(:,:) - TRACE(Stress(:,:),3) * Ident/3
 
@@ -2153,20 +2028,13 @@ CONTAINS
       !Principal stresses and Tresca
       IF(CalcPrincipalAll) THEN
         DO i=1,SIZE( StressPerm )
-          IF ( StressPerm(i) <= 0 ) CYCLE       
-          !Stresses: 
-          p = 0
-
+          IF ( StressPerm(i) <= 0 ) CYCLE
+          !Stresses:
           sdim=3
           IF (dim==2.AND.PlaneStress) sdim=2
 
-          DO j=1,3
-            DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-              p = p+1
-              q = 6 * (StressPerm(i)-1) + IND(p)
-              PriCache(j,k) = NodalStress(q)
-            END DO
-          END DO
+          q = ncomp * (StressPerm(i)-1)
+          CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, PriCache )
 
           !Use lapack function to do solve eigenvalues (i.e. principal stresses)
           CALL DSYEV( 'N', 'U', sdim, PriCache, 3, PriW, PriWork, PriLWork, PriInfo )
@@ -2181,14 +2049,8 @@ CONTAINS
 
           IF(CalcPrincipalAngle) THEN
             !DSYEV has changed the vector, so well copy it again from NodalStress
-            p=0
-            DO j=1,3
-              DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-                 p = p+1
-                 q = 6 * (StressPerm(i)-1) + IND(p)
-                 PriCache(j,k) = NodalStress(q)
-              END DO
-            END DO
+            q = ncomp * (StressPerm(i)-1)
+            CALL OutputVector2Tensor( NodalStress(q+1:q+ncomp), ncomp, PriCache )
 
             DO k=1,3 ! for all principal stresses
               ! This is where things get _very_ heary. The code below
@@ -2237,15 +2099,9 @@ CONTAINS
           
           !Strain:
           IF (CalcPrincipalStrain) THEN
-            p=0
-            DO j=1,3
-              DO k=1,3 ! TODO only upper triangle should be filled, this is is wasteful
-                p = p+1
-                q = 6 * (StressPerm(i)-1) + IND(p)
-                PriCache(j,k) = NodalStrain(q)
-              END DO
-            END DO
-      
+            q = ncomp * (StressPerm(i)-1)
+            CALL OutputVector2Tensor( NodalStrain(q+1:q+ncomp), ncomp, PriCache )
+
             sdim=3; IF(dim==2.AND..NOT.PlaneStress) sdim=2
 
             !Use lapack function to do solve eigenvalues
@@ -2262,26 +2118,10 @@ CONTAINS
       DEALLOCATE( Basis, dBasisdx )
       DEALLOCATE( Indexes, LocalDisplacement, MASS, FORCE )
 
-      IF ( EigenAnalysis ) &
-        CALL ListAddLogical( SolverParams, 'Eigen Analysis', .TRUE. )
-      IF ( HarmonicAnalysis ) &
-        CALL ListAddLogical( SolverParams, 'Harmonic Analysis', .TRUE. )
-      CALL ListAddConstReal( SolverParams,'Nonlinear System Relaxation Factor', Relax )
-
-
-      Model % Solver => Solver
-
-      IF( LimiterOn ) THEN
-        CALL ListAddLogical( SolverParams,'Apply Limiter',.TRUE.) 
-      END IF
-      IF( ContactOn ) THEN
-        CALL ListAddLogical( SolverParams,'Apply Contact BCs',.TRUE.) 
-      END IF
+      CALL NodalProjectorEnd( Proj, Solver )
 
       CALL Info('StressSolver','Finished Stress Computation',Level=7)
       CALL Info('StressSolver','------------------------------------------',Level=7)
-
-      CALL ListSetNameSpace('')
 
 !------------------------------------------------------------------------------
    END SUBROUTINE ComputeStress
