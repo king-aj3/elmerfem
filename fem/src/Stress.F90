@@ -2553,6 +2553,706 @@ CONTAINS
 !------------------------------------------------------------------------------
 
 
+
+!------------------------------------------------------------------------------
+!> Adaptivity error estimators for elasticity, shared by both solvers.
+!>
+!> This is StressSolve's version, which is the more capable of the two that
+!> existed: the material arrives through InputTensor as a full tensor with an
+!> Isotropic flag so anisotropy is supported, the stress comes from the shared
+!> LocalStress rather than being computed inline, and elements are reached through
+!> GetElementNOFDOFs/GetElementNodes so p-elements and bubbles are handled.
+!>
+!> These do not cover every feature of either solver -- they estimate the residual
+!> of the plain elasticity operator and predate much of what the two solvers grew
+!> afterwards. Sharing them does not change that; it only stops there being two
+!> versions of the same partial coverage.
+!>
+!> Element is deliberately NOT a POINTER dummy here: Adaptive's InsideResidual
+!> interface declares it as a plain TYPE(Element_t), and a POINTER dummy would read
+!> the target address it is handed as though it were a pointer descriptor. That
+!> silently produces a garbage element and a heap overrun rather than a diagnostic.
+!------------------------------------------------------------------------------
+
+   SUBROUTINE ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator )
+!------------------------------------------------------------------------------
+     USE DefUtils
+     IMPLICIT NONE
+!------------------------------------------------------------------------------
+     TYPE(Model_t) :: Model
+     INTEGER :: Perm(:)
+     TYPE( Mesh_t )    :: Mesh
+     TYPE( Element_t ) :: Edge
+     REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
+!------------------------------------------------------------------------------
+
+     TYPE(Nodes_t) :: Nodes, EdgeNodes
+     TYPE(Element_t), POINTER :: Element, Bndry
+     INTEGER :: i,j,k,n,l,t,dim,DOFs,nd,Pn,En
+     LOGICAL :: stat, Found
+     REAL(KIND=dp) :: SqrtMetric, Metric(3,3), Symb(3,3,3), dSymb(3,3,3,3)
+     REAL(KIND=dp) :: Normal(3), EdgeLength
+     REAL(KIND=dp) :: u, v, w, s, detJ
+
+     REAL(KIND=dp), ALLOCATABLE :: EdgeBasis(:), dEdgeBasisdx(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: x(:), y(:), z(:), ExtPressure(:)
+     REAL(KIND=dp), ALLOCATABLE :: Basis(:),dBasisdx(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: Force(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalDisplacement(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: ElasticModulus(:,:,:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalPoissonRatio(:)
+     REAL(KIND=dp), ALLOCATABLE :: LocalTemp(:), LocalHexp(:,:,:)
+
+     REAL(KIND=dp) :: Residual(3), ResidualNorm, Area
+     REAL(KIND=dp) :: ForceSolved(3), Dir(3)
+     REAL(KIND=dp) :: Displacement(3)
+     REAL(KIND=dp) :: YoungsModulus
+     REAL(KIND=dp) :: PoissonRatio
+     REAL(KIND=dp) :: Grad(3,3), Strain(3,3), Stress1(3,3), Stress2(3,3)
+     REAL(KIND=dp) :: Identity(3,3), YoungsAverage
+
+     LOGICAL :: PlaneStress, Isotropic(2)=.TRUE., CSymmetry = .FALSE.
+     TYPE(ValueList_t), POINTER :: Material, Equation, BodyForce, BC
+     TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
+
+     SAVE Nodes, EdgeNodes
+!------------------------------------------------------------------------------
+
+     ! Initialize:
+     ! -----------
+     Gnorm = 0.0d0
+     Indicator = 0.0d0
+
+     Identity = 0.0d0
+     DO i=1,3
+        Identity(i,i) = 1.0d0
+     END DO
+
+     CSymmetry = CurrentCoordinateSystem() == CylindricSymmetric .OR. &
+                 CurrentCoordinateSystem() == AxisSymmetric
+
+     dim = CoordinateSystemDimension()
+     DOFs = dim
+
+!    --------------------------------------------------
+     Element => Edge % BoundaryInfo % Left
+
+     IF ( .NOT. ASSOCIATED( Element ) ) THEN
+        Element => Edge % BoundaryInfo % Right
+     ELSE IF ( ANY( Perm( Element % NodeIndexes ) <= 0 ) ) THEN
+        Element => Edge % BoundaryInfo % Right
+     END IF
+
+     IF ( .NOT. ASSOCIATED( Element ) ) RETURN
+     IF ( ANY( Perm( Element % NodeIndexes ) <= 0 ) ) RETURN
+
+     En = GetElementNOFNodes( Edge )
+     CALL GetElementNodes( EdgeNodes )
+
+     nd = GetElementNOFDOFs( Element )
+     Pn = GetElementNOFNodes( Element )
+     CALL GetElementNodes( Nodes, UElement=Element )
+
+     ALLOCATE( EdgeBasis(En), dEdgeBasisdx(En,3), x(En), y(En), z(En), &
+        ExtPressure(En), Basis(nd), dBasisdx(nd,3), Force(3,En), &
+        NodalDisplacement(3,nd), ElasticModulus(6,6,Pn),&
+        NodalPoissonRatio(Pn), LocalTemp(nd), LocalHexp(3,3,Pn) )
+
+     LocalTemp = 0
+     LocalHexp = 0
+
+     DO l = 1,En
+       DO k = 1,Pn
+          IF ( Edge % NodeIndexes(l) == Element % NodeIndexes(k) ) THEN
+             x(l) = Element % TYPE % NodeU(k)
+             y(l) = Element % TYPE % NodeV(k)
+             z(l) = Element % TYPE % NodeW(k)
+             EXIT
+          END IF
+       END DO
+     END DO
+
+     ! Integrate square of residual over boundary element:
+     ! ---------------------------------------------------
+     Indicator     = 0.0d0
+     EdgeLength    = 0.0d0
+     YoungsAverage = 0.0d0
+     ResidualNorm  = 0.0d0
+
+     BC => GetBC()
+     IF ( .NOT.ASSOCIATED( BC ) ) RETURN
+
+     ! Logical parameters:
+     ! -------------------
+     Equation => GetEquation( Element )
+     PlaneStress = GetLogical( Equation, 'Plane Stress' ,Found )
+
+     Material => GetMaterial( Element )
+     NodalPoissonRatio(1:pn) = GetReal( &
+                  Material, 'Poisson Ratio',Found, Element )
+     CALL InputTensor( ElasticModulus, Isotropic(1), &
+                 'Youngs Modulus', Material, Pn, Element % NodeIndexes )
+
+     ! Given traction:
+     ! ---------------
+     Force = 0.0d0
+     Force(1,1:En) = GetReal( BC, 'Force 1', Found )
+     Force(2,1:En) = GetReal( BC, 'Force 2', Found )
+     Force(3,1:En) = GetReal( BC, 'Force 3', Found )
+
+     ! Force in normal direction:
+     ! ---------------------------
+     ExtPressure(1:En) = GetReal( BC, 'Normal Force', Found )
+
+     ! If dirichlet BC for displacement in any direction given,
+     ! nullify force in that direction:
+     ! --------------------------------------------------------
+     Dir = 1.0d0
+     IF ( ListCheckPresent( BC, 'Displacement' ) )   Dir = 0
+     IF ( ListCheckPresent( BC, 'Displacement 1' ) ) Dir(1) = 0
+     IF ( ListCheckPresent( BC, 'Displacement 2' ) ) Dir(2) = 0
+     IF ( ListCheckPresent( BC, 'Displacement 3' ) ) Dir(3) = 0
+
+     ! Elementwise nodal solution:
+     ! ---------------------------
+     CALL GetVectorLocalSolution( NodalDisplacement, UElement=Element )
+
+     ! Integration:
+     ! ------------
+     EdgeLength    = 0.0d0
+     YoungsAverage = 0.0d0
+     ResidualNorm  = 0.0d0
+
+     IntegStuff = GaussPoints( Edge )
+
+     DO t=1,IntegStuff % n
+        u = IntegStuff % u(t)
+        v = IntegStuff % v(t)
+        w = IntegStuff % w(t)
+
+        stat = ElementInfo( Edge, EdgeNodes, u, v, w, detJ, &
+            EdgeBasis, dEdgeBasisdx )
+
+        IF ( CurrentCoordinateSystem() == Cartesian ) THEN
+           s = IntegStuff % s(t) * detJ
+        ELSE
+           u = SUM( EdgeBasis(1:En) * EdgeNodes % x(1:En) )
+           v = SUM( EdgeBasis(1:En) * EdgeNodes % y(1:En) )
+           w = SUM( EdgeBasis(1:En) * EdgeNodes % z(1:En) )
+   
+           CALL CoordinateSystemInfo( Metric, SqrtMetric, &
+                       Symb, dSymb, u, v, w )
+
+           s = IntegStuff % s(t) * detJ * SqrtMetric
+        END IF
+
+        Normal = NormalVector( Edge, EdgeNodes, u, v, .TRUE. )
+
+        u = SUM( EdgeBasis(1:En) * x(1:En) )
+        v = SUM( EdgeBasis(1:En) * y(1:En) )
+        w = SUM( EdgeBasis(1:En) * z(1:En) )
+
+        stat = ElementInfo( Element, Nodes, u, v, w, detJ, &
+           Basis, dBasisdx )
+
+        ! Stress tensor on the edge:
+        ! --------------------------
+        CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
+           ElasticModulus, LocalHExp, LocalTemp, &
+           Isotropic, CSymmetry, PlaneStress, &
+           NodalDisplacement, Basis, dBasisdx, Nodes, dim, pn, nd )
+
+        ! Given force at the integration point:
+        ! -------------------------------------
+        Residual = MATMUL( Force(:,1:En), EdgeBasis(1:En) ) - &
+          SUM( ExtPressure(1:En) * EdgeBasis(1:En) ) * Normal
+
+        ForceSolved = MATMUL( Stress1, Normal )
+        Residual = Residual - ForceSolved * Dir
+
+        EdgeLength    = EdgeLength + s
+        ResidualNorm  = ResidualNorm  + s * SUM(Residual(1:DIM) ** 2)
+        YoungsAverage = YoungsAverage + &
+                    s * SUM( ElasticModulus(1,1,1:Pn) * Basis(1:Pn) )
+     END DO
+
+     IF ( YoungsAverage > AEPS ) THEN
+        YoungsAverage = YoungsAverage / EdgeLength
+        Indicator = EdgeLength * ResidualNorm / YoungsAverage
+     END IF
+
+     DEALLOCATE( EdgeBasis, dEdgeBasisdx, x, y, z, ExtPressure, Basis, &
+      dBasisdx, Force, NodalDisplacement, ElasticModulus, NodalPoissonRatio, &
+      LocalTemp, LocalHexp )
+!------------------------------------------------------------------------------
+   END SUBROUTINE ElasticityBoundaryResidual
+
+  SUBROUTINE ElasticityEdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator )
+!------------------------------------------------------------------------------
+     USE DefUtils
+     IMPLICIT NONE
+
+     TYPE(Model_t) :: Model
+     INTEGER :: Perm(:)
+     REAL(KIND=dp) :: Quant(:), Indicator(2)
+     TYPE( Mesh_t )    :: Mesh
+     TYPE( Element_t ) :: Edge
+!------------------------------------------------------------------------------
+
+     TYPE(Nodes_t) :: Nodes, EdgeNodes
+     TYPE(Element_t), POINTER :: Element, Bndry
+
+     INTEGER :: i,j,k,l,n,t,dim,DOFs,En,Pn, nd
+     LOGICAL :: stat, Found
+
+     REAL(KIND=dp) :: SqrtMetric, Metric(3,3), Symb(3,3,3), dSymb(3,3,3,3)
+     REAL(KIND=dp) :: Stressi(3,3,2), Jump(3), Identity(3,3)
+     REAL(KIND=dp) :: Normal(3)
+     REAL(KIND=dp) :: Displacement(3)
+     REAL(KIND=dp) :: YoungsModulus
+     REAL(KIND=dp) :: PoissonRatio
+     REAL(KIND=dp) :: YoungsAverage
+     REAL(KIND=dp) :: Grad(3,3), Strain(3,3), Stress1(3,3), Stress2(3,3)
+
+     REAL(KIND=dp), ALLOCATABLE :: LocalTemp(:), LocalHexp(:,:,:)
+     REAL(KIND=dp), ALLOCATABLE :: x(:), y(:), z(:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalDisplacement(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: ElasticModulus(:,:,:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalPoissonRatio(:)
+     REAL(KIND=dp), ALLOCATABLE :: EdgeBasis(:), Basis(:), dBasisdx(:,:)
+
+     LOGICAL :: PlaneStress, Isotropic(2)=.TRUE., CSymmetry
+
+     TYPE(ValueList_t), POINTER :: Material, Equation
+
+     REAL(KIND=dp) :: u, v, w, s, detJ
+
+     REAL(KIND=dp) :: Residual, ResidualNorm, EdgeLength
+
+     TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
+
+     SAVE Nodes, EdgeNodes
+!------------------------------------------------------------------------------
+
+!    Initialize:
+!    -----------
+     dim = CoordinateSystemDimension()
+     DOFs = dim
+
+     CSymmetry = CurrentCoordinateSystem() == CylindricSymmetric .OR. &
+                 CurrentCoordinateSystem() == AxisSymmetric
+
+
+     Identity = 0.0d0
+     Metric   = 0.0d0
+     DO i = 1,3
+        Metric(i,i)   = 1.0d0
+        Identity(i,i) = 1.0d0
+     END DO
+!
+!    ---------------------------------------------
+     En = GetElementNOFNodes( Edge )
+     CALL GetElementNodes( EdgeNodes, Edge )
+
+     Element => Edge % BoundaryInfo % Left
+     pn = GetElementNOFNodes( Element )
+     nd = GetElementNOFDOFs( Element )
+
+     Element => Edge % BoundaryInfo % Right
+     nd = MAX( nd, GetElementNOFDOFs( Element ) )
+     pn = MAX( pn, GetElementNOFNodes( Element ) )
+
+     ALLOCATE( LocalTemp(nd), LocalHexp(3,3,Pn), x(En), y(En), z(En), &
+      NodalDisplacement(3,nd), ElasticModulus(6,6,pn), &
+      NodalPoissonRatio(pn), EdgeBasis(En), Basis(nd), dBasisdx(nd,3) )
+
+     LocalTemp = 0
+     LocalHexp = 0
+
+!    Integrate square of jump over edge:
+!    ------------------------------------
+     ResidualNorm  = 0.0d0
+     EdgeLength    = 0.0d0
+     Indicator     = 0.0d0
+     Grad          = 0.0d0
+     YoungsAverage = 0.0d0
+
+     IntegStuff = GaussPoints( Edge )
+
+     DO t=1,IntegStuff % n
+
+        u = IntegStuff % u(t)
+        v = IntegStuff % v(t)
+        w = IntegStuff % w(t)
+
+        stat = ElementInfo( Edge, EdgeNodes, u, v, w, detJ, &
+             EdgeBasis, dBasisdx )
+
+        Normal = NormalVector( Edge, EdgeNodes, u, v, .FALSE. )
+
+        IF ( CurrentCoordinateSystem() == Cartesian ) THEN
+           s = IntegStuff % s(t) * detJ
+        ELSE
+           u = SUM( EdgeBasis(1:En) * EdgeNodes % x(1:En) )
+           v = SUM( EdgeBasis(1:En) * EdgeNodes % y(1:En) )
+           w = SUM( EdgeBasis(1:En) * EdgeNodes % z(1:En) )
+
+           CALL CoordinateSystemInfo( Metric, SqrtMetric, &
+                       Symb, dSymb, u, v, w )
+           s = IntegStuff % s(t) * detJ * SqrtMetric
+        END IF
+
+        Stressi = 0.0d0
+        DO i = 1,2
+           IF ( i==1 ) THEN
+              Element => Edge % BoundaryInfo % Left
+           ELSE
+              Element => Edge % BoundaryInfo % Right
+           END IF
+
+           IF ( ANY( Perm( Element % NodeIndexes ) <= 0 ) ) CYCLE
+
+           pn = GetElementNOFNodes( Element )
+           nd = GetElementNOFDOFs( Element )
+           CALL GetElementNodes( Nodes, Element )
+           DO j = 1,en
+              DO k = 1,pn
+                 IF ( Edge % NodeIndexes(j) == Element % NodeIndexes(k) ) THEN
+                    x(j) = Element % TYPE % NodeU(k)
+                    y(j) = Element % TYPE % NodeV(k)
+                    z(j) = Element % TYPE % NodeW(k)
+                    EXIT
+                 END IF
+              END DO
+           END DO
+
+           u = SUM( EdgeBasis(1:En) * x(1:En) )
+           v = SUM( EdgeBasis(1:En) * y(1:En) )
+           w = SUM( EdgeBasis(1:En) * z(1:En) )
+
+           stat = ElementInfo( Element, Nodes, u, v, w, detJ, &
+               Basis, dBasisdx )
+
+           ! Logical parameters:
+           ! -------------------
+           Equation => GetEquation( Element )
+           PlaneStress = GetLogical( Equation,'Plane Stress',Found )
+
+           ! Material parameters:
+           ! --------------------
+           Material => GetMaterial( Element )
+           NodalPoissonRatio(1:pn) = GetReal( Material, 'Poisson Ratio', Found, Element )
+           CALL InputTensor( ElasticModulus, Isotropic(1), &
+                         'Youngs Modulus', Material, pn, Element % NodeIndexes )
+
+           ! Elementwise nodal solution:
+           ! ---------------------------
+           CALL GetVectorLocalSolution( NodalDisplacement, UElement=Element )
+
+           ! Stress tensor on the edge:
+           ! --------------------------
+           CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
+              ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
+              NodalDisplacement, Basis, dBasisdx, Nodes, dim, pn, nd )
+
+           Stressi(:,:,i) = Stress1
+        END DO
+
+        EdgeLength  = EdgeLength + s
+        Jump = MATMUL( ( Stressi(:,:,1) - Stressi(:,:,2)), Normal )
+        ResidualNorm = ResidualNorm + s * SUM( Jump(1:DIM) ** 2 )
+
+        YoungsAverage = YoungsAverage + s *  &
+                    SUM( ElasticModulus(1,1,1:pn) * Basis(1:pn) )
+     END DO
+
+     YoungsAverage = YoungsAverage / EdgeLength
+     Indicator = EdgeLength * ResidualNorm / YoungsAverage
+
+     DEALLOCATE( LocalTemp, LocalHexp, x, y, z, NodalDisplacement, &
+       ElasticModulus, NodalPoissonRatio, EdgeBasis, Basis, dBasisdx )
+!------------------------------------------------------------------------------
+   END SUBROUTINE ElasticityEdgeResidual
+
+   SUBROUTINE ElasticityInsideResidual( Model, Element,  &
+                      Mesh, Quant, Perm, Fnorm, Indicator )
+!------------------------------------------------------------------------------
+     USE DefUtils
+!------------------------------------------------------------------------------
+     IMPLICIT NONE
+!------------------------------------------------------------------------------
+     TYPE(Model_t) :: Model
+     INTEGER :: Perm(:)
+     REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
+     TYPE( Mesh_t )    :: Mesh
+     TYPE( Element_t ) :: Element
+!------------------------------------------------------------------------------
+
+     TYPE(Nodes_t) :: Nodes
+
+     INTEGER :: i,j,k,l,m,n,nd,t,dim,DOFs,I1(6),I2(6)
+     INTEGER, ALLOCATABLE :: Indexes(:)
+
+     LOGICAL :: stat, Found
+
+     TYPE( Variable_t ), POINTER :: Var
+
+     REAL(KIND=dp) :: SqrtMetric, Metric(3,3), Symb(3,3,3), dSymb(3,3,3,3)
+
+     REAL(KIND=dp) :: Density
+     REAL(KIND=dp) :: PoissonRatio
+     REAL(KIND=dp) :: Damping
+     REAL(KIND=dp) :: Displacement(3),Identity(3,3), YoungsAverage
+     REAL(KIND=dp) :: Grad(3,3), Strain(3,3), Stress1(3,3), Stress2(3,3)
+     REAL(KIND=dp) :: Energy
+
+     REAL(KIND=dp), ALLOCATABLE :: ElasticModulus(:,:,:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalDensity(:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalPoissonRatio(:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalDamping(:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalDisplacement(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: LocalHexp(:,:,:), vec(:)
+     REAL(KIND=dp), ALLOCATABLE :: Stressi(:,:,:), LocalTemp(:)
+     REAL(KIND=dp), ALLOCATABLE :: Basis(:), dBasisdx(:,:)
+     REAL(KIND=dp), ALLOCATABLE :: NodalForce(:,:), Veloc(:,:), Accel(:,:)
+
+     LOGICAL :: PlaneStress, CSymmetry, Isotropic(2)=.TRUE., Transient
+
+     REAL(KIND=dp) :: u, v, w, s, detJ
+     REAL(KIND=dp) :: Residual(3), ResidualNorm, Area
+
+     TYPE(ValueList_t), POINTER :: Material, BodyForce, Equation
+
+     TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
+
+     SAVE Nodes
+!------------------------------------------------------------------------------
+     ! Initialize:
+     ! -----------
+     Fnorm     = 0.0d0
+     Indicator = 0.0d0
+
+     IF ( ANY( Perm( Element % NodeIndexes ) <= 0 ) ) RETURN
+
+     Metric = 0.0d0
+     DO i=1,3
+        Metric(i,i) = 1.0d0
+     END DO
+
+     dim = CoordinateSystemDimension()
+     DOFs = dim 
+
+     CSymmetry = CurrentCoordinateSystem() == CylindricSymmetric .OR. &
+                 CurrentCoordinateSystem() == AxisSymmetric
+
+     ! Element nodal points:
+     ! ---------------------
+     nd = GetElementNOFDOFs()
+     n  = GetElementNOFNodes()
+     CALL GetElementNodes( Nodes )
+
+     ALLOCATE( ElasticModulus(6,6,nd), NodalDensity(n), NodalPoissonRatio(n), &
+         NodalDamping(n), NodalDisplacement(3,nd), LocalHExp(3,3,n), vec(nd), &
+         Stressi(3,3,nd), LocalTemp(nd), Basis(nd), dBasisdx(3,nd), &
+         NodalForce(4,n), Veloc(3,nd), Accel(3,nd) )
+
+     LocalTemp = 0
+     LocalHexp = 0
+
+     ! Logical parameters:
+     ! -------------------
+     equation => GetEquation()
+     PlaneStress = GetLogical( Equation, 'Plane Stress',Found )
+
+     ! Material parameters:
+     ! --------------------
+     Material => GetMaterial()
+
+     CALL InputTensor( ElasticModulus, Isotropic(1), &
+           'Youngs Modulus', Material, n, Element % NodeIndexes )
+
+     NodalPoissonRatio(1:n) = GetReal( Material, 'Poisson Ratio', Found )
+
+     ! Check for time dep.
+     ! -------------------
+     IF ( ListGetString( Model % Simulation, 'Simulation Type') == 'transient' ) THEN
+        Transient = .TRUE.
+        Var => VariableGet( Model % Variables, 'Displacement', .TRUE. )
+
+        nd = GetElementDOFs( Indexes )
+
+        Veloc = 0.0d0
+        Accel = 0.0d0
+        DO i=1,DOFs
+           Veloc(i,1:nd) = Var % PrevValues(DOFs*(Var % Perm(Indexes(1:nd))-1)+i,1)
+           Accel(i,1:nd) = Var % PrevValues(DOFs*(Var % Perm(Indexes(1:nd))-1)+i,2)
+        END DO
+        NodalDensity(1:n) = GetReal( Material, 'Density', Found )
+        NodalDamping(1:n) = GetReal( Material, 'Damping', Found )
+     ELSE
+        Transient = .FALSE.
+     END IF
+
+     ! Elementwise nodal solution:
+     ! ---------------------------
+     CALL GetVectorLocalSolution( NodalDisplacement )
+
+     ! Body Forces:
+     ! ------------
+     BodyForce => GetBodyForce()
+
+     NodalForce = 0.0d0
+
+     IF ( ASSOCIATED( BodyForce ) ) THEN
+        NodalForce(1,1:n) = NodalForce(1,1:n) + GetReal( &
+            BodyForce, 'Stress BodyForce 1', Found )
+        NodalForce(2,1:n) = NodalForce(1,1:n) + GetReal( &
+            BodyForce, 'Stress BodyForce 2', Found )
+        NodalForce(3,1:n) = NodalForce(1,1:n) + GetReal( &
+            BodyForce, 'Stress BodyForce 3', Found )
+     END IF
+
+     Identity = 0.0D0
+     DO i = 1,dim
+        Identity(i,i) = 1.0D0
+     END DO
+     CSymmetry = .FALSE.
+
+     Var => VariableGet( Model % Variables, 'Stress 1' )
+     IF ( ASSOCIATED( Var ) ) THEN
+
+       ! If stress already computed:
+       ! ---------------------------
+       I1(1:6) = (/ 1,2,3,1,2,1 /)
+       I2(1:6) = (/ 1,2,3,2,3,3 /)
+       DO i=1,6
+         CALL GetScalarLocalSolution(Vec(1:nd),'Stress ' // CHAR(i+ICHAR('0')))
+         Stressi(I1(i),I2(i),1:nd) = Vec(1:nd)
+         Stressi(I2(i),I1(i),1:nd) = Vec(1:nd)
+       END DO
+     ELSE
+       ! Values of the stress tensor at node points:
+       ! -------------------------------------------
+       DO i = 1,n
+         u = Element % TYPE % NodeU(i)
+         v = Element % TYPE % NodeV(i)
+         w = Element % TYPE % NodeW(i)
+
+         stat = ElementInfo( Element, Nodes, u, v, w, detJ, &
+             Basis, dBasisdx )
+
+         CALL LocalStress( Stressi(:,:,i), Strain, NodalPoissonRatio, &
+                   ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
+                   NodalDisplacement, Basis, dBasisdx, Nodes, dim, n, nd )
+       END DO
+     END IF
+
+     ! Integrate square of residual over element:
+     ! ------------------------------------------
+     ResidualNorm = 0.0d0
+     Fnorm = 0.0d0
+     Area = 0.0d0
+     Energy = 0.0d0
+     YoungsAverage = 0.0d0
+
+     IntegStuff = GaussPoints( Element )
+
+     DO t=1,IntegStuff % n
+        u = IntegStuff % u(t)
+        v = IntegStuff % v(t)
+        w = IntegStuff % w(t)
+
+        stat = ElementInfo( Element, Nodes, u, v, w, detJ, &
+            Basis, dBasisdx )
+
+        IF ( CurrentCoordinateSystem() == Cartesian ) THEN
+           s = IntegStuff % s(t) * detJ
+        ELSE
+           u = SUM( Basis(1:n) * Nodes % x(1:n) )
+           v = SUM( Basis(1:n) * Nodes % y(1:n) )
+           w = SUM( Basis(1:n) * Nodes % z(1:n) )
+
+           CALL CoordinateSystemInfo( Metric,SqrtMetric,Symb,dSymb,u,v,w )
+           s = IntegStuff % s(t) * detJ * SqrtMetric
+        END IF
+
+        ! Residual of the diff.equation:
+        ! ------------------------------
+        Residual = 0.0d0
+        DO i = 1,3
+           Residual(i) = -SUM( NodalForce(i,1:n) * Basis(1:n) )
+
+           IF ( Transient ) THEN
+              Residual(i) = Residual(i) + SUM(NodalDensity(1:n)*Basis(1:n)) * &
+                            SUM( Accel(i,1:nd) * Basis(1:nd) )
+              Residual(i) = Residual(i) + SUM(NodalDamping(1:n)*Basis(1:n)) * &
+                            SUM( Veloc(i,1:nd) * Basis(1:nd) )
+           END IF
+
+           DO j = 1,3
+             Residual(i) = Residual(i) - SUM(Stressi(i,j,1:nd)*dBasisdx(1:nd,j))
+           END DO
+        END DO
+
+!       IF ( CSymmetry ) THEN
+!          DO k=1,3
+!             Residual(1) = Residual(1) + ...
+!          END DO
+!       END IF
+
+       ! Dual norm of the load:
+       ! ----------------------
+        DO i = 1,dim
+           Fnorm = Fnorm + s * SUM( NodalForce(i,1:n) * Basis(1:n) ) ** 2
+        END DO
+
+        YoungsAverage = YoungsAverage + s*SUM( ElasticModulus(1,1,1:n) * Basis(1:n) )
+
+        ! Energy:
+        ! -------
+        CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
+           ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
+           NodalDisplacement, Basis, dBasisdx, Nodes, dim, n, nd )
+
+        Energy = Energy + s*DDOTPROD(Strain,Stress1,dim) / 2.0d0
+
+        Area = Area + s
+        ResidualNorm = ResidualNorm + s * SUM( Residual(1:dim) ** 2 )
+     END DO
+
+     YoungsAverage = YoungsAverage / Area
+     Fnorm = Energy
+     Indicator = Area * ResidualNorm / YoungsAverage
+ 
+     DEALLOCATE( ElasticModulus, NodalDensity, NodalPoissonRatio,  &
+         NodalDamping, NodalDisplacement, LocalHExp, vec, Stressi, &
+         LocalTemp, Basis, dBasisdx, NodalForce, Veloc, Accel )
+
+
+CONTAINS
+
+!------------------------------------------------------------------------------
+  FUNCTION DDOTPROD(A,B,N) RESULT(C)
+!------------------------------------------------------------------------------
+    IMPLICIT NONE
+    DOUBLE PRECISION :: A(:,:),B(:,:),C
+    INTEGER :: N
+!------------------------------------------------------------------------------
+    INTEGER :: I,J
+!------------------------------------------------------------------------------
+    C = 0.0D0
+    DO i = 1,N
+       DO j = 1,N
+          C = C + A(i,j)*B(i,j)
+       END DO
+    END DO
+!------------------------------------------------------------------------------
+  END FUNCTION DDOTPROD
+!------------------------------------------------------------------------------
+
+!------------------------------------------------------------------------------
+   END SUBROUTINE ElasticityInsideResidual
+
 END MODULE StressLocal
 
 !> \}
