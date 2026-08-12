@@ -2555,6 +2555,61 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> Isotropic Lame parameters at a point, from Young's modulus and Poisson ratio.
+!------------------------------------------------------------------------------
+   SUBROUTINE LameParameters( Young, Poisson, PlaneStress, Lame1, Lame2 )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: Young, Poisson, Lame1, Lame2
+     LOGICAL :: PlaneStress
+!------------------------------------------------------------------------------
+     IF ( PlaneStress ) THEN
+       Lame1 = Young * Poisson / ( 1.0_dp - Poisson**2 )
+     ELSE
+       Lame1 = Young * Poisson / ( (1.0_dp + Poisson) * (1.0_dp - 2.0_dp*Poisson) )
+     END IF
+     Lame2 = Young / ( 2.0_dp * (1.0_dp + Poisson) )
+!------------------------------------------------------------------------------
+   END SUBROUTINE LameParameters
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The geometrically nonlinear stress an adaptivity estimator wants: Green-Lagrange
+!> strain, St Venant-Kirchhoff stress from it, pushed forward with the deformation
+!> gradient. Note what comes back is therefore the **first Piola-Kirchhoff** stress,
+!> where the small strain path returns Cauchy; the two coincide only as the
+!> displacement gradient vanishes. Isotropic only, which is what ElasticSolve's
+!> estimators have always been.
+!------------------------------------------------------------------------------
+   SUBROUTINE LargeDeflectionResidualStress( Stress, Strain, Grad, Lame1, Lame2, dim )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: Stress(3,3), Strain(3,3), Grad(3,3), Lame1, Lame2
+     INTEGER :: dim
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: DefG(3,3), Stress2(3,3), Identity(3,3), tr
+     INTEGER :: i
+!------------------------------------------------------------------------------
+     Identity = 0.0_dp
+     DO i=1,3
+       Identity(i,i) = 1.0_dp
+     END DO
+
+     DefG = Identity + Grad
+     Strain = ( TRANSPOSE(Grad) + Grad + MATMUL(TRANSPOSE(Grad),Grad) ) / 2.0_dp
+
+     tr = 0.0_dp
+     DO i=1,dim
+       tr = tr + Strain(i,i)
+     END DO
+
+     Stress2 = 2.0_dp*Lame2*Strain + Lame1*tr*Identity
+     Stress = MATMUL( DefG, Stress2 )
+!------------------------------------------------------------------------------
+   END SUBROUTINE LargeDeflectionResidualStress
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Adaptivity error estimators for elasticity, shared by both solvers.
 !>
 !> This is StressSolve's version, which is the more capable of the two that
@@ -2574,10 +2629,17 @@ CONTAINS
 !> silently produces a garbage element and a heap overrun rather than a diagnostic.
 !------------------------------------------------------------------------------
 
-   SUBROUTINE ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator )
+   SUBROUTINE ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator, LargeDeflection )
 !------------------------------------------------------------------------------
      USE DefUtils
      IMPLICIT NONE
+     !> Geometrically nonlinear stress, as ElasticSolve's estimators have always
+     !> used; false gives the small strain path through LocalStress. Deliberately
+     !> not OPTIONAL -- an absent optional cannot be tested without PRESENT, and
+     !> getting that wrong reads uninitialised memory rather than failing to build.
+     LOGICAL :: LargeDeflection
+     REAL(KIND=dp) :: Lame1, Lame2, ResGrad(3,3)
+
 !------------------------------------------------------------------------------
      TYPE(Model_t) :: Model
      INTEGER :: Perm(:)
@@ -2757,10 +2819,17 @@ CONTAINS
 
         ! Stress tensor on the edge:
         ! --------------------------
+        IF ( LargeDeflection ) THEN
+          CALL LameParameters( SUM( ElasticModulus(1,1,1:pn) * Basis(1:pn) ), &
+              SUM( NodalPoissonRatio(1:pn) * Basis(1:pn) ), PlaneStress, Lame1, Lame2 )
+          ResGrad = MATMUL( NodalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
+          CALL LargeDeflectionResidualStress( Stress1, Strain, ResGrad, Lame1, Lame2, dim )
+        ELSE
         CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
            ElasticModulus, LocalHExp, LocalTemp, &
            Isotropic, CSymmetry, PlaneStress, &
            NodalDisplacement, Basis, dBasisdx, Nodes, dim, pn, nd )
+        END IF
 
         ! Given force at the integration point:
         ! -------------------------------------
@@ -2787,10 +2856,17 @@ CONTAINS
 !------------------------------------------------------------------------------
    END SUBROUTINE ElasticityBoundaryResidual
 
-  SUBROUTINE ElasticityEdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator )
+  SUBROUTINE ElasticityEdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator, LargeDeflection )
 !------------------------------------------------------------------------------
      USE DefUtils
      IMPLICIT NONE
+     !> Geometrically nonlinear stress, as ElasticSolve's estimators have always
+     !> used; false gives the small strain path through LocalStress. Deliberately
+     !> not OPTIONAL -- an absent optional cannot be tested without PRESENT, and
+     !> getting that wrong reads uninitialised memory rather than failing to build.
+     LOGICAL :: LargeDeflection
+     REAL(KIND=dp) :: Lame1, Lame2, ResGrad(3,3)
+
 
      TYPE(Model_t) :: Model
      INTEGER :: Perm(:)
@@ -2951,9 +3027,16 @@ CONTAINS
 
            ! Stress tensor on the edge:
            ! --------------------------
+        IF ( LargeDeflection ) THEN
+          CALL LameParameters( SUM( ElasticModulus(1,1,1:pn) * Basis(1:pn) ), &
+              SUM( NodalPoissonRatio(1:pn) * Basis(1:pn) ), PlaneStress, Lame1, Lame2 )
+          ResGrad = MATMUL( NodalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
+          CALL LargeDeflectionResidualStress( Stress1, Strain, ResGrad, Lame1, Lame2, dim )
+        ELSE
            CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
               ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
               NodalDisplacement, Basis, dBasisdx, Nodes, dim, pn, nd )
+        END IF
 
            Stressi(:,:,i) = Stress1
         END DO
@@ -2975,11 +3058,18 @@ CONTAINS
    END SUBROUTINE ElasticityEdgeResidual
 
    SUBROUTINE ElasticityInsideResidual( Model, Element,  &
-                      Mesh, Quant, Perm, Fnorm, Indicator )
+                      Mesh, Quant, Perm, Fnorm, Indicator, LargeDeflection )
 !------------------------------------------------------------------------------
      USE DefUtils
 !------------------------------------------------------------------------------
      IMPLICIT NONE
+     !> Geometrically nonlinear stress, as ElasticSolve's estimators have always
+     !> used; false gives the small strain path through LocalStress. Deliberately
+     !> not OPTIONAL -- an absent optional cannot be tested without PRESENT, and
+     !> getting that wrong reads uninitialised memory rather than failing to build.
+     LOGICAL :: LargeDeflection
+     REAL(KIND=dp) :: Lame1, Lame2, ResGrad(3,3)
+
 !------------------------------------------------------------------------------
      TYPE(Model_t) :: Model
      INTEGER :: Perm(:)
@@ -3141,9 +3231,16 @@ CONTAINS
          stat = ElementInfo( Element, Nodes, u, v, w, detJ, &
              Basis, dBasisdx )
 
+        IF ( LargeDeflection ) THEN
+          CALL LameParameters( SUM( ElasticModulus(1,1,1:n) * Basis(1:n) ), &
+              SUM( NodalPoissonRatio(1:n) * Basis(1:n) ), PlaneStress, Lame1, Lame2 )
+          ResGrad = MATMUL( NodalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
+          CALL LargeDeflectionResidualStress( Stressi(:,:,i), Strain, ResGrad, Lame1, Lame2, dim )
+        ELSE
          CALL LocalStress( Stressi(:,:,i), Strain, NodalPoissonRatio, &
                    ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
                    NodalDisplacement, Basis, dBasisdx, Nodes, dim, n, nd )
+        END IF
        END DO
      END IF
 
@@ -3210,9 +3307,16 @@ CONTAINS
 
         ! Energy:
         ! -------
+        IF ( LargeDeflection ) THEN
+          CALL LameParameters( SUM( ElasticModulus(1,1,1:n) * Basis(1:n) ), &
+              SUM( NodalPoissonRatio(1:n) * Basis(1:n) ), PlaneStress, Lame1, Lame2 )
+          ResGrad = MATMUL( NodalDisplacement(:,1:nd), dBasisdx(1:nd,:) )
+          CALL LargeDeflectionResidualStress( Stress1, Strain, ResGrad, Lame1, Lame2, dim )
+        ELSE
         CALL LocalStress( Stress1, Strain, NodalPoissonRatio, &
            ElasticModulus, LocalHExp, LocalTemp, Isotropic, CSymmetry, PlaneStress, &
            NodalDisplacement, Basis, dBasisdx, Nodes, dim, n, nd )
+        END IF
 
         Energy = Energy + s*DDOTPROD(Strain,Stress1,dim) / 2.0d0
 

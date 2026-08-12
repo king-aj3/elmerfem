@@ -2788,7 +2788,8 @@ CONTAINS
      TYPE( Mesh_t )    :: Mesh
      TYPE( Element_t ) :: Edge
      REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
-     CALL ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator )
+     CALL ElasticityBoundaryResidual( Model, Edge, Mesh, Quant, Perm, Gnorm, Indicator, &
+         LargeDeflection = .FALSE. )
    END SUBROUTINE StressSolver_Boundary_Residual
 !------------------------------------------------------------------------------
 
@@ -2803,7 +2804,8 @@ CONTAINS
      TYPE(Mesh_t) :: Mesh
      TYPE(Element_t) :: Edge
      REAL(KIND=dp) :: Quant(:), Indicator(2)
-     CALL ElasticityEdgeResidual( Model, Edge, Mesh, Quant, Perm, Indicator )
+     CALL ElasticityEdgeResidual( Model, Edge, Mesh, Quant, Perm, Indicator, &
+         LargeDeflection = .FALSE. )
    END SUBROUTINE StressSolver_Edge_Residual
 !------------------------------------------------------------------------------
 
@@ -2819,6 +2821,7 @@ CONTAINS
      TYPE( Mesh_t )    :: Mesh
      TYPE( Element_t ) :: Element
      REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
-     CALL ElasticityInsideResidual( Model, Element, Mesh, Quant, Perm, Fnorm, Indicator )
+     CALL ElasticityInsideResidual( Model, Element, Mesh, Quant, Perm, Fnorm, Indicator, &
+         LargeDeflection = .FALSE. )
    END SUBROUTINE StressSolver_Inside_Residual
 !------------------------------------------------------------------------------
