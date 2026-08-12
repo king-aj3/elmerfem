@@ -1810,8 +1810,7 @@ CONTAINS
      TYPE(Solver_t), POINTER :: StSolver
 
      LOGICAL :: FirstTime = .TRUE., OptimizeBW, GlobalBubbles, &
-          Factorize, FoundFactorize, FreeFactorize, FoundFreeFactorize, &
-          LimiterOn, SkipChange, FoundSkipChange
+          LimiterOn
 
      TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
      CHARACTER(LEN=MAX_NAME_LEN) :: eqname
@@ -2022,76 +2021,9 @@ CONTAINS
         END DO
       END DO
 
-      Factorize = GetLogical( SolverParams, 'Linear System Refactorize', FoundFactorize )
-      FreeFactorize = GetLogical( SolverParams, &
-          'Linear System Free Factorization', FoundFreeFactorize )
-      SkipChange = GetLogical( SolverParams, &
-          'Skip Compute Nonlinear Change', FoundSkipChange )
-
-      CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
-      CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )
-      CALL ListAddLogical( SolverParams, 'Skip Compute Nonlinear Change', .TRUE. )
-
-      DO i=1,3
-        DO j=i,3
-          k = IND(3*(i-1)+j)
-          IF ( k > ncomp ) CYCLE
-
-          StSolver % Matrix % RHS = ForceG(k::ncomp)
-
-          DO l=1,SIZE( Permutation )
-            IF ( Permutation(l) <= 0 ) CYCLE
-            StSolver % Variable % Values(Permutation(l)) = NodalStress(ncomp*(StressPerm(l)-1)+k)
-          END DO
-
-          WRITE( Message,'(A,I0,A,I0,A)') 'Solving for Stress(',i,',',j,')'
-          CALL Info('StressSolver',Message,Level=5)
-
-          st = DefaultSolve()
-
-          DO l=1,SIZE( Permutation )
-            IF ( Permutation(l) <= 0 ) CYCLE
-            NodalStress(ncomp*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
-          END DO
-
-          IF(CalculateStrains) THEN
-            StSolver % Matrix % RHS = SForceG(k::ncomp)
-            DO l=1,SIZE( Permutation )
-              IF ( Permutation(l) <= 0 ) CYCLE
-              StSolver % Variable % Values(Permutation(l)) = NodalStrain(ncomp*(StressPerm(l)-1)+k)
-            END DO
-            ! this solves some convergence problems at the expense of bad convergence      
-            ! StSolver % Variable % Values = 0
-
-            WRITE( Message,'(A,I0,A,I0,A)') 'Solving for Strain(',i,',',j,')'
-            CALL Info('StressSolver',Message,Level=5)
-            st = DefaultSolve()
-          
-            DO l=1,SIZE( Permutation )
-              IF ( Permutation(l) <= 0 ) CYCLE
-              NodalStrain(ncomp*(StressPerm(l)-1)+k) = StSolver % Variable % Values(Permutation(l))
-            END DO
-          END IF !CalculateStrains
-        END DO
-      END DO
-
-      IF ( FoundFactorize ) THEN
-        CALL ListAddLogical( SolverParams, 'Linear System Refactorize', Factorize )
-      ELSE
-        CALL ListRemove( SolverParams, 'Linear System Refactorize' )
-      END IF
-
-      IF ( FoundFreeFactorize ) THEN
-        CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
-      ELSE
-        CALL ListRemove( SolverParams, 'Linear System Free Factorization' )
-      END IF
-
-      IF( FoundSkipChange ) THEN
-        CALL ListAddLogical( SolverParams, 'Skip Compute Nonlinear Change',SkipChange )
-      ELSE
-        CALL ListRemove( SolverParams, 'Skip Compute Nonlinear Change' )
-      END IF
+      CALL NodalProjectorSolve( Proj, 'Stress', ncomp, ForceG, NodalStress, StressPerm )
+      IF( CalculateStrains ) &
+          CALL NodalProjectorSolve( Proj, 'Strain', ncomp, SForceG, NodalStrain, StressPerm )
 
       ! Von Mises stress from the component nodal values:
       ! -------------------------------------------------

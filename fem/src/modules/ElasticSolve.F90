@@ -3316,8 +3316,6 @@ CONTAINS
     TYPE(ValueList_t), POINTER :: Equation
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
-    LOGICAL :: Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize
-    LOGICAL :: SkipChange, FoundSkipChange
     INTEGER, POINTER :: Permutation(:), Indices(:)
     INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(9), StrainDim
 
@@ -3480,54 +3478,7 @@ CONTAINS
     !-----------------------------------------------------------------------
     CALL Info(Caller,'Calculating strain components',Level=7)
 
-    Factorize = GetLogical( SolverParams, 'Linear System Refactorize', FoundFactorize )
-    FreeFactorize = GetLogical( SolverParams, &
-         'Linear System Free Factorization', FoundFreeFactorize )
-
-    CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
-    CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
-
-    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
-        FoundSkipChange )
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
-    n = SIZE(StSolver % Variable % Values)
-
-    ! The names no longer branch on the coordinate system, there being one layout:
-    ! slot 3 is the out-of-plane component, the hoop under axial symmetry.
-    DO i=1,StrainDim
-       CALL Info(Caller,'Strain Component '//SymTensorComponentName(i),Level=5)
-
-       StSolver % Matrix % RHS = SForceG(i::StrainDim)
-       StSolver % Variable % Values = 0.0d0
-
-       res = DefaultSolve()
-       WRITE( Message, '(a,g15.8)') 'Solution Norm:', ComputeNorm(StSolver,n)
-       CALL Info( 'GenerateStrainVariable', Message, Level=5 )
-
-       DO l=1,SIZE( Permutation )
-          IF ( Permutation(l) <= 0 ) CYCLE
-          NodalStrain(StrainDim*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
-       END DO
-
-    END DO
-
-    IF ( FoundFactorize ) THEN
-       CALL ListAddLogical( SolverParams, 'Linear System Refactorize', Factorize )
-    ELSE
-       CALL ListRemove( SolverParams, 'Linear System Refactorize' )
-    END IF
-
-    IF ( .NOT. FoundFreeFactorize ) THEN
-       CALL ListRemove( SolverParams, 'Linear System Free Factorization' )
-    ELSE
-       CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
-    END IF
-
-    IF ( FoundSkipChange ) THEN
-       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
-    ELSE
-       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
-    END IF
+    CALL NodalProjectorSolve( Proj, 'Strain', StrainDim, SForceG, NodalStrain, Perm )
 
     DEALLOCATE( Indices, &
          LocalDisplacement, &
@@ -3563,8 +3514,6 @@ CONTAINS
     TYPE(ValueList_t), POINTER :: Equation, Material
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
-    LOGICAL :: Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize
-    LOGICAL :: SkipChange, FoundSkipChange
 
     INTEGER, POINTER :: Permutation(:), Indices(:)
     INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(6) 
@@ -3710,51 +3659,7 @@ CONTAINS
     !-----------------------------------------------------------------------
     CALL Info(Caller,'Calculating stress components',Level=7)
 
-    Factorize = GetLogical( SolverParams, 'Linear System Refactorize', FoundFactorize )
-    FreeFactorize = GetLogical( SolverParams, &
-         'Linear System Free Factorization', FoundFreeFactorize )
-
-    CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
-    CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
-
-    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
-        FoundSkipChange )
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
-
-    n = SIZE(StSolver % Variable % Values)
-    DO i=1,StressDim
-       CALL Info(Caller,'Stress Component '//SymTensorComponentName(i),Level=5)
-
-       StSolver % Matrix % RHS = SForceG(i::StressDim)
-       StSolver % Variable % Values = 0.0d0
-
-       res = DefaultSolve()
-       WRITE( Message, '(a,g15.8)') 'Solution Norm:', ComputeNorm(StSolver,n)
-       CALL Info( 'GenerateStressVariable', Message, Level=5 )
-
-       DO l=1,SIZE( Permutation )
-          IF ( Permutation(l) <= 0 ) CYCLE
-          NodalStress(StressDim*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
-       END DO
-    END DO
-
-    IF ( FoundFactorize ) THEN
-       CALL ListAddLogical( SolverParams, 'Linear System Refactorize', Factorize )
-    ELSE
-       CALL ListRemove( SolverParams, 'Linear System Refactorize' )
-    END IF
-
-    IF ( .NOT. FoundFreeFactorize ) THEN
-       CALL ListRemove( SolverParams, 'Linear System Free Factorization' )
-    ELSE
-       CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
-    END IF
-
-    IF ( FoundSkipChange ) THEN
-       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
-    ELSE
-       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
-    END IF
+    CALL NodalProjectorSolve( Proj, 'Stress', StressDim, SForceG, NodalStress, Perm )
 
     DEALLOCATE( Indices, &
          MASS, &
@@ -3802,8 +3707,7 @@ CONTAINS
          Pres
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, &
-         Factorize,  FoundFactorize, FreeFactorize, FoundFreeFactorize, PlaneStress, &
-         SkipChange, FoundSkipChange, &
+         PlaneStress, &
          Isotropic, UseMask, LimiterOn, ContactOn, ResidualOn
 
     CHARACTER(LEN=MAX_NAME_LEN) :: eqname
@@ -4168,57 +4072,18 @@ CONTAINS
 
     END DO
 
-    Factorize = GetLogical( SolverParams, 'Linear System Refactorize', FoundFactorize )
-    FreeFactorize = GetLogical( SolverParams, &
-         'Linear System Free Factorization', FoundFreeFactorize )
-
-    CALL ListAddLogical( SolverParams, 'Linear System Refactorize', .FALSE. )
-    CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', .FALSE. )   
-    SkipChange = GetLogical( StSolver % Values, 'Skip Compute Nonlinear Change', &
-        FoundSkipChange )
-    CALL ListAddLogical(StSolver % Values, 'Skip Compute Nonlinear Change', .TRUE.)
-
     n = SIZE(StSolver % Variable % Values)
     !----------------------------------------------------------------------
     ! Linear solves componentwise...
     !-----------------------------------------------------------------------
     IF (CalculateStrains) THEN
        CALL Info(Caller,'Calculating strain components',Level=7)
-       DO i=1,StrainDim
-          CALL Info(Caller,'Strain Component '//SymTensorComponentName(i),Level=5)
-
-          StSolver % Matrix % RHS = ForceG(i::StrainDim)
-          StSolver % Variable % Values = 0.0d0
-
-          res = DefaultSolve()
-          WRITE( Message, '(a,g15.8)') 'Solution Norm:', ComputeNorm(StSolver,n)
-          CALL Info( 'ComputeStressAndStrain', Message, Level=5 )
-
-          DO l=1,SIZE( Permutation )
-             IF ( Permutation(l) <= 0 ) CYCLE
-             NodalStrain(StrainDim*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
-          END DO
-       END DO
+       CALL NodalProjectorSolve( Proj, 'Strain', StrainDim, ForceG, NodalStrain, Perm )
     END IF
 
     IF (CalculateStresses) THEN
        CALL Info(Caller,'Calculating stress components',Level=7)
-       DO i=1,StrainDim
-          CALL Info(Caller,'Stress Component '//SymTensorComponentName(i),Level=5)
-
-          StSolver % Matrix % RHS = SForceG(i::StrainDim)
-          StSolver % Variable % Values = 0.0d0
-
-          res = DefaultSolve()
-          WRITE( Message, '(a,g15.8)') 'Solution Norm:', ComputeNorm(StSolver,n)
-          CALL Info( 'ComputeStressAndStrain', Message, Level=5 )
-
-          DO l=1,SIZE( Permutation )
-             IF ( Permutation(l) <= 0 ) CYCLE
-             NodalStress(StrainDim*(Perm(l)-1)+i) = StSolver % Variable % Values(Permutation(l))
-          END DO
-       END DO
-
+       CALL NodalProjectorSolve( Proj, 'Stress', StrainDim, SForceG, NodalStress, Perm )
 
        ! Von Mises stress from the component nodal values:
        ! -------------------------------------------------
@@ -4239,24 +4104,6 @@ CONTAINS
           END DO
        END DO
        VonMises = SQRT( 3.0d0 * VonMises / 2.0d0 )
-    END IF
-
-
-    IF ( FoundFactorize ) THEN
-       CALL ListAddLogical( SolverParams, 'Linear System Refactorize', Factorize )
-    ELSE
-       CALL ListRemove( SolverParams, 'Linear System Refactorize' )
-    END IF
-
-    IF ( .NOT. FoundFreeFactorize ) THEN
-       CALL ListRemove( SolverParams, 'Linear System Free Factorization' )
-    ELSE
-       CALL ListAddLogical( SolverParams, 'Linear System Free Factorization', FreeFactorize )
-    END IF
-    IF ( FoundSkipChange ) THEN
-       CALL ListAddLogical( StSolver % Values, 'Skip Compute Nonlinear Change', SkipChange )
-    ELSE
-       CALL ListRemove( StSolver % Values, 'Skip Compute Nonlinear Change' )
     END IF
 
 

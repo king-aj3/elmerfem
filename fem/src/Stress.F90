@@ -70,6 +70,9 @@ MODULE StressLocal
     LOGICAL :: EigenOn = .FALSE., HarmonicOn = .FALSE., ResidualOn = .FALSE.
     REAL(KIND=dp) :: Relax = 1.0_dp
     LOGICAL :: RelaxFound = .FALSE.
+    LOGICAL :: Factorize = .FALSE., FoundFactorize = .FALSE.
+    LOGICAL :: FreeFactorize = .FALSE., FoundFreeFactorize = .FALSE.
+    LOGICAL :: SkipChange = .FALSE., FoundSkipChange = .FALSE.
   END TYPE NodalProjector_t
 
 !------------------------------------------------------------------------------
@@ -2191,10 +2194,71 @@ CONTAINS
      IF ( .NOT. Proj % RelaxFound ) Proj % Relax = 1.0_dp
      CALL ListAddConstReal( Params, 'Nonlinear System Relaxation Factor', 1.0_dp )
 
+     ! Every component solve runs against the same matrix and differs only in its
+     ! right hand side, so the factorization is formed once and kept for the whole
+     ! bracket. And a component solve is not a nonlinear iteration, so it must not
+     ! feed the primary solve's convergence measure.
+     Proj % Factorize = ListGetLogical( Params, 'Linear System Refactorize', &
+         Proj % FoundFactorize )
+     Proj % FreeFactorize = ListGetLogical( Params, 'Linear System Free Factorization', &
+         Proj % FoundFreeFactorize )
+     Proj % SkipChange = ListGetLogical( Params, 'Skip Compute Nonlinear Change', &
+         Proj % FoundSkipChange )
+
+     CALL ListAddLogical( Params, 'Linear System Refactorize', .FALSE. )
+     CALL ListAddLogical( Params, 'Linear System Free Factorization', .FALSE. )
+     CALL ListAddLogical( Params, 'Skip Compute Nonlinear Change', .TRUE. )
+
      Proj % PSolver % NOFEigenValues = 0
      CurrentModel % Solver => Proj % PSolver
 !------------------------------------------------------------------------------
    END SUBROUTINE NodalProjectorBegin
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Run the projection component by component and scatter each result into the
+!> nodal field. The components share the matrix and differ only in the right hand
+!> side, whose slots are interleaved with stride ncomp; refactorization is already
+!> suppressed for the whole bracket by NodalProjectorBegin, so the factorization is
+!> formed once and reused.
+!>
+!> Perm indexes the nodal field, which need not be the projection's own
+!> permutation -- it is the field variable's, and the two differ whenever the
+!> projection was built over a mask.
+!------------------------------------------------------------------------------
+   SUBROUTINE NodalProjectorSolve( Proj, FieldName, ncomp, ForceG, Nodal, Perm )
+!------------------------------------------------------------------------------
+     TYPE(NodalProjector_t) :: Proj
+     CHARACTER(LEN=*) :: FieldName
+     INTEGER :: ncomp
+     REAL(KIND=dp) :: ForceG(:), Nodal(:)
+     INTEGER, POINTER :: Perm(:)
+!------------------------------------------------------------------------------
+     INTEGER :: i, l
+     REAL(KIND=dp) :: Norm
+     TYPE(Solver_t), POINTER :: PSolver
+!------------------------------------------------------------------------------
+     PSolver => Proj % PSolver
+
+     DO i=1,ncomp
+       CALL Info( 'NodalProjectorSolve', TRIM(FieldName)//' component '// &
+           SymTensorComponentName(i), Level=5 )
+
+       PSolver % Matrix % RHS = ForceG(i::ncomp)
+       ! Cold start, which is what every caller of this did before it was shared:
+       ! the previous component's solution is no kind of guess for this one.
+       PSolver % Variable % Values = 0.0_dp
+
+       Norm = DefaultSolve()
+
+       DO l=1,SIZE( Proj % Perm )
+         IF ( Proj % Perm(l) <= 0 ) CYCLE
+         Nodal(ncomp*(Perm(l)-1)+i) = PSolver % Variable % Values(Proj % Perm(l))
+       END DO
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE NodalProjectorSolve
 !------------------------------------------------------------------------------
 
 
@@ -2224,6 +2288,22 @@ CONTAINS
      IF ( Proj % ContactOn ) CALL ListAddLogical( Params, 'Apply Contact BCs', .TRUE. )
      IF ( Proj % ResidualOn ) &
          CALL ListAddLogical( Params, 'Linear System Residual Mode', .TRUE. )
+
+     IF ( Proj % FoundFactorize ) THEN
+       CALL ListAddLogical( Params, 'Linear System Refactorize', Proj % Factorize )
+     ELSE
+       CALL ListRemove( Params, 'Linear System Refactorize' )
+     END IF
+     IF ( Proj % FoundFreeFactorize ) THEN
+       CALL ListAddLogical( Params, 'Linear System Free Factorization', Proj % FreeFactorize )
+     ELSE
+       CALL ListRemove( Params, 'Linear System Free Factorization' )
+     END IF
+     IF ( Proj % FoundSkipChange ) THEN
+       CALL ListAddLogical( Params, 'Skip Compute Nonlinear Change', Proj % SkipChange )
+     ELSE
+       CALL ListRemove( Params, 'Skip Compute Nonlinear Change' )
+     END IF
 
      CurrentModel % Solver => Solver
      CALL ListSetNameSpace('')
