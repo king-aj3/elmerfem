@@ -1933,7 +1933,7 @@ CONTAINS
 !> caller keeps between calls have to be reallocated to the new row count.
 !------------------------------------------------------------------------------
    SUBROUTINE NodalProjectorSetup( Proj, Solver, NameSpace, MaskKeyword, TempName, &
-       GlobalBubbles, Rebuilt, VarPerm )
+       GlobalBubbles, Rebuilt, VarPerm, ReuseExisting )
 !------------------------------------------------------------------------------
      TYPE(NodalProjector_t) :: Proj
      TYPE(Solver_t) :: Solver
@@ -1944,6 +1944,10 @@ CONTAINS
      !> own, which is what the component solves index with; callers that register
      !> it against the field permutation instead pass theirs.
      INTEGER, POINTER, OPTIONAL :: VarPerm(:)
+     !> Adopt an existing variable of this name, and its permutation, when the mesh
+     !> already carries one -- as it can after a refinement has interpolated it
+     !> across. Off by default, in which case a fresh one is always made.
+     LOGICAL, OPTIONAL :: ReuseExisting
 !------------------------------------------------------------------------------
      LOGICAL :: Found, OptimizeBW
      REAL(KIND=dp), POINTER :: TempValues(:)
@@ -1965,7 +1969,20 @@ CONTAINS
      END IF
      Proj % PSolver = Solver
 
-     ALLOCATE( Proj % Perm( SIZE(Solver % Variable % Perm) ) )
+     ! An earlier run may have left this variable on the mesh, in which case its
+     ! permutation is adopted rather than a new one built.
+     Proj % PSolver % Variable => NULL()
+     IF ( PRESENT(ReuseExisting) ) THEN
+       IF ( ReuseExisting ) Proj % PSolver % Variable => &
+           VariableGet( Proj % PSolver % Mesh % Variables, TempName, ThisOnly=.TRUE. )
+     END IF
+
+     IF ( ASSOCIATED( Proj % PSolver % Variable ) ) THEN
+       Proj % Perm => Proj % PSolver % Variable % Perm
+     ELSE
+       ALLOCATE( Proj % Perm( SIZE(Solver % Variable % Perm) ) )
+       Proj % Perm = 0
+     END IF
 
      OptimizeBW = GetLogical( Proj % PSolver % Values, 'Optimize Bandwidth', Found )
      IF ( .NOT. Found ) OptimizeBW = .TRUE.
@@ -1985,13 +2002,15 @@ CONTAINS
      ALLOCATE( Proj % PSolver % Matrix % RHS(Proj % PSolver % Matrix % NumberOfRows) )
      Proj % PSolver % Matrix % Comm = Solver % Matrix % Comm
 
-     ALLOCATE( TempValues(Proj % PSolver % Matrix % NumberOfRows) )
-     TempValues = 0.0_dp
-     PermForVar => Proj % Perm
-     IF ( PRESENT(VarPerm) ) PermForVar => VarPerm
-     CALL VariableAdd( Proj % PSolver % Mesh % Variables, Proj % PSolver % Mesh, &
-         Proj % PSolver, TempName, 1, TempValues, PermForVar, Output=.FALSE. )
-     Proj % PSolver % Variable => VariableGet( Proj % PSolver % Mesh % Variables, TempName )
+     IF ( .NOT. ASSOCIATED( Proj % PSolver % Variable ) ) THEN
+       PermForVar => Proj % Perm
+       IF ( PRESENT(VarPerm) ) PermForVar => VarPerm
+       ALLOCATE( TempValues(Proj % PSolver % Matrix % NumberOfRows) )
+       TempValues = 0.0_dp
+       CALL VariableAdd( Proj % PSolver % Mesh % Variables, Proj % PSolver % Mesh, &
+           Proj % PSolver, TempName, 1, TempValues, PermForVar, Output=.FALSE. )
+       Proj % PSolver % Variable => VariableGet( Proj % PSolver % Mesh % Variables, TempName )
+     END IF
 
      Proj % Initialized = .TRUE.
 !------------------------------------------------------------------------------

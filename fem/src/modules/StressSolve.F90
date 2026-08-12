@@ -1813,7 +1813,10 @@ CONTAINS
      TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
      CHARACTER(LEN=MAX_NAME_LEN) :: eqname
 
-     SAVE FirstTime, Nodes, StSolver, ForceG, Permutation, SForceG, Eqname, UseMask
+     TYPE(NodalProjector_t), SAVE :: Proj
+     LOGICAL :: Rebuilt
+
+     SAVE Nodes, ForceG, SForceG
 
      ! These variables are needed for Principal stress calculation
      ! they are quite small and allocated even if principal stress calculation
@@ -1848,50 +1851,22 @@ CONTAINS
          SFORCE(6*n), &
          Basis(n), dBasisdx(n,3) )
 
-     IF ( FirstTime .OR. Solver % MeshChanged ) THEN
-       IF ( FirstTime ) THEN
-         ALLOCATE( StSolver )
-       ELSE
-         DEALLOCATE( ForceG, SForceG )
-         CALL FreeMatrix( StSolver % Matrix )
-       END IF
+     GlobalBubbles = GetLogical(SolverParams,'Bubbles in Global System',Found, DefValue = .TRUE. )
 
-       StSolver = Solver
-       StSolver % Variable => VariableGet( StSolver % Mesh % Variables, &
-                  'StressTemp', ThisOnly=.TRUE. )
-       IF ( ASSOCIATED( StSolver % Variable ) ) THEN
-         Permutation => StSolver % Variable % Perm
-       ELSE
-         ALLOCATE( Permutation( SIZE(Solver % Variable % Perm) ) )
-         Permutation = 0
-       END IF
+     CALL NodalProjectorSetup( Proj, Solver, 'stress:', 'Calculate Stresses', &
+         'StressTemp', GlobalBubbles, Rebuilt, VarPerm = StressPerm, &
+         ReuseExisting = .TRUE. )
 
-       OptimizeBW = GetLogical( StSolver % Values, 'Optimize Bandwidth', Found, DefValue = .TRUE. )
+     StSolver => Proj % PSolver
+     Permutation => Proj % Perm
+     UseMask = Proj % UseMask
+     eqname = Proj % EqName
 
-       GlobalBubbles = GetLogical(SolverParams,'Bubbles in Global System',Found, DefValue = .TRUE. )
-
-       IF( ListGetLogicalAnyEquation( Model,'Calculate Stresses' ) ) THEN
-         UseMask = .TRUE.
-         eqname = 'Calculate Stresses'
-       ELSE
-         UseMask = .FALSE.
-         eqname = TRIM( ListGetString( StSolver % Values,'Equation') )
-       END IF
-       StSolver % Matrix => CreateMatrix( Model, Solver, Mesh, Permutation, &
-           1, MATRIX_CRS, OptimizeBW, eqname, GlobalBubbles=GlobalBubbles )
-
-       ALLOCATE( StSolver % Matrix % RHS(StSolver % Matrix % NumberOfRows) )
-       StSolver % Matrix % Comm = Solver % Matrix % Comm
-
+     IF ( Rebuilt ) THEN
+       IF ( ALLOCATED(ForceG) ) DEALLOCATE( ForceG )
+       IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
        ALLOCATE( ForceG(StSolver % Matrix % NumberOfRows*6) )
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*6) )
-
-       IF ( .NOT. ASSOCIATED( StSolver % Variable ) ) THEN
-          CALL VariableAddVector( StSolver % Mesh % Variables, StSolver % Mesh, StSolver, &
-                 'StressTemp', 1, Perm = StressPerm, Output=.FALSE. )
-          StSolver % Variable => VariableGet( StSolver % Mesh % Variables, 'StressTemp' )
-       END IF
-       FirstTime = .FALSE.
      END IF
 
      Model % Solver => StSolver
