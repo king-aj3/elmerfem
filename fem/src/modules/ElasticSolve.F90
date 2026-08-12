@@ -3384,45 +3384,16 @@ CONTAINS
     LOGICAL :: CalculateStress, AxialSymmetry
  !---------------------------------------------------------------------------------
     TYPE(Solver_t), POINTER :: StSolver
-    TYPE(Nodes_t) :: Nodes
-    TYPE(Element_t), POINTER :: Element
-    TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
-    TYPE(ValueList_t), POINTER :: Equation, Material
-
-    LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, UseMask   
-
-    INTEGER, POINTER :: Permutation(:), Indices(:)
-    INTEGER :: dim, elem, n, nd, i, k, l, p, q, Ind(6) 
-    INTEGER :: StressDim, StressDofs
-    INTEGER :: ipindex
-
-    REAL(KIND=dp), POINTER :: StressTemp(:)
-    ! One integration point's stress, permuted from the UMAT's own component order
-    ! into the stored one.
-    REAL(KIND=dp) :: UmatComp(6)
+    LOGICAL :: GlobalBubbles, Rebuilt
+    INTEGER :: StressDim
     REAL(KIND=dp), ALLOCATABLE :: SForceG(:)
-    REAL(KIND=dp), ALLOCATABLE :: Mass(:,:), Force(:), SForce(:), Basis(:)
 
-    REAL(KIND=dp) :: u, v, w, Weight, detJ, res
-
-    CHARACTER(LEN=MAX_NAME_LEN) :: eqname
-    
     TYPE(NodalProjector_t), SAVE :: Proj
-    LOGICAL :: Rebuilt
+    PROCEDURE(ProjectedTensors_i) :: ElasticUmatStressAtIP
 
-    SAVE Force, SForceG, Nodes
-    SAVE StressDim
+    SAVE SForceG, StressDim
  !--------------------------------------------------------------------------------------------
     IF (.NOT. CalculateStress) RETURN
-
-    dim = CoordinateSystemDimension()
-
-    n = Solver % Mesh % MaxElementDOFs
-    ALLOCATE( Indices(n), &
-         Mass(n,n), &
-         Force(n), &
-         SForce(6*n), &
-         Basis(n) )
 
     ! Rebuilt on mesh change -- see the note in GenerateStrainVariable.
     ! Resolved here rather than inside the projector, which sits below MainUtils.
@@ -3432,9 +3403,6 @@ CONTAINS
         'StressTemp', GlobalBubbles, Rebuilt )
 
     StSolver => Proj % PSolver
-    Permutation => Proj % Perm
-    UseMask = Proj % UseMask
-    eqname = Proj % EqName
 
     IF ( Rebuilt ) THEN
        IF ( ALLOCATED(SForceG) ) DEALLOCATE( SForceG )
@@ -3443,85 +3411,19 @@ CONTAINS
        ! written into a StressComponents-wide variable that was 6 unless
        ! axisymmetric -- so a plane case left two slots permanently unwritten.
        ! That mismatch was this routine's own TO DO and it is what is gone.
-       StressDim = SymTensorOutputComponents( dim )
+       StressDim = SymTensorOutputComponents( CoordinateSystemDimension() )
 
        ALLOCATE( SForceG(StSolver % Matrix % NumberOfRows*StressDim) )
     END IF
 
-    StressDofs = UMatStressVar % Dofs
     ! Limiters, contact conditions, residual mode, eigen/harmonic settings and the
     ! relaxation factor belong to the primary solve, not to an L2 fit; put aside
     ! until NodalProjectorEnd.
     CALL NodalProjectorBegin( Proj, Solver )
     NodalStress = 0.0d0
-    SForceG = 0.0d0
 
-    ! Maps an output slot onto the UmatStress slot it is read from. The UMAT keeps
-    ! its own order -- (rr,hoop,axial,rz) under axial symmetry, (11,22,33,12,13,23)
-    ! otherwise -- while the output is (11,22,33,12,23,13) with 33 out-of-plane, so
-    ! axisymmetry swaps the hoop and axial slots and 3D the last two shears.
-    IF (AxialSymmetry) THEN
-       Ind = (/ 1, 3, 2, 4, 5, 6 /)
-    ELSE
-       Ind = (/ 1, 2, 3, 4, 6, 5 /)
-    END IF
-
-    CALL DefaultInitialize()
-    !------------------------------------------------------------------------
-    ! Assembly loop 
-    !------------------------------------------------------------------------
-    DO elem = 1, Solver % NumberOfActiveElements
-       Element => GetActiveElement(elem, Solver)
-       n  = GetElementNOFNodes()
-       nd = GetElementDOFs( Indices )
-       CALL GetElementNodes( Nodes )
-
-       Equation => GetEquation()
-       Material => GetMaterial()
-       !---------------------------------------
-       ! Check if stresses wanted for this body:
-       ! ---------------------------------------
-       IF( UseMask ) THEN
-          IF(.NOT. GetLogical( Equation, eqname, Found )) CYCLE
-       END IF
-
-       IntegStuff = GaussPoints( element )
-
-       Mass = 0.0d0
-       Force = 0.0d0
-       SForce = 0.0d0        
-
-       DO t=1,IntegStuff % n
-
-          ipindex = GetIpIndex( t, usolver=solver, element=element, ipvar = UmatStressVar )   
-
-          u = IntegStuff % u(t)
-          v = IntegStuff % v(t)
-          w = IntegStuff % w(t)
-          Weight = IntegStuff % s(t)
-
-          stat = ElementInfo( Element, Nodes, u, v, w, detJ, Basis )
-          Weight = Weight * detJ
-           ! The projection is an L2 fit, so in axisymmetric coordinates it has to
-           ! be weighted by the radius like any other volume integral. Without this
-           ! the fit is made in the Cartesian metric and every spatially varying
-           ! component comes out different from the correctly weighted one.
-           IF (AxialSymmetry) Weight = Weight * SUM( Basis(1:n) * Nodes % x(1:n) )
-
-          DO i=1,StressDim
-            UmatComp(i) = UMatStress(StressDofs*(ipIndex-1)+Ind(i))
-          END DO
-          CALL NodalProjectorMass( Mass, Basis, nd, Weight )
-          CALL NodalProjectorVector( SForce, Basis, nd, StressDim, Weight, UmatComp )
-       END DO
-
-       CALL DefaultUpdateEquations( Mass, Force ) 
-
-       !--------------------------------
-       ! Assemble global RHS vectors:
-       !--------------------------------
-       CALL NodalProjectorGlue( SForceG, SForce, Permutation, Indices, nd, StressDim )
-    END DO
+    CALL NodalProjectorAssemble( Proj, StressDim, AxialSymmetry, &
+        ElasticUmatStressAtIP, SForceG )
 
     !----------------------------------------------------------------------
     ! Linear solves componentwise...
@@ -3529,12 +3431,6 @@ CONTAINS
     CALL Info(Caller,'Calculating stress components',Level=7)
 
     CALL NodalProjectorSolve( Proj, 'Stress', StressDim, SForceG, NodalStress, Perm )
-
-    DEALLOCATE( Indices, &
-         MASS, &
-         Force, &
-         SForce, &
-         Basis )
 
     CALL NodalProjectorEnd( Proj, Solver )
 
@@ -4059,6 +3955,65 @@ SUBROUTINE ElasticStrainAtIP( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T
 !------------------------------------------------------------------------------
 END SUBROUTINE ElasticStrainAtIP
 !------------------------------------------------------------------------------
+
+
+!--------------------------------------------------------------------------------
+!> The UMAT's stress at one integration point, for GenerateStressVariable.
+!>
+!> File scope, like ElasticStrainAtIP and for the same reason. Nothing arrives by
+!> host association, so the integration point variable and the component
+!> permutation are found again here.
+!>
+!> The UMAT hands its stress back as a component vector in its own order rather
+!> than as a tensor, so it is expanded into one for the assembly to pack again.
+!> The round trip is exact: both directions are the same permutation, with zeros
+!> for whatever the layout does not carry.
+!--------------------------------------------------------------------------------
+SUBROUTINE ElasticUmatStressAtIP( Proj, Element, Nodes, n, nd, t, Basis, dBasisdx, T1, T2 )
+!--------------------------------------------------------------------------------
+  USE StressLocal
+  IMPLICIT NONE
+
+  TYPE(NodalProjector_t) :: Proj
+  TYPE(Element_t), POINTER :: Element
+  TYPE(Nodes_t) :: Nodes
+  INTEGER :: n, nd, t
+  REAL(KIND=dp) :: Basis(:), dBasisdx(:,:), T1(3,3), T2(3,3)
+!--------------------------------------------------------------------------------
+  TYPE(Variable_t), POINTER, SAVE :: UmatStressVar => NULL()
+  INTEGER, SAVE :: StressDofs, StressDim, Ind(6)
+  INTEGER :: ipindex, i
+  REAL(KIND=dp) :: Comp(6)
+!--------------------------------------------------------------------------------
+  IF ( t == 1 ) THEN
+    UmatStressVar => VariableGet( Proj % Solver % Mesh % Variables, 'UmatStress' )
+    StressDofs = UmatStressVar % Dofs
+    StressDim = SymTensorOutputComponents( CoordinateSystemDimension() )
+
+    ! Output slot -> the UmatStress slot it is read from. The UMAT keeps its own
+    ! order, (rr,hoop,axial,rz) under axial symmetry and (11,22,33,12,13,23)
+    ! otherwise, while the output is (11,22,33,12,23,13) with 33 out of plane. So
+    ! axisymmetry swaps the hoop and axial slots, and 3D the last two shears.
+    IF ( CurrentCoordinateSystem() == AxisSymmetric .OR. &
+         CurrentCoordinateSystem() == CylindricSymmetric ) THEN
+      Ind = (/ 1, 3, 2, 4, 5, 6 /)
+    ELSE
+      Ind = (/ 1, 2, 3, 4, 6, 5 /)
+    END IF
+  END IF
+
+  ipindex = GetIpIndex( t, USolver = Proj % Solver, Element = Element, &
+      IpVar = UmatStressVar )
+
+  Comp = 0.0_dp
+  DO i=1,StressDim
+    Comp(i) = UmatStressVar % Values( StressDofs*(ipindex-1) + Ind(i) )
+  END DO
+
+  CALL OutputVector2Tensor( Comp(1:StressDim), StressDim, T1 )
+!--------------------------------------------------------------------------------
+END SUBROUTINE ElasticUmatStressAtIP
+!--------------------------------------------------------------------------------
 
 
 
