@@ -772,20 +772,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         ' "Large Deflection = False" and use neither a UMAT nor a neo-Hookean material' )
   END IF
 
-  ! Two couplings that would otherwise make a keyword quietly do nothing.
-  !
-  ! "Constant System" needs the whole system, boundary conditions included, and
-  ! that is saved only in the boundary assembly slot -- which DefUtils reaches
-  ! only when "Calculate Loads" is set as well (the test sits inside that one,
-  ! DefUtils.F90:7574). Without it nothing is ever saved, so the keyword cannot
-  ! engage. fem/tests/mgdyn_transient sets it alone and is in exactly that state.
-  IF( ConstantSystem .AND. .NOT. &
-      ListGetLogical( SolverParams,'Calculate Loads', GotIt ) ) THEN
-    CALL Warn( Caller,'"Constant System" does nothing without "Calculate Loads"' )
-  END IF
-
-  ! And the tests below are in order of increasing boldness, so the weaker
-  ! keyword wins if both are given. StressSolve orders them the same way.
+  ! The tests below are in order of increasing boldness, so the weaker keyword
+  ! wins if both are given. StressSolve orders them the same way.
   IF( ConstantSystem .AND. ( ConstantBulkSystem .OR. ConstantBulkMatrix ) ) THEN
     CALL Warn( Caller,'"Constant System" is superseded by the narrower '//&
         '"Constant Bulk System"/"Constant Bulk Matrix" given beside it' )

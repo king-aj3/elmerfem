@@ -79,19 +79,29 @@ End
 ! silently lose the boundary force. Its save point is after the boundary
 ! assembly; theirs is before it.
 !
-! "Calculate Loads" is required, not decoration. The full system is saved only in
-! the boundary assembly slot, and DefUtils reaches that test only when
-! "Calculate Loads" is set too -- the test sits nested inside it
-! (DefUtils.F90:7574). Without it nothing is ever saved and the keyword cannot
-! engage at all; the solver warns when it is missing. fem/tests/mgdyn_transient
-! sets "Constant System" alone and is in precisely that state, so this is the
-! first case in the tree that actually exercises this level.
+! The keyword stands on its own here. It did not used to: the full system is
+! saved only in the boundary assembly slot, and the test for it there was nested
+! inside the "Calculate Loads" one, so on its own nothing was ever saved and no
+! solver relying on that path could engage. Corrected in DefUtils along with this
+! test -- MagnetoDynamics was never affected, passing the flag explicitly instead.
 !
 ! The Neumann condition on boundary 2 is what gives the test its teeth: skipping
 ! the boundary assembly while restoring from the wrong point would drop that
 ! force. With Dirichlet conditions alone the error could not show.
 
 Solver 1 :: Constant System = Logical True
-Solver 1 :: Calculate Loads = Logical True
+Solver 1 :: Reference Norm = Real 1.70786776E-03
+RUN
+
+! Proof that the reuse actually engages, which nothing above can give: every
+! level is behaviour-neutral by construction, so a reference norm cannot tell a
+! working reuse from one that quietly never fires -- as this test itself did not,
+! until this RUN was added.
+!
+! So assert constancy falsely, on purpose. Solver % Matrix % BulkValues persists
+! across RUNs, so a working reuse restores the system assembled above and ignores
+! the tenfold stiffer material below entirely, reproducing the same norm. Were
+! nothing being saved, this RUN would reassemble and land near a tenth of it.
+Material 1 :: Youngs Modulus = Real 1.0e4
 Solver 1 :: Reference Norm = Real 1.70786776E-03
 RUN
