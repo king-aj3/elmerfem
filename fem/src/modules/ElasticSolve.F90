@@ -440,7 +440,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   MeshDisplacementActive = ListGetLogical( SolverParams, &
        'Displace Mesh', GotIt )
-  IF ( .NOT. GotIt ) MeshDisplacementActive = .TRUE.
+
+  ! An eigen or harmonic analysis has no displacement field to speak of -- the
+  ! solution is a set of modes, and what the variable happens to hold afterwards
+  ! is not a deformation of the mesh. So do not displace by it unless asked to,
+  ! which is what StressSolve has always done.
+  IF ( .NOT. GotIt ) MeshDisplacementActive = .NOT. EigenOrHarmonicAnalysis()
 
   ! Sometimes we might want to use this solver to provide also eigenmode or harmonic analysis.
   ! Then we need to add also the mass even though the system is not transient.
