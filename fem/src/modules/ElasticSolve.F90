@@ -295,6 +295,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
   LOGICAL :: CalcPrincipalStress, CalcPrincipalStrain
   LOGICAL :: AllocationsDone = .FALSE., HarmonicAnalysis
+  LOGICAL :: ConstantBulkMatrix, ConstantBulkSystem, ConstantSystem
+  LOGICAL :: ConstantBulkMatrixInUse
   LOGICAL :: CompressibilityDefined = .FALSE.
   LOGICAL :: NormalSpring, NormalTangential
   LOGICAL :: Converged, NoExternalLoads
@@ -746,6 +748,49 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         ' and use neither a UMAT nor a neo-Hookean material' )
   END IF
 
+  !-----------------------------------------------------------------------------
+  ! Reusing what a previous pass assembled. The three keywords differ in how much
+  ! is taken to be unchanged; see the restore block in the assembly below.
+  !
+  ! The same soundness conditions as the local matrix cache apply, for the same
+  ! reason: a stiffness held over from the previous pass is only the right
+  ! stiffness while it does not depend on the solution, and only the bulk matrix
+  ! and its load are saved, so mass and damping cannot be carried over. StressSolve
+  ! supports the transient case by integrating the restored matrix in time
+  ! afterwards (its AddGlobalTime); that is not done here, so refuse it rather
+  ! than appear to honour the keyword.
+  !-----------------------------------------------------------------------------
+  ConstantSystem     = ListGetLogical( SolverParams, 'Constant System', GotIt )
+  ConstantBulkSystem = ListGetLogical( SolverParams, 'Constant Bulk System', GotIt )
+  ConstantBulkMatrix = ListGetLogical( SolverParams, 'Constant Bulk Matrix', GotIt )
+
+  IF( ConstantSystem .OR. ConstantBulkSystem .OR. ConstantBulkMatrix ) THEN
+    IF( NeedMass .OR. TransientSimulation ) CALL Fatal( Caller, &
+        'The "Constant ..." keywords are applicable to steady cases only here' )
+    IF( UseUMAT .OR. NeoHookeanMaterial .OR. LargeDeflection ) CALL Fatal( Caller, &
+        'The "Constant ..." keywords need a linear material: set'//&
+        ' "Large Deflection = False" and use neither a UMAT nor a neo-Hookean material' )
+  END IF
+
+  ! Two couplings that would otherwise make a keyword quietly do nothing.
+  !
+  ! "Constant System" needs the whole system, boundary conditions included, and
+  ! that is saved only in the boundary assembly slot -- which DefUtils reaches
+  ! only when "Calculate Loads" is set as well (the test sits inside that one,
+  ! DefUtils.F90:7574). Without it nothing is ever saved, so the keyword cannot
+  ! engage. fem/tests/mgdyn_transient sets it alone and is in exactly that state.
+  IF( ConstantSystem .AND. .NOT. &
+      ListGetLogical( SolverParams,'Calculate Loads', GotIt ) ) THEN
+    CALL Warn( Caller,'"Constant System" does nothing without "Calculate Loads"' )
+  END IF
+
+  ! And the tests below are in order of increasing boldness, so the weaker
+  ! keyword wins if both are given. StressSolve orders them the same way.
+  IF( ConstantSystem .AND. ( ConstantBulkSystem .OR. ConstantBulkMatrix ) ) THEN
+    CALL Warn( Caller,'"Constant System" is superseded by the narrower '//&
+        '"Constant Bulk System"/"Constant Bulk Matrix" given beside it' )
+  END IF
+
   GlobalPseudoTraction = GetLogical( SolverParams, 'Pseudo-Traction', GotIt)
 
 
@@ -783,6 +828,42 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
      !------------------------------------------------------------------------------
 100  CALL DefaultInitialize()
+
+     !---------------------------------------------------------------------------
+     ! Reuse what the previous pass assembled, at one of three depths. The bulk
+     ! matrix and right hand side are saved into BulkValues/BulkRHS by
+     ! DefaultFinishBulkAssembly below whenever any of these keywords is set, so
+     ! there is nothing to restore on the first pass and the tests below simply
+     ! fall through to a full assembly.
+     !
+     !   Constant Bulk Matrix -- the matrix is reused, the load is reassembled.
+     !     The element loop still runs, but only the force is glued (see the
+     !     ConstantBulkMatrixInUse test at its end).
+     !   Constant Bulk System -- matrix and bulk load both reused; the element
+     !     loop is skipped entirely and only the boundary conditions run.
+     !   Constant System -- the boundary conditions are constant too, so nothing
+     !     is assembled at all.
+     !
+     ! The motivating case is model lumping, whose six load cases share one
+     ! stiffness and differ only in what is imposed on the lumping boundary.
+     !---------------------------------------------------------------------------
+     ConstantBulkMatrixInUse = ConstantBulkMatrix .AND. &
+         ASSOCIATED( Solver % Matrix % BulkValues )
+
+     IF ( ASSOCIATED( Solver % Matrix % BulkValues ) ) THEN
+       IF ( ConstantBulkMatrix .OR. ConstantBulkSystem .OR. ConstantSystem ) THEN
+         Solver % Matrix % Values = Solver % Matrix % BulkValues
+       END IF
+
+       IF ( ConstantBulkSystem .OR. ConstantSystem ) THEN
+         Solver % Matrix % RHS = Solver % Matrix % BulkRHS
+       ELSE IF ( ConstantBulkMatrix ) THEN
+         Solver % Matrix % RHS = 0.0_dp
+       END IF
+
+       IF ( ConstantBulkSystem ) GO TO 2000
+       IF ( ConstantSystem )     GO TO 3000
+     END IF
      !------------------------------------------------------------------------------
      DO t=1,GetNOFActive()
       
@@ -808,7 +889,9 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         ! so its local matrix is in store and DefaultUpdateEquations will fetch it
         ! rather than read what is passed. Skip building it. See the guard on
         ! "Local Matrix Storage" above for when this is sound.
-        IF( UseLocalMatrixCopy( Solver, activeind = t ) ) GOTO 200
+        IF( .NOT. ConstantBulkMatrixInUse ) THEN
+          IF( UseLocalMatrixCopy( Solver, activeind = t ) ) GOTO 200
+        END IF
 
         !-----------------------------------------------------------------------------------
         !        Get the material parameters relating to the constitutive law:
@@ -1031,7 +1114,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         !------------------------------------------------------------------------------
         !        Update global matrices from local matrices
         !------------------------------------------------------------------------------
-200     CALL DefaultUpdateEquations( LocalStiffMatrix, LocalForce )
+200     IF ( ConstantBulkMatrixInUse ) THEN
+          ! The matrix was restored wholesale, so only the load is wanted here.
+          CALL DefaultUpdateForce( LocalForce )
+        ELSE
+          CALL DefaultUpdateEquations( LocalStiffMatrix, LocalForce )
+        END IF
         !------------------------------------------------------------------------------
 
         IF( NeedMass ) THEN
@@ -1047,7 +1135,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
      !------------------------------------------------------------------------------
      !     Neumann & Newton boundary conditions
      !------------------------------------------------------------------------------
-     DO t = 1,GetNOFBoundaryElements()
+2000 DO t = 1,GetNOFBoundaryElements()
         CurrentElement =>  GetBoundaryElement(t)
         IF (.NOT. ActiveBoundaryElement()) CYCLE
 
@@ -1241,7 +1329,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
      ! This is a matrix level routine for setting friction such that tangential
      ! traction is the normal traction multiplied by a coefficient.
-     CALL SetImplicitFriction(Model, Solver,'Implicit Friction Coefficient',&
+3000 CALL SetImplicitFriction(Model, Solver,'Implicit Friction Coefficient',&
          'Friction Direction')
      
      CALL DefaultFinishAssembly()
