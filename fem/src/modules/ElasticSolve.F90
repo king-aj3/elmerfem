@@ -262,6 +262,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   USE DefUtils
   USE MaterialModels
   USE StressLocal
+  USE Constitutive
   USE MainUtils, ONLY : SetGlobalBubblesFlag
   
   IMPLICIT NONE
@@ -3623,6 +3624,11 @@ CONTAINS
          Mass(:,:), Force(:), SForce(:), Basis(:), dBasisdx(:,:), &
          NodalLame1(:), NodalLame2(:)
 
+    TYPE(MaterialPoint_t) :: MatPoint
+    TYPE(MaterialResponse_t) :: MatResponse
+    TYPE(MaterialState_t) :: MatState
+    TYPE(MaterialModel_t) :: MatModel
+    REAL(KIND=dp) :: MatProps(ISOLIN_NPROPS)
     REAL(KIND=dp) :: Strain(3,3), Stress(3,3), Stress2(3,3), Grad(3,3), DefG(3,3), Identity(3,3), &
          InvC(3,3), InvDefG(3,3), u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r, &
          Pres
@@ -3653,6 +3659,15 @@ CONTAINS
     ELSE
        dim = cdim
     END IF
+
+    ! Selected once, not per integration point. Only the isotropic linear law
+    ! goes through the interface so far; the anisotropic branch below still calls
+    ! Strain2Stress directly, because its elasticity matrix is interpolated per
+    ! point and so raises the question of how per-point material data reaches a
+    ! model, and the neo-Hookean branch needs its mixed-formulation pressure,
+    ! which is solution data rather than a material constant. Both are the next
+    ! step rather than this one.
+    MatModel = IsotropicLinearModel()
 
     IF (MixedFormulation) THEN
       DOFs = cdim + 1 
@@ -3905,7 +3920,21 @@ CONTAINS
              IF (.NOT. Isotropic) THEN
                 CALL Strain2Stress(Stress2, Strain, G, dim, .FALSE.) 
              ELSE
-                Stress2 = 2.0D0*Lame2*Strain + Lame1*TRACE(Strain,dim)*Identity
+                ! Through the constitutive interface. The identity this model
+                ! builds for itself is the same modified one assembled above --
+                ! CDim-diagonal, out-of-plane entry only away from plane stress --
+                ! since inside this branch Isotropic is true by construction.
+                MatPoint % Strain = Strain
+                MatPoint % Dim = dim
+                MatPoint % CDim = cdim
+                MatPoint % PlaneStress = PlaneStress
+                MatPoint % AxiSymmetric = AxialSymmetry
+                MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
+                    KINEMATICS_SMALL_STRAIN, LargeDeflection )
+                MatProps(ISOLIN_LAME1) = Lame1
+                MatProps(ISOLIN_LAME2) = Lame2
+                CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
+                Stress2 = MatResponse % Stress
              END IF
           END IF
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
