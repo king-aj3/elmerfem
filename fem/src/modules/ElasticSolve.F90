@@ -308,6 +308,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   INTEGER :: dim,i,j,k,l,m,n,nd,nb,ntot,t,iter,NDeg,STDOFs,LocalNodes,istat
   INTEGER :: NonlinearIter, MinNonlinearIter, FlowNOFNodes, previ
   INTEGER :: EigenModes, Passes
+  INTEGER :: RelIntegOrder
   INTEGER :: CoordinateSystem
   INTEGER :: NPROPS, NSTATEV, MAXSTATEV
 
@@ -760,6 +761,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! afterwards (its AddGlobalTime); that is not done here, so refuse it rather
   ! than appear to honour the keyword.
   !-----------------------------------------------------------------------------
+  ! Relative order of the integration rule, as StressSolve has always taken it.
+  ! Zero when the keyword is absent, which is the rule GaussPoints would have
+  ! chosen anyway. Matters most for p-elements, where the default rule is the one
+  ! the element declares; fem/tests/ElastPelem2dPmultg* are StressSolve cases that
+  ! turn it down to keep a p-refined solve affordable.
+  RelIntegOrder = ListGetInteger( SolverParams,'Relative Integration Order', GotIt )
+
   ConstantSystem     = ListGetLogical( SolverParams, 'Constant System', GotIt )
   ConstantBulkSystem = ListGetLogical( SolverParams, 'Constant Bulk System', GotIt )
   ConstantBulkMatrix = ListGetLogical( SolverParams, 'Constant Bulk Matrix', GotIt )
@@ -1736,7 +1744,7 @@ CONTAINS
     ! ------------------------------------
     ! Integration stuff
     ! ------------------------------------   
-    IntegStuff = GaussPoints( Element )
+    IntegStuff = GaussPoints( Element, RelOrder = RelIntegOrder )
 
     ForceVector = 0.0D0
     ExternalForceVector = 0.0D0
@@ -2384,7 +2392,7 @@ CONTAINS
     !-------------------------------------------------------
     !    Integration stuff
     !-------------------------------------------------------    
-    IntegStuff = GaussPoints( element )
+    IntegStuff = GaussPoints( element, RelOrder = RelIntegOrder )
 
     U_Integ => IntegStuff % u
     V_Integ => IntegStuff % v
@@ -2797,7 +2805,7 @@ CONTAINS
        Identity(i,i) = 1.0D0
     END DO
 
-    IntegStuff = GaussPoints( element )
+    IntegStuff = GaussPoints( element, RelOrder = RelIntegOrder )
 
     U_Integ => IntegStuff % u
     V_Integ => IntegStuff % v
@@ -3239,7 +3247,7 @@ CONTAINS
        END DO
     END IF
 
-    IP = GaussPoints( Element )
+    IP = GaussPoints( Element, RelOrder = RelIntegOrder )
 
     DO t=1,IP % n
        u = IP % U(t)
