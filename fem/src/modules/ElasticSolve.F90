@@ -3628,7 +3628,9 @@ CONTAINS
     TYPE(MaterialResponse_t) :: MatResponse
     TYPE(MaterialState_t) :: MatState
     TYPE(MaterialModel_t) :: MatModel
-    REAL(KIND=dp) :: MatProps(ISOLIN_NPROPS)
+    ! Sized by the largest layout any model selected here asks for, which is the
+    ! anisotropic one's flattened 6x6.
+    REAL(KIND=dp) :: MatProps(ANISOLIN_NPROPS)
     REAL(KIND=dp) :: Strain(3,3), Stress(3,3), Stress2(3,3), Grad(3,3), DefG(3,3), Identity(3,3), &
          InvC(3,3), InvDefG(3,3), u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r, &
          Pres
@@ -3659,15 +3661,6 @@ CONTAINS
     ELSE
        dim = cdim
     END IF
-
-    ! Selected once, not per integration point. Only the isotropic linear law
-    ! goes through the interface so far; the anisotropic branch below still calls
-    ! Strain2Stress directly, because its elasticity matrix is interpolated per
-    ! point and so raises the question of how per-point material data reaches a
-    ! model, and the neo-Hookean branch needs its mixed-formulation pressure,
-    ! which is solution data rather than a material constant. Both are the next
-    ! step rather than this one.
-    MatModel = IsotropicLinearModel()
 
     IF (MixedFormulation) THEN
       DOFs = cdim + 1 
@@ -3761,7 +3754,19 @@ CONTAINS
                'Youngs Modulus', n, Indices, Found )
        ELSE
           CALL InputTensor( ElasticModulus, Isotropic, &
-               'Youngs Modulus', Material, n, Indices )        
+               'Youngs Modulus', Material, n, Indices )
+       END IF
+
+       ! Selected per element rather than per integration point, since the choice
+       ! turns on which keyword the material gave and not on position. Both linear
+       ! laws now go through the constitutive interface; only neo-Hookean is still
+       ! inline below, because it needs its mixed-formulation pressure, and that is
+       ! solution data rather than a material constant -- so it is waiting on a
+       ! field of MaterialPoint_t, not on anything Props could carry.
+       IF ( Isotropic ) THEN
+          MatModel = IsotropicLinearModel()
+       ELSE
+          MatModel = AnisotropicLinearModel()
        END IF
 
        !------------------------------------------------------------------------------
@@ -3802,6 +3807,11 @@ CONTAINS
        END IF
 
        PoissonRatio = 0.0d0
+       ! Only the isotropic branch below assigns this, and every reading of it is
+       ! guarded by Isotropic -- but Fortran does not promise to stop evaluating an
+       ! .AND. once it is decided, so an anisotropic material would have it read
+       ! while undefined. Defined here instead, which changes no outcome.
+       PlaneStress = .FALSE.
        IF (Isotropic) THEN
           PoissonRatio(1:n) = ListGetReal( Material, 'Poisson Ratio', n, Indices )
           IF (MixedFormulation) THEN
@@ -3917,25 +3927,29 @@ CONTAINS
              !--------------------------------------------------------------
              Stress2 =  Pres * InvC + Lame2 * (Identity - InvC)
           ELSE
-             IF (.NOT. Isotropic) THEN
-                CALL Strain2Stress(Stress2, Strain, G, dim, .FALSE.) 
-             ELSE
-                ! Through the constitutive interface. The identity this model
-                ! builds for itself is the same modified one assembled above --
-                ! CDim-diagonal, out-of-plane entry only away from plane stress --
-                ! since inside this branch Isotropic is true by construction.
-                MatPoint % Strain = Strain
-                MatPoint % Dim = dim
-                MatPoint % CDim = cdim
-                MatPoint % PlaneStress = PlaneStress
-                MatPoint % AxiSymmetric = AxialSymmetry
-                MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
-                    KINEMATICS_SMALL_STRAIN, LargeDeflection )
+             ! Through the constitutive interface, both laws. In the isotropic case
+             ! the identity the model builds for itself is the same modified one
+             ! assembled above -- CDim-diagonal, out-of-plane entry only away from
+             ! plane stress. The only difference between the two is what goes into
+             ! Props: two Lame parameters, or the whole interpolated elasticity
+             ! matrix flattened, which is the per-point material data question the
+             ! interface was left holding.
+             MatPoint % Strain = Strain
+             MatPoint % Dim = dim
+             MatPoint % CDim = cdim
+             MatPoint % PlaneStress = PlaneStress
+             MatPoint % AxiSymmetric = AxialSymmetry
+             MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
+                 KINEMATICS_SMALL_STRAIN, LargeDeflection )
+             IF ( Isotropic ) THEN
                 MatProps(ISOLIN_LAME1) = Lame1
                 MatProps(ISOLIN_LAME2) = Lame2
-                CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
-                Stress2 = MatResponse % Stress
+             ELSE
+                MatProps(ANISOLIN_C:ANISOLIN_C+ANISOLIN_NPROPS-1) = &
+                    RESHAPE( G, [ ANISOLIN_NPROPS ] )
              END IF
+             CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
+             Stress2 = MatResponse % Stress
           END IF
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
 

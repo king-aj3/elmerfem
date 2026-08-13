@@ -63,6 +63,22 @@
 !>     of nanoseconds at best -- which is one to two orders of magnitude more than
 !>     the entire interface overhead measured above. The driver interpolates once
 !>     per point and hands the numbers over. This is UMAT's own arrangement.
+!>
+!>     How much may Props carry? Arbitrarily much, and a matrix as readily as a
+!>     scalar: the anisotropic model below takes a whole 6x6 elasticity matrix
+!>     through it, flattened in Fortran's own column-major order so that the
+!>     driver packs with RESHAPE and the model indexes back with the same
+!>     arithmetic. That settles the question against a second, matrix-shaped
+!>     channel into the interface, and it draws the line where it belongs:
+!>
+!>       MATERIAL data, however much of it, goes in Props;
+!>       SOLUTION data goes in MaterialPoint_t.
+!>
+!>     The distinction is what separates the two remaining inline branches. The
+!>     anisotropic elasticity matrix is material data that merely happens to vary
+!>     from point to point, so Props takes it. A mixed formulation's pressure is a
+!>     component of the solution, so it belongs with the deformation state in
+!>     MaterialPoint_t and no amount of Props would be the right home for it.
 !>   THE MODEL DECLARES ITS STRESS MEASURE rather than the driver assuming.
 !>     Elmer already has one kernel read two ways: Strain2Stress is fed
 !>     infinitesimal strain and read as Cauchy by StressSolve, and Green-Lagrange
@@ -73,6 +89,7 @@
 MODULE Constitutive
 
   USE Types
+  USE Messages
 
   IMPLICIT NONE
 
@@ -187,6 +204,11 @@ MODULE Constitutive
   !> Props layout for IsotropicLinearStress.
   INTEGER, PARAMETER :: ISOLIN_LAME1 = 1, ISOLIN_LAME2 = 2, ISOLIN_NPROPS = 2
 
+  !> Props layout for AnisotropicLinearStress: the 6x6 elasticity matrix in
+  !> Elmer's Voigt order (11,22,33,12,23,13) with engineering shear, flattened
+  !> column major, which is what RESHAPE(C,[36]) produces.
+  INTEGER, PARAMETER :: ANISOLIN_C = 1, ANISOLIN_NPROPS = 36
+
 CONTAINS
 
 !------------------------------------------------------------------------------
@@ -248,6 +270,89 @@ CONTAINS
     Model % Name = 'isotropic linear'
 !------------------------------------------------------------------------------
   END FUNCTION IsotropicLinearModel
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Anisotropic linear elasticity: sigma = C : eps, with C given in full as the
+!> pre-evaluated Props array.
+!>
+!> THREE DIMENSIONS ONLY, and that is not a shortcut taken here -- it is the whole
+!> of the anisotropic capability the calling solver has. ElasticSolve's LocalMatrix
+!> refuses anything else outright, with two guards:
+!>
+!>   "Material anisotropy implemented only for 3-d"
+!>   "Axially symmetric option is not supported for anisotropic materials"
+!>
+!> so a plane or axisymmetric anisotropic problem never reaches an assembly, let
+!> alone this routine. StressSolve does carry those cases, by condensing C into the
+!> reduced plane packing -- moving the shear modulus C(4,4) into slot 3, clearing
+!> the out-of-plane couplings, statically condensing the out-of-plane row under
+!> plane stress -- and recovering the out-of-plane component afterwards for output.
+!> None of that is done here, and it is deliberate that a dimension other than
+!> three is fatal rather than quietly contracting the raw matrix in the reduced
+!> packing: the raw top-left 3x3 of a 6x6 has C(3,3) where the shear modulus should
+!> be, so the quiet route is wrong by a factor of three and a half on this test's
+!> material rather than merely incomplete. Bringing those cases over is the work
+!> that lets StressSolve retire; until then the fatal is the honest boundary.
+!------------------------------------------------------------------------------
+  SUBROUTINE AnisotropicLinearStress( Point, Props, State, Response )
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp), INTENT(IN) :: Props(:)
+    TYPE(MaterialState_t), INTENT(INOUT) :: State
+    TYPE(MaterialResponse_t), INTENT(OUT) :: Response
+!------------------------------------------------------------------------------
+    !> Elmer's Voigt order as index pairs, the same tables Strain2Stress builds.
+    INTEGER, PARAMETER :: I1(6) = [ 1,2,3,1,2,1 ], I2(6) = [ 1,2,3,2,3,3 ]
+    REAL(KIND=dp) :: S(6), csum
+    INTEGER :: i, j, p, q
+!------------------------------------------------------------------------------
+    IF ( Point % Dim /= 3 ) CALL Fatal( 'AnisotropicLinearStress', &
+        'Material anisotropy implemented only for 3-d' )
+
+    ! The off-diagonal entries are engineering shear, doubled here because C is
+    ! indexed for it. A factor of two lost on these is invisible in any isotropic
+    ! test, which is why it is written out rather than looped.
+    S(1) = Point % Strain(1,1)
+    S(2) = Point % Strain(2,2)
+    S(3) = Point % Strain(3,3)
+    S(4) = 2.0_dp * Point % Strain(1,2)
+    S(5) = 2.0_dp * Point % Strain(2,3)
+    S(6) = 2.0_dp * Point % Strain(1,3)
+
+    DO i=1,6
+      p = I1(i)
+      q = I2(i)
+      csum = 0.0_dp
+      DO j=1,6
+        csum = csum + Props(ANISOLIN_C - 1 + 6*(j-1) + i) * S(j)
+      END DO
+      Response % Stress(p,q) = csum
+      Response % Stress(q,p) = csum
+    END DO
+
+    Response % StressMeasure = MERGE( STRESS_PK2, STRESS_CAUCHY, &
+        Point % Kinematics /= KINEMATICS_SMALL_STRAIN )
+!------------------------------------------------------------------------------
+  END SUBROUTINE AnisotropicLinearStress
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The model record for the above.
+!------------------------------------------------------------------------------
+  FUNCTION AnisotropicLinearModel() RESULT( Model )
+!------------------------------------------------------------------------------
+    TYPE(MaterialModel_t) :: Model
+!------------------------------------------------------------------------------
+    Model % Stress => AnisotropicLinearStress
+    Model % StrainLinear = .TRUE.
+    Model % nState = 0
+    Model % nProps = ANISOLIN_NPROPS
+    Model % Name = 'anisotropic linear'
+!------------------------------------------------------------------------------
+  END FUNCTION AnisotropicLinearModel
 !------------------------------------------------------------------------------
 
 END MODULE Constitutive
