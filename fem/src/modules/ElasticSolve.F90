@@ -724,6 +724,28 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   IF (.NOT. LargeDeflection) HenckyStrain = .FALSE.
 
+  !-----------------------------------------------------------------------------
+  ! "Local Matrix Storage" lets the assembly build one element's local matrix and
+  ! reuse it for every element the core has marked identical to it -- by
+  ! "Local Matrix Identical" for the whole set, or "... Identical Bodies" per
+  ! body. The bookkeeping is all in DefaultStart and UseLocalMatrixCopy; a solver
+  ! opts in with the one test in the assembly loop below.
+  !
+  ! It is only sound while the local matrix depends on nothing element-specific,
+  ! which rules out more here than it does in StressSolve. Only the stiffness and
+  ! the force are stored, so mass and damping cannot be carried; and a tangent
+  ! that reads the current solution differs element by element however identical
+  ! the geometry, so the nonlinear paths are out too. Refuse rather than quietly
+  ! assemble the wrong matrix -- being wrong here looks like a converged answer.
+  !-----------------------------------------------------------------------------
+  IF( ListGetLogical( SolverParams, 'Local Matrix Storage', GotIt ) ) THEN
+    IF( NeedMass .OR. TransientSimulation ) CALL Fatal( Caller, &
+        '"Local Matrix Storage" is applicable to steady cases only' )
+    IF( UseUMAT .OR. NeoHookeanMaterial .OR. LargeDeflection ) CALL Fatal( Caller, &
+        '"Local Matrix Storage" needs a linear material: set "Large Deflection = False"'//&
+        ' and use neither a UMAT nor a neo-Hookean material' )
+  END IF
+
   GlobalPseudoTraction = GetLogical( SolverParams, 'Pseudo-Traction', GotIt)
 
 
@@ -781,6 +803,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         nd = GetElementDOFs( Indices )
         nb = GetElementNOFBDOFs()
         ntot = nd + nb
+
+        ! The core has marked this element as identical to one already assembled,
+        ! so its local matrix is in store and DefaultUpdateEquations will fetch it
+        ! rather than read what is passed. Skip building it. See the guard on
+        ! "Local Matrix Storage" above for when this is sound.
+        IF( UseLocalMatrixCopy( Solver, activeind = t ) ) GOTO 200
 
         !-----------------------------------------------------------------------------------
         !        Get the material parameters relating to the constitutive law:
@@ -1001,9 +1029,9 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 LocalStiffMatrix, LocalForce )
         END IF
         !------------------------------------------------------------------------------
-        !        Update global matrices from local matrices 
+        !        Update global matrices from local matrices
         !------------------------------------------------------------------------------
-        CALL DefaultUpdateEquations( LocalStiffMatrix, LocalForce )
+200     CALL DefaultUpdateEquations( LocalStiffMatrix, LocalForce )
         !------------------------------------------------------------------------------
 
         IF( NeedMass ) THEN
