@@ -57,6 +57,14 @@ MODULE StressLocal
 !> one the layout does not carry.
   INTEGER, PARAMETER :: SYMTENSOR_IND(9) = [ 1,4,6,4,2,5,6,5,3 ]
 
+!> Every field an elasticity solver may recover from the displacement. Both
+!> solvers declare exactly this set, so ElasticityStoreEigenmode can walk it
+!> without being told which of them are in play: one a solver did not declare is
+!> simply not on the mesh, and is skipped.
+  CHARACTER(LEN=16), PARAMETER :: STRESS_OUTPUT_FIELDS(7) = &
+      [ CHARACTER(LEN=16) :: 'Stress', 'vonMises', 'Principal Stress', 'Strain', &
+        'Principal Strain', 'Principal Angle', 'Tresca' ]
+
 !------------------------------------------------------------------------------
 !> Persistent state of a nodal projection. Stress and strain fields are recovered
 !> from their integration point values by an L2 projection, which needs a solver
@@ -1564,6 +1572,82 @@ CONTAINS
      Str = TRIM(Str)//']'
 !------------------------------------------------------------------------------
    END FUNCTION StressFieldDefinition
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Keep the postprocessed fields of one eigenmode.
+!>
+!> Each mode has its own displacement and hence its own stresses, so the
+!> postprocessing runs once per mode -- but the nodal fields can only ever hold
+!> the last one computed. The results therefore go into each field variable's own
+!> EigenVectors, mirroring the displacement's, so that a mode written out carries
+!> its stresses with it.
+!>
+!> Call this after the postprocessing of mode Mode has run. The fields are read
+!> from the variables themselves, which is where the projection has just left
+!> them, so nothing has to be threaded through: whichever fields the solver
+!> declared are the ones stored.
+!>
+!> Imaginary is mandatory rather than OPTIONAL on purpose -- testing an absent
+!> OPTIONAL reads uninitialised memory instead of failing to build. A harmonic
+!> caller runs each mode twice, .FALSE. for the real part and then .TRUE. for the
+!> imaginary; an eigen caller passes .FALSE. once.
+!------------------------------------------------------------------------------
+   SUBROUTINE ElasticityStoreEigenmode( Solver, Mesh, Mode, Imaginary )
+!------------------------------------------------------------------------------
+     TYPE(Solver_t) :: Solver
+     TYPE(Mesh_t), POINTER :: Mesh
+     INTEGER :: Mode
+     LOGICAL :: Imaginary
+!------------------------------------------------------------------------------
+     TYPE(Variable_t), POINTER :: Var, iVar
+     INTEGER :: i, k, dofs, nomodes
+!------------------------------------------------------------------------------
+     nomodes = Solver % NOFEigenValues
+
+     DO i=1,SIZE(STRESS_OUTPUT_FIELDS)
+       Var => VariableGet( Mesh % Variables, STRESS_OUTPUT_FIELDS(i) )
+       IF ( .NOT. ASSOCIATED( Var ) ) CYCLE
+       dofs = Var % DOFs
+
+       IF ( Mode == 1 .AND. .NOT. Imaginary ) THEN
+         ! Sized from the field itself rather than from the displacement: the two
+         ! agree whenever both are on the same permutation, and where they would
+         ! not, this is the length the assignments below actually need.
+         IF ( .NOT. ASSOCIATED( Var % EigenVectors ) ) THEN
+           ALLOCATE( Var % EigenVectors( nomodes, SIZE( Var % Values ) ) )
+           Var % EigenVectors = 0.0_dp
+         END IF
+         IF ( .NOT. ASSOCIATED( Var % EigenValues ) ) THEN
+           ALLOCATE( Var % EigenValues( nomodes ) )
+           Var % EigenValues = 0.0_dp
+         END IF
+         Var % EigenValues = Solver % Variable % EigenValues
+
+         ! The components of a multi-dof field are variables in their own right,
+         ! and they are what actually gets written out, so point each at the slice
+         ! it names.
+         IF ( dofs > 1 ) THEN
+           DO k=1,dofs
+             iVar => VariableGet( Mesh % Variables, ComponentName( Var % Name, k ) )
+             IF ( .NOT. ASSOCIATED( iVar ) ) CALL Fatal( 'ElasticityStoreEigenmode', &
+                 'No variable associated: '//TRIM( ComponentName( Var % Name, k ) ) )
+             iVar % EigenValues => Var % EigenValues
+             iVar % EigenVectors => Var % EigenVectors(:,k::dofs)
+           END DO
+         END IF
+       END IF
+
+       IF ( Imaginary ) THEN
+         Var % EigenVectors(Mode,:) = Var % EigenVectors(Mode,:) + &
+             CMPLX( 0.0_dp, Var % Values, KIND=dp )
+       ELSE
+         Var % EigenVectors(Mode,:) = Var % Values
+       END IF
+     END DO
+!------------------------------------------------------------------------------
+   END SUBROUTINE ElasticityStoreEigenmode
 !------------------------------------------------------------------------------
 
 
