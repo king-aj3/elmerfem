@@ -1226,7 +1226,8 @@ CONTAINS
 !------------------------------------------------------------------------------
      INTEGER :: i,j,p,q,ic
      LOGICAL :: Found, Incompressible, FirstTime=.TRUE., PreBuiltC
-     REAL(KIND=dp) :: C(6,6), Young, LGrad(3,3), Poisson, S(6), &
+     ! S went with the plane strain recovery, which is now PlaneStrainStressZZ.
+     REAL(KIND=dp) :: C(6,6), Young, LGrad(3,3), Poisson, &
           Pressure, Radius, HEXP(3,3), EzzC(3)
      TYPE(ValueHandle_t), SAVE :: BetaIP_h, EIP_h, nuIP_h, Load_h(4), Load_h_im(4)
      TYPE(Element_t), POINTER :: Element
@@ -1359,28 +1360,7 @@ CONTAINS
               C(4,2) = C(1,2)
             END IF
          ELSE
-            IF ( PlaneStress ) THEN
-!              Coefficients recovering the out-of-plane strain from the in-plane
-!              ones, from the plane stress condition Stress_zz = 0. Taken before
-!              the condensation below overwrites the out-of-plane row. The third
-!              multiplies the engineering shear, which is how C is indexed.
-               EzzC(1) = -C(3,1) / C(3,3)
-               EzzC(2) = -C(3,2) / C(3,3)
-               EzzC(3) = -C(3,4) / C(3,3)
-
-               C(1,1) = C(1,1) - C(1,3) * C(3,1) / C(3,3)
-               C(1,2) = C(1,2) - C(1,3) * C(2,3) / C(3,3)
-               C(2,1) = C(2,1) - C(2,3) * C(1,3) / C(3,3)
-               C(2,2) = C(2,2) - C(2,3) * C(3,2) / C(3,3)
-            ELSE
-!              To compute Stress_zz afterwards....!
-               C(4,1) = C(3,1)
-               C(4,2) = C(3,2)
-               C(4,3) = C(3,4)
-            END IF
-            C(3,3) = C(4,4)
-            C(1,3) = 0; C(3,1) = 0
-            C(2,3) = 0; C(3,2) = 0
+            CALL CondensePlaneElasticityMatrix( C, PlaneStress, EzzC )
          END IF
        END IF
 
@@ -1435,18 +1415,12 @@ CONTAINS
 !    cannot see them -- but both are reportable, so fill them in for output.
      IF ( dim==2 .AND. .NOT. CSymmetry ) THEN
        IF ( .NOT. PlaneStress ) THEN
-         S(1) = Strain(1,1)
-         S(2) = Strain(2,2)
-         ! The engineering shear: C is indexed for it throughout, as Strain2Stress
-         ! shows by doubling this same component before contracting with C.
-         S(3) = 2.0_dp * Strain(1,2)
-         Stress(3,3) = Stress(3,3) + SUM( C(4,1:3) * S(1:3) )
+         Stress(3,3) = Stress(3,3) + PlaneStrainStressZZ( C, Strain )
        ELSE
          IF ( Isotropic(1) ) THEN
            Strain(3,3) = -Poisson / ( 1.0_dp - Poisson ) * ( Strain(1,1) + Strain(2,2) )
          ELSE
-           Strain(3,3) = EzzC(1) * Strain(1,1) + EzzC(2) * Strain(2,2) + &
-               EzzC(3) * 2.0_dp * Strain(1,2)
+           Strain(3,3) = PlaneStressStrainZZ( EzzC, Strain )
          END IF
        END IF
      END IF
@@ -1505,6 +1479,120 @@ CONTAINS
      END DO
 !------------------------------------------------------------------------------
    END SUBROUTINE Strain2Stress
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Reduce a full 6x6 elasticity matrix to the three-component plane packing that
+!> Strain2Stress uses when dim is 2 and CSymmetry is false, namely (11,22,12) with
+!> the engineering shear.
+!>
+!> This is the step that separates a solver which supports anisotropy in the plane
+!> from one which does not, and it is nothing to do with the assembly: a plane
+!> assembly written for a general dim contracts C(1:3,1:3) with (e11,e22,2e12), so
+!> handed a raw 6x6 it would read C(3,3) -- the 33 modulus -- as the shear modulus,
+!> and the 11-33 couplings as normal-to-shear ones. Hence the condensation, and
+!> hence extracting it here rather than letting a second solver grow its own.
+!>
+!> WHAT COMES BACK, and it is two different things depending on the assumption,
+!> because the plane system determines one out-of-plane component without carrying
+!> it:
+!>
+!>   plane strain -> Stress_zz is left to be recovered, and its coefficients are
+!>     stashed in C(4,1:3), to be contracted with (e11,e22,2e12). EzzC is untouched.
+!>   plane stress -> Strain_zz is left to be recovered, and its coefficients come
+!>     back in EzzC. C(4,1:3) is untouched, and still holds the shear row.
+!>
+!> The C(4,1:3) stash is not a design so much as an existing convention -- the
+!> isotropic path a few lines up in LocalStress fills the same slots by hand -- and
+!> it is kept because changing it would alter what every caller reads for no gain
+!> here. A caller wanting the plane strain coefficients reads C(4,1:3); one wanting
+!> the plane stress coefficients reads EzzC; neither is meaningful under the other
+!> assumption.
+!>
+!> KNOWN LIMITATION, pre-existing and preserved deliberately: the normal-to-shear
+!> couplings C(1,4) and C(2,4) of the input are NOT carried into the reduced
+!> matrix -- positions (1,3) and (2,3) are zeroed rather than loaded from them. For
+!> a material whose axes are the coordinate axes those couplings vanish and nothing
+!> is lost, which is why no test has ever noticed. Fixing it would change
+!> StressSolve's answers, so it is recorded rather than done.
+!------------------------------------------------------------------------------
+   SUBROUTINE CondensePlaneElasticityMatrix( C, PlaneStress, EzzC )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: C(:,:)     !< 6x6 in; reduced plane packing in C(1:3,1:3) out
+     LOGICAL :: PlaneStress
+     REAL(KIND=dp) :: EzzC(:)    !< plane stress only: the Strain_zz coefficients
+!------------------------------------------------------------------------------
+     IF ( PlaneStress ) THEN
+!      Coefficients recovering the out-of-plane strain from the in-plane ones, from
+!      the plane stress condition Stress_zz = 0. Taken before the condensation
+!      below overwrites the out-of-plane row. The third multiplies the engineering
+!      shear, which is how C is indexed.
+       EzzC(1) = -C(3,1) / C(3,3)
+       EzzC(2) = -C(3,2) / C(3,3)
+       EzzC(3) = -C(3,4) / C(3,3)
+
+       C(1,1) = C(1,1) - C(1,3) * C(3,1) / C(3,3)
+       C(1,2) = C(1,2) - C(1,3) * C(2,3) / C(3,3)
+       C(2,1) = C(2,1) - C(2,3) * C(1,3) / C(3,3)
+       C(2,2) = C(2,2) - C(2,3) * C(3,2) / C(3,3)
+     ELSE
+!      To compute Stress_zz afterwards....!
+       C(4,1) = C(3,1)
+       C(4,2) = C(3,2)
+       C(4,3) = C(3,4)
+     END IF
+     C(3,3) = C(4,4)
+     C(1,3) = 0; C(3,1) = 0
+     C(2,3) = 0; C(3,2) = 0
+!------------------------------------------------------------------------------
+   END SUBROUTINE CondensePlaneElasticityMatrix
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The out-of-plane normal stress that a plane strain system determines but does
+!> not carry, from the coefficients CondensePlaneElasticityMatrix stashed in
+!> C(4,1:3). Anisotropic materials only; the isotropic case has a closed form in
+!> terms of the Poisson ratio and does not need the stash.
+!>
+!> Extracted so that the two elasticity solvers cannot drift apart on it. It is one
+!> expression and it would be trivial to write twice, which is exactly how a factor
+!> of two on the engineering shear below came to live in this file unnoticed until
+!> a test was written that could see it.
+!------------------------------------------------------------------------------
+   PURE FUNCTION PlaneStrainStressZZ( C, Strain ) RESULT( Szz )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp), INTENT(IN) :: C(:,:), Strain(:,:)
+     REAL(KIND=dp) :: Szz
+!------------------------------------------------------------------------------
+     REAL(KIND=dp) :: S(3)
+!------------------------------------------------------------------------------
+     S(1) = Strain(1,1)
+     S(2) = Strain(2,2)
+     ! The engineering shear: C is indexed for it throughout, as Strain2Stress
+     ! shows by doubling this same component before contracting with C.
+     S(3) = 2.0_dp * Strain(1,2)
+     Szz = SUM( C(4,1:3) * S(1:3) )
+!------------------------------------------------------------------------------
+   END FUNCTION PlaneStrainStressZZ
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The out-of-plane normal strain that a plane stress system determines but does
+!> not carry, from the coefficients CondensePlaneElasticityMatrix returned in EzzC.
+!> Anisotropic materials only, for the same reason as above.
+!------------------------------------------------------------------------------
+   PURE FUNCTION PlaneStressStrainZZ( EzzC, Strain ) RESULT( Ezz )
+!------------------------------------------------------------------------------
+     REAL(KIND=dp), INTENT(IN) :: EzzC(:), Strain(:,:)
+     REAL(KIND=dp) :: Ezz
+!------------------------------------------------------------------------------
+     Ezz = EzzC(1) * Strain(1,1) + EzzC(2) * Strain(2,2) + &
+         EzzC(3) * 2.0_dp * Strain(1,2)
+!------------------------------------------------------------------------------
+   END FUNCTION PlaneStressStrainZZ
 !------------------------------------------------------------------------------
 
 
