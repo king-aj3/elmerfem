@@ -90,6 +90,7 @@ MODULE Constitutive
 
   USE Types
   USE Messages
+  USE LinearAlgebra
 
   IMPLICIT NONE
 
@@ -122,6 +123,17 @@ MODULE Constitutive
     !> trace runs over Dim while the identity it multiplies is CDim-diagonal.
     INTEGER :: Dim = 3, CDim = 3
     LOGICAL :: PlaneStress = .FALSE., AxiSymmetric = .FALSE.
+    !> A pressure carried as an unknown of the system rather than derived from the
+    !> deformation, which is what Elmer's "Mixed Formulation" does for a nearly
+    !> incompressible material. It sits here and not in Props because it is a
+    !> component of the SOLUTION -- the one piece of a constitutive response that a
+    !> model cannot compute for itself and the driver must hand over. A model that
+    !> also has a compressible form checks PressureSupplied and computes its own
+    !> volumetric term when it is false; the constitutive relation stays in the
+    !> model either way, which is the whole point of asking the driver only for
+    !> what the driver alone knows.
+    REAL(KIND=dp) :: Pressure = 0.0_dp
+    LOGICAL :: PressureSupplied = .FALSE.
     INTEGER :: Element = 0, IP = 0
   END TYPE MaterialPoint_t
 
@@ -209,7 +221,41 @@ MODULE Constitutive
   !> column major, which is what RESHAPE(C,[36]) produces.
   INTEGER, PARAMETER :: ANISOLIN_C = 1, ANISOLIN_NPROPS = 36
 
+  !> Props layout for NeoHookeanStress. The same two constants the isotropic
+  !> linear law takes, read as the compressible neo-Hookean parameters: LAME2 is
+  !> the shear modulus and LAME1 the one governing the volumetric term, which is
+  !> used only when the driver does not supply a pressure.
+  INTEGER, PARAMETER :: NEOHOOKE_LAME1 = 1, NEOHOOKE_LAME2 = 2, NEOHOOKE_NPROPS = 2
+
 CONTAINS
+
+!------------------------------------------------------------------------------
+!> The identity that the plane and axisymmetric reductions actually want, shared
+!> by every model here because getting it wrong is how a plane stress case
+!> silently becomes a plane strain one.
+!>
+!> It is not the plain identity: it is CDim-diagonal, and carries the out-of-plane
+!> entry only away from plane stress. With that entry zeroed a volumetric term
+!> makes no contribution to sigma_33, which is what leaves sigma_33 zero as plane
+!> stress requires. Under axial symmetry the out-of-plane direction is the hoop and
+!> does carry stress, so the entry is present whatever the plane stress flag says.
+!------------------------------------------------------------------------------
+  PURE FUNCTION ReducedIdentity( Point ) RESULT( Identity )
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp) :: Identity(3,3)
+!------------------------------------------------------------------------------
+    INTEGER :: i
+!------------------------------------------------------------------------------
+    Identity = 0.0_dp
+    DO i=1,Point % CDim
+      Identity(i,i) = 1.0_dp
+    END DO
+    IF ( Point % AxiSymmetric .OR. .NOT. Point % PlaneStress ) Identity(3,3) = 1.0_dp
+!------------------------------------------------------------------------------
+  END FUNCTION ReducedIdentity
+!------------------------------------------------------------------------------
+
 
 !------------------------------------------------------------------------------
 !> Isotropic linear elasticity: sigma = 2 mu eps + lambda tr(eps) I.
@@ -235,11 +281,7 @@ CONTAINS
     REAL(KIND=dp) :: Identity(3,3), tr
     INTEGER :: i
 !------------------------------------------------------------------------------
-    Identity = 0.0_dp
-    DO i=1,Point % CDim
-      Identity(i,i) = 1.0_dp
-    END DO
-    IF ( Point % AxiSymmetric .OR. .NOT. Point % PlaneStress ) Identity(3,3) = 1.0_dp
+    Identity = ReducedIdentity( Point )
 
     tr = 0.0_dp
     DO i=1,Point % Dim
@@ -353,6 +395,79 @@ CONTAINS
     Model % Name = 'anisotropic linear'
 !------------------------------------------------------------------------------
   END FUNCTION AnisotropicLinearModel
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Compressible neo-Hookean elasticity, returning the second Piola-Kirchhoff
+!> stress of the current iterate:
+!>
+!>   S = p C^-1 + mu ( I - C^-1 ),     C = F^T F
+!>
+!> This is the first model here that is NOT linear in its strain measure, so
+!> StrainLinear is false and the Gateaux shortcut is not a derivative for it --
+!> which is exactly why the calling solver keeps a separate assembly routine for
+!> it. Nothing in this file depends on that; the flag is how a driver finds out.
+!>
+!> The pressure arrives one of two ways, and the split is the reason this model was
+!> the one the interface could not absorb until MaterialPoint_t grew a field:
+!>
+!>   SUPPLIED -- Elmer's "Mixed Formulation" carries pressure as an unknown of the
+!>     system, so it is solution data and only the driver can produce it. It comes
+!>     in through Point % Pressure.
+!>   COMPUTED -- otherwise the pressure is the material's own volumetric response
+!>     to the dilatation, lambda/2 (J^2 - 1), which is a constitutive relation and
+!>     so belongs here rather than in the driver that used to hold it.
+!>
+!> Written with (J-1)(J+1) rather than (J^2-1) deliberately: that is the form the
+!> driver had, and the two are not the same in floating point.
+!------------------------------------------------------------------------------
+  SUBROUTINE NeoHookeanStress( Point, Props, State, Response )
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp), INTENT(IN) :: Props(:)
+    TYPE(MaterialState_t), INTENT(INOUT) :: State
+    TYPE(MaterialResponse_t), INTENT(OUT) :: Response
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: InvC(3,3), Identity(3,3), Pres
+!------------------------------------------------------------------------------
+    IF ( Point % PressureSupplied ) THEN
+      Pres = Point % Pressure
+    ELSE
+      Pres = Props(NEOHOOKE_LAME1)/2.0_dp * (Point % DetF - 1.0_dp) * &
+          (Point % DetF + 1.0_dp)
+    END IF
+
+    Identity = ReducedIdentity( Point )
+
+    ! The inverse of the right Cauchy-Green tensor. Inverted over Dim, the
+    ! dimension of the state of stress, and not over the three rows it is stored
+    ! in -- the out-of-plane row is not part of the plane system.
+    InvC = MATMUL( TRANSPOSE(Point % F), Point % F )
+    CALL InvertMatrix( InvC, Point % Dim )
+
+    Response % Stress = Pres * InvC + Props(NEOHOOKE_LAME2) * (Identity - InvC)
+    Response % StressMeasure = STRESS_PK2
+!------------------------------------------------------------------------------
+  END SUBROUTINE NeoHookeanStress
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> The model record for the above.
+!------------------------------------------------------------------------------
+  FUNCTION NeoHookeanModel() RESULT( Model )
+!------------------------------------------------------------------------------
+    TYPE(MaterialModel_t) :: Model
+!------------------------------------------------------------------------------
+    Model % Stress => NeoHookeanStress
+    !> Not linear in the strain measure: see the note on the type's own field.
+    Model % StrainLinear = .FALSE.
+    Model % nState = 0
+    Model % nProps = NEOHOOKE_NPROPS
+    Model % Name = 'neo-Hookean'
+!------------------------------------------------------------------------------
+  END FUNCTION NeoHookeanModel
 !------------------------------------------------------------------------------
 
 END MODULE Constitutive

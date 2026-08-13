@@ -3631,9 +3631,13 @@ CONTAINS
     ! Sized by the largest layout any model selected here asks for, which is the
     ! anisotropic one's flattened 6x6.
     REAL(KIND=dp) :: MatProps(ANISOLIN_NPROPS)
+    ! InvC, InvDefG and Pres went with the neo-Hookean block that moved into the
+    ! constitutive interface. InvDefG was already dead before the move: it was
+    ! assigned and inverted at every integration point and never read, so the
+    ! postprocessing loop was paying for one matrix inversion per point for
+    ! nothing.
     REAL(KIND=dp) :: Strain(3,3), Stress(3,3), Stress2(3,3), Grad(3,3), DefG(3,3), Identity(3,3), &
-         InvC(3,3), InvDefG(3,3), u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r, &
-         Pres
+         u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, &
          PlaneStress, &
@@ -3758,12 +3762,11 @@ CONTAINS
        END IF
 
        ! Selected per element rather than per integration point, since the choice
-       ! turns on which keyword the material gave and not on position. Both linear
-       ! laws now go through the constitutive interface; only neo-Hookean is still
-       ! inline below, because it needs its mixed-formulation pressure, and that is
-       ! solution data rather than a material constant -- so it is waiting on a
-       ! field of MaterialPoint_t, not on anything Props could carry.
-       IF ( Isotropic ) THEN
+       ! turns on which keywords the material and solver gave and not on position.
+       ! Neo-Hookean is tested first because it sets Isotropic itself.
+       IF ( NeoHookeanMaterial ) THEN
+          MatModel = NeoHookeanModel()
+       ELSE IF ( Isotropic ) THEN
           MatModel = IsotropicLinearModel()
        ELSE
           MatModel = AnisotropicLinearModel()
@@ -3909,48 +3912,43 @@ CONTAINS
           IF (Isotropic .AND. PlaneStress) &
                Strain(3,3) = -nu/(1.0d0-nu)*(Strain(1,1)+Strain(2,2))
 
+          ! Every law goes through the constitutive interface now, so the choice
+          ! here is only what to put in front of it. In the isotropic cases the
+          ! identity the model builds for itself is the same modified one assembled
+          ! above -- CDim-diagonal, out-of-plane entry only away from plane stress
+          ! -- which is shared code in the interface rather than a coincidence.
+          MatPoint % Strain = Strain
+          MatPoint % Dim = dim
+          MatPoint % CDim = cdim
+          MatPoint % PlaneStress = PlaneStress
+          MatPoint % AxiSymmetric = AxialSymmetry
+          MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
+              KINEMATICS_SMALL_STRAIN, LargeDeflection )
           IF (NeoHookeanMaterial) THEN
-             IF (MixedFormulation) THEN
-               Pres = -SUM(LocalDisplacement(DOFs,1:n) * Basis(1:n))
-             ELSE
-               Pres = Lame1/2.0d0 * (DetDefG - 1.0d0) * (DetDefG + 1.0d0)
-             END IF
-             InvC = MATMUL( TRANSPOSE(DefG), DefG )
-             InvDefG = DefG
-             !-------------------------------------------------------------
-             !  InvC will now be the inverse of the right Cauchy-Green tensor
-             !-------------------------------------------------------------
-             CALL InvertMatrix( InvC, dim )
-             CALL InvertMatrix( InvDefG, dim )       
-             !-------------------------------------------------------------
-             ! The second Piola-Kirchhoff stress for the current iterate
-             !--------------------------------------------------------------
-             Stress2 =  Pres * InvC + Lame2 * (Identity - InvC)
+             ! The deformation gradient, which only a large-deflection law reads,
+             ! and the pressure if the system carries one as an unknown. That
+             ! pressure is the whole reason this branch could not be a model until
+             ! MaterialPoint_t had a place for solution data; the volumetric
+             ! alternative to it is a constitutive relation and has moved into the
+             ! model, which is why no dilatation formula is left here.
+             MatPoint % F = DefG
+             MatPoint % DetF = DetDefG
+             MatPoint % PressureSupplied = MixedFormulation
+             IF (MixedFormulation) &
+                 MatPoint % Pressure = -SUM(LocalDisplacement(DOFs,1:n) * Basis(1:n))
+             MatProps(NEOHOOKE_LAME1) = Lame1
+             MatProps(NEOHOOKE_LAME2) = Lame2
+          ELSE IF ( Isotropic ) THEN
+             MatProps(ISOLIN_LAME1) = Lame1
+             MatProps(ISOLIN_LAME2) = Lame2
           ELSE
-             ! Through the constitutive interface, both laws. In the isotropic case
-             ! the identity the model builds for itself is the same modified one
-             ! assembled above -- CDim-diagonal, out-of-plane entry only away from
-             ! plane stress. The only difference between the two is what goes into
-             ! Props: two Lame parameters, or the whole interpolated elasticity
-             ! matrix flattened, which is the per-point material data question the
-             ! interface was left holding.
-             MatPoint % Strain = Strain
-             MatPoint % Dim = dim
-             MatPoint % CDim = cdim
-             MatPoint % PlaneStress = PlaneStress
-             MatPoint % AxiSymmetric = AxialSymmetry
-             MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
-                 KINEMATICS_SMALL_STRAIN, LargeDeflection )
-             IF ( Isotropic ) THEN
-                MatProps(ISOLIN_LAME1) = Lame1
-                MatProps(ISOLIN_LAME2) = Lame2
-             ELSE
-                MatProps(ANISOLIN_C:ANISOLIN_C+ANISOLIN_NPROPS-1) = &
-                    RESHAPE( G, [ ANISOLIN_NPROPS ] )
-             END IF
-             CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
-             Stress2 = MatResponse % Stress
+             ! The whole interpolated elasticity matrix, flattened -- the per-point
+             ! material data question the interface was left holding.
+             MatProps(ANISOLIN_C:ANISOLIN_C+ANISOLIN_NPROPS-1) = &
+                 RESHAPE( G, [ ANISOLIN_NPROPS ] )
           END IF
+          CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
+          Stress2 = MatResponse % Stress
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
 
           CALL NodalProjectorMass( Mass, Basis, nd, Weight )
