@@ -294,7 +294,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: PlaneStress, CalculateStrains, CalculateStresses
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
   LOGICAL :: CalcPrincipalStress, CalcPrincipalStrain
-  LOGICAL :: AllocationsDone = .FALSE.
+  LOGICAL :: AllocationsDone = .FALSE., HarmonicAnalysis
   LOGICAL :: CompressibilityDefined = .FALSE.
   LOGICAL :: NormalSpring, NormalTangential
   LOGICAL :: Converged, NoExternalLoads
@@ -305,6 +305,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   INTEGER :: dim,i,j,k,l,m,n,nd,nb,ntot,t,iter,NDeg,STDOFs,LocalNodes,istat
   INTEGER :: NonlinearIter, MinNonlinearIter, FlowNOFNodes, previ
+  INTEGER :: EigenModes, Passes
   INTEGER :: CoordinateSystem
   INTEGER :: NPROPS, NSTATEV, MAXSTATEV
 
@@ -447,14 +448,15 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! which is what StressSolve has always done.
   IF ( .NOT. GotIt ) MeshDisplacementActive = .NOT. EigenOrHarmonicAnalysis()
 
+  HarmonicAnalysis = getLogical( SolverParams, 'Harmonic Analysis', GotIt ) .OR. &
+      getLogical( SolverParams,'Harmonic Mode',GotIt )
+
   ! Sometimes we might want to use this solver to provide also eigenmode or harmonic analysis.
   ! Then we need to add also the mass even though the system is not transient.
   IF( TransientSimulation ) THEN
     NeedMass = .FALSE.
   ELSE
-    NeedMass = EigenOrHarmonicAnalysis() .OR.  & 
-        getLogical( SolverParams, 'Harmonic Analysis', GotIt ) .OR. &
-        getLogical( SolverParams,'Harmonic Mode',GotIt ) 
+    NeedMass = EigenOrHarmonicAnalysis() .OR. HarmonicAnalysis
   END IF
     
   
@@ -1356,18 +1358,55 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   !-----------------------------------------------------------------------------
   IF (CalculateStrains .OR. CalculateStresses) THEN
      CALL Info(Caller,'Computing postprocessing fields')
-     IF (UseUMAT) THEN
-        CALL GenerateStressVariable(NodalStress, StressPerm, &
-            CalculateStresses, AxialSymmetry)
 
-        CALL GenerateStrainVariable(Displacement, NodalStrain, StressPerm, CalculateStrains, &
-            AxialSymmetry, LargeDeflection)
-     ELSE
-        CALL ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, StressPerm, &
-             PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, NeoHookeanMaterial, &
-             CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, MixedFormulation, &
-             LargeDeflection)
-     END IF
+     !--------------------------------------------------------------------------
+     ! An eigen or harmonic analysis has a displacement per mode, hence stresses
+     ! per mode, so the postprocessing runs once for each. The nodal fields can
+     ! only ever hold the last of them, so each mode's result is kept with the
+     ! mode itself -- see ElasticityStoreEigenmode. A harmonic mode is complex and
+     ! takes two passes, the real part and then the imaginary.
+     !
+     ! NOFEigenValues is zero in an ordinary solve, which is the single pass of
+     ! the loop below with none of this entered.
+     !
+     ! The displacement is left holding the last mode rather than restored, which
+     ! is what StressSolve does. The reported norm of a case like
+     ! fem/tests/StrainCalculation03 is that mode's, so the two solvers have to
+     ! agree here for its reference norm to survive them being merged. Displacing
+     ! the mesh by a mode shape is the part that would be wrong, and the default
+     ! set for "Displace Mesh" above stops that.
+     !--------------------------------------------------------------------------
+     EigenModes = Solver % NOFEigenValues
+     Passes = 1
+     IF ( EigenModes > 0 .AND. HarmonicAnalysis ) Passes = 2
+
+     DO i=1,MAX( EigenModes, 1 )
+        DO l=1,Passes
+           IF ( EigenModes > 0 ) THEN
+              CALL Info(Caller,'Computing stresses for eigenmode: '//I2S(i),Level=5)
+              IF ( l == 1 ) THEN
+                 Displacement = REAL( Solver % Variable % EigenVectors(i,:) )
+              ELSE
+                 Displacement = AIMAG( Solver % Variable % EigenVectors(i,:) )
+              END IF
+           END IF
+
+           IF (UseUMAT) THEN
+              CALL GenerateStressVariable(NodalStress, StressPerm, &
+                  CalculateStresses, AxialSymmetry)
+
+              CALL GenerateStrainVariable(Displacement, NodalStrain, StressPerm, CalculateStrains, &
+                  AxialSymmetry, LargeDeflection)
+           ELSE
+              CALL ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, StressPerm, &
+                   PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, NeoHookeanMaterial, &
+                   CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, MixedFormulation, &
+                   LargeDeflection)
+           END IF
+
+           IF ( EigenModes > 0 ) CALL ElasticityStoreEigenmode( Solver, Mesh, i, l == 2 )
+        END DO
+     END DO
   END IF
 
   IF ( ListGetLogical(SolverParams, 'Adaptive Mesh Refinement', GotIt) ) THEN
