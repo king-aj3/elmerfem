@@ -2430,14 +2430,28 @@ CONTAINS
           InertialForce(i) = SUM( InertialLoad(i,1:n)*Basis(1:n) )
        END DO
 
+       ! Density and damping are properties of the material and not of whether it
+       ! happens to be isotropic, and the mass and damping matrices below are
+       ! assembled outside that branch. Interpolated here, in the common part, for
+       ! that reason: assigned only inside the isotropic branch, as they were, they
+       ! were READ UNINITIALISED for every anisotropic material -- by the mass matrix
+       ! loop at the foot of this integration point, and by the inertial term of the
+       ! anisotropic branch's own force vector.
+       !
+       ! The symptom was an intermittent NaN, which is what an uninitialised read
+       ! looks like when the value is multiplied by something that is usually zero:
+       ! stack garbage that happens to carry a NaN pattern propagates, garbage that
+       ! does not is silently multiplied away. Valgrind put it at the gluing of the
+       ! local matrix; three runs of the same case NaNed twice.
+       Density = SUM( NodalDensity(1:n)*Basis(1:n) )
+       Damping = SUM( NodalDamping(1:n)*Basis(1:n) )
+
        IF (Isotropic) THEN
           !-------------------------------------------------
           ! Lame parameters at the integration point
           !------------------------------------------------
           Lame1 = SUM( NodalLame1(1:n)*Basis(1:n) )
           Lame2 = SUM( NodalLame2(1:n)*Basis(1:n) )
-          Density = SUM( NodalDensity(1:n)*Basis(1:n) )
-          Damping = SUM( NodalDamping(1:n)*Basis(1:n) )
 
           !------------------------------------------------------------------
           ! Deformation gradient etc. evaluated using the current solution:
@@ -2562,13 +2576,31 @@ CONTAINS
           !--------------------------------------------------------------------------
           ! Anisotropic material is handled in this branch. 
           !-------------------------------------------------------------------------
-          ! Axial symmetry remains refused, and the guard is load bearing rather
-          ! than unfinished: the axisymmetric branch above orders the components
-          ! (r, phi, z), with the hoop at index 2, while the postprocessor and
-          ! StressSolve order them (r, z, phi) with the hoop at index 3. An
-          ! isotropic law cannot see the difference; an anisotropic C is the
-          ! difference between C(2,2) and C(3,3). Reconciling the two conventions
-          ! comes before axisymmetric anisotropy, not with it.
+          ! Axial symmetry remains refused, and for TWO independent reasons, either
+          ! of which alone would be enough:
+          !
+          !   This branch has no axisymmetric kinematics at all. Grad below is the
+          !   plain displacement gradient, with no hoop term, where the isotropic
+          !   branch builds one specially and carries a matching Newton loop and
+          !   stiffness mapping. That machinery is missing here, not merely
+          !   differently written.
+          !
+          !   And the axis ordering differs. This routine orders the axisymmetric
+          !   components (r, phi, z) with the hoop at index 2, while a matrix valued
+          !   "Youngs Modulus" is written (r, z, phi) like everything else the user
+          !   sees, so the matrix would need permuting on the way in -- the Voigt
+          !   slot permutation [1,3,2,6,5,4], applied as C(P(i),P(j)), which is its
+          !   own inverse and needs no shear factors since it exchanges two direct
+          !   slots and two shear slots. That has to be an ADAPTER and not a
+          !   renumbering of this routine, because the ordering here is shared with
+          !   LocalMatrixWithUMAT and is part of what every UMAT is handed:
+          !   Stran = (Strain(1,1), Strain(2,2), Strain(3,3), 2 Strain(1,3)) reads
+          !   as (e_rr, e_hoop, e_zz, 2 e_rz) only under this ordering.
+          !
+          ! The two branches here differ only in how the stress follows from the
+          ! strain, so the way to get axial symmetry for anisotropy is to make them
+          ! one assembly over the constitutive interface rather than to grow a second
+          ! copy of the axisymmetric machinery.
           IF (AxialSymmetry) &
                CALL Fatal(Caller, 'Axially symmetric option is not supported for anisotropic materials')
 
@@ -2618,7 +2650,16 @@ CONTAINS
           !-------------------------------------------------------------
           ! The second Piola-Kirchhoff stress for the current iterate
           !--------------------------------------------------------------
-          CALL Strain2Stress(Stress2, Strain, G, dim, .FALSE.)         
+          ! Zeroed because Strain2Stress does not: with dim 2 it writes only the
+          ! four in-plane entries and leaves row and column 3 alone, so an
+          ! unzeroed target carries stack garbage into Stress1 through the matmul
+          ! below and then into the force vector, where dBasisdx(p,3) is zero in
+          ! the plane and multiplies it away -- unless the garbage is a NaN, which
+          ! is how this showed up as an intermittent NaN rather than a wrong
+          ! answer. With dim 3 all six slots are written and zeroing changes
+          ! nothing.
+          Stress2 = 0.0D0
+          CALL Strain2Stress(Stress2, Strain, G, dim, .FALSE.)
           !--------------------------------------------------
           ! The first Piola-Kirchhoff stress
           !--------------------------------------------------
@@ -2632,7 +2673,8 @@ CONTAINS
           dDefGU = Grad
           dStrainU = (MATMUL(TRANSPOSE(DefG),Grad) &
                + MATMUL(TRANSPOSE(Grad),DefG))/2.0D0
-          CALL Strain2Stress(dStress2U, dStrainU, G, dim, .FALSE.)    
+          dStress2U = 0.0D0
+          CALL Strain2Stress(dStress2U, dStrainU, G, dim, .FALSE.)
           !-------------------------------------------------------------
           ! dStress1U presents the derivative term DS(F_k)[grad u_k] with
           ! S the first  Piola-Kirchhoff stress
@@ -2659,7 +2701,8 @@ CONTAINS
                 !------------------------------------------------------------------
                 dStrainU = (MATMUL(TRANSPOSE(DefG),Grad) &
                      + MATMUL(TRANSPOSE(Grad),DefG))/2.0D0
-                CALL Strain2Stress(dStress2, dStrainU, TRANSPOSE(G), dim, .FALSE.)                  
+                dStress2 = 0.0D0
+                CALL Strain2Stress(dStress2, dStrainU, TRANSPOSE(G), dim, .FALSE.)
 
                 !-------------------------------------------------------------
                 ! Then dStress1 relates to having an equivalent expression for
