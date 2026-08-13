@@ -319,24 +319,29 @@ CONTAINS
 !> Anisotropic linear elasticity: sigma = C : eps, with C given in full as the
 !> pre-evaluated Props array.
 !>
-!> THREE DIMENSIONS ONLY, and that is not a shortcut taken here -- it is the whole
-!> of the anisotropic capability the calling solver has. ElasticSolve's LocalMatrix
-!> refuses anything else outright, with two guards:
+!> TWO PACKINGS, and which one applies is decided by Dim rather than chosen here.
+!> In three dimensions C is the full 6x6 in Elmer's Voigt order. In two it is the
+!> reduced three-component plane packing (11,22,12), and the caller is required to
+!> have condensed it -- CondensePlaneElasticityMatrix in StressLocal is what does
+!> that, moving the shear modulus C(4,4) into slot 3 and clearing the out-of-plane
+!> couplings, plus a static condensation of the out-of-plane row under plane stress.
 !>
-!>   "Material anisotropy implemented only for 3-d"
-!>   "Axially symmetric option is not supported for anisotropic materials"
+!> That requirement cannot be checked from here and getting it wrong is silent, so
+!> it is worth being explicit about the failure mode: handed a RAW 6x6 with Dim 2,
+!> this routine reads C(3,3) -- the 33 modulus -- as the shear modulus, and the
+!> 11-33 couplings as normal-to-shear ones. On the material in the anisotropic
+!> tests that is 1346 in place of 385, wrong by three and a half times, and wrong in
+!> the stiffness rather than only in the output.
 !>
-!> so a plane or axisymmetric anisotropic problem never reaches an assembly, let
-!> alone this routine. StressSolve does carry those cases, by condensing C into the
-!> reduced plane packing -- moving the shear modulus C(4,4) into slot 3, clearing
-!> the out-of-plane couplings, statically condensing the out-of-plane row under
-!> plane stress -- and recovering the out-of-plane component afterwards for output.
-!> None of that is done here, and it is deliberate that a dimension other than
-!> three is fatal rather than quietly contracting the raw matrix in the reduced
-!> packing: the raw top-left 3x3 of a 6x6 has C(3,3) where the shear modulus should
-!> be, so the quiet route is wrong by a factor of three and a half on this test's
-!> material rather than merely incomplete. Bringing those cases over is the work
-!> that lets StressSolve retire; until then the fatal is the honest boundary.
+!> Axial symmetry does not arrive here at all: ElasticSolve's LocalMatrix still
+!> refuses it for anisotropic materials, and that guard is load bearing rather than
+!> merely unfinished. Its axisymmetric assembly orders the components (r, phi, z),
+!> putting the hoop at index 2, while this file, ElasticSolve's own postprocessor
+!> and StressSolve all order them (r, z, phi) with the hoop at index 3. For an
+!> isotropic law the difference is invisible, since the trace and the identity do
+!> not care which axis is which; for an anisotropic C it is the difference between
+!> C(2,2) and C(3,3). Reconciling those two conventions is a prerequisite for
+!> axisymmetric anisotropy, not a detail of it.
 !------------------------------------------------------------------------------
   SUBROUTINE AnisotropicLinearStress( Point, Props, State, Response )
 !------------------------------------------------------------------------------
@@ -345,29 +350,46 @@ CONTAINS
     TYPE(MaterialState_t), INTENT(INOUT) :: State
     TYPE(MaterialResponse_t), INTENT(OUT) :: Response
 !------------------------------------------------------------------------------
-    !> Elmer's Voigt order as index pairs, the same tables Strain2Stress builds.
+    !> Elmer's Voigt order as index pairs, the same tables Strain2Stress builds --
+    !> the full six in three dimensions, the leading three in the reduced plane
+    !> packing, where slot 3 is the shear and there is no out-of-plane row.
     INTEGER, PARAMETER :: I1(6) = [ 1,2,3,1,2,1 ], I2(6) = [ 1,2,3,2,3,3 ]
+    INTEGER, PARAMETER :: I1P(3) = [ 1,2,1 ], I2P(3) = [ 1,2,2 ]
     REAL(KIND=dp) :: S(6), csum
-    INTEGER :: i, j, p, q
+    INTEGER :: i, j, p, q, n
 !------------------------------------------------------------------------------
-    IF ( Point % Dim /= 3 ) CALL Fatal( 'AnisotropicLinearStress', &
-        'Material anisotropy implemented only for 3-d' )
-
     ! The off-diagonal entries are engineering shear, doubled here because C is
     ! indexed for it. A factor of two lost on these is invisible in any isotropic
-    ! test, which is why it is written out rather than looped.
-    S(1) = Point % Strain(1,1)
-    S(2) = Point % Strain(2,2)
-    S(3) = Point % Strain(3,3)
-    S(4) = 2.0_dp * Point % Strain(1,2)
-    S(5) = 2.0_dp * Point % Strain(2,3)
-    S(6) = 2.0_dp * Point % Strain(1,3)
+    ! test, which is why they are written out rather than looped.
+    SELECT CASE ( Point % Dim )
+    CASE ( 2 )
+      n = 3
+      S(1) = Point % Strain(1,1)
+      S(2) = Point % Strain(2,2)
+      S(3) = 2.0_dp * Point % Strain(1,2)
+    CASE ( 3 )
+      n = 6
+      S(1) = Point % Strain(1,1)
+      S(2) = Point % Strain(2,2)
+      S(3) = Point % Strain(3,3)
+      S(4) = 2.0_dp * Point % Strain(1,2)
+      S(5) = 2.0_dp * Point % Strain(2,3)
+      S(6) = 2.0_dp * Point % Strain(1,3)
+    CASE DEFAULT
+      CALL Fatal( 'AnisotropicLinearStress', &
+          'Material anisotropy implemented for two and three dimensions only' )
+    END SELECT
 
-    DO i=1,6
-      p = I1(i)
-      q = I2(i)
+    DO i=1,n
+      IF ( n == 3 ) THEN
+        p = I1P(i)
+        q = I2P(i)
+      ELSE
+        p = I1(i)
+        q = I2(i)
+      END IF
       csum = 0.0_dp
-      DO j=1,6
+      DO j=1,n
         csum = csum + Props(ANISOLIN_C - 1 + 6*(j-1) + i) * S(j)
       END DO
       Response % Stress(p,q) = csum

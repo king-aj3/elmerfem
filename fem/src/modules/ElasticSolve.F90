@@ -2337,6 +2337,9 @@ CONTAINS
     REAL(KIND=dp) :: Force(3), InertialForce(3), NodalLame1(n),NodalLame2(n),Density, &
          Damping,Lame1,Lame2
     REAL(KIND=dp) :: Grad(3,3),Identity(3,3),DetDefG,G(6,6)
+    ! Required by the condensation, and unused here: the out-of-plane component it
+    ! describes does no virtual work, so it concerns the postprocessor alone.
+    REAL(KIND=dp) :: EzzC(3)
     REAL(KIND=dp) ::  DefG(3,3), Strain(3,3), Stress2(3,3), Stress1(3,3)
 
     REAL(KIND=dp) :: dDefG(3,3),dStrain(3,3),dStress2(3,3),dStress1(3,3)
@@ -2559,8 +2562,13 @@ CONTAINS
           !--------------------------------------------------------------------------
           ! Anisotropic material is handled in this branch. 
           !-------------------------------------------------------------------------
-          IF (dim /= 3 ) &
-               CALL Fatal( Caller,  'Material anisotropy implemented only for 3-d' )
+          ! Axial symmetry remains refused, and the guard is load bearing rather
+          ! than unfinished: the axisymmetric branch above orders the components
+          ! (r, phi, z), with the hoop at index 2, while the postprocessor and
+          ! StressSolve order them (r, z, phi) with the hoop at index 3. An
+          ! isotropic law cannot see the difference; an anisotropic C is the
+          ! difference between C(2,2) and C(3,3). Reconciling the two conventions
+          ! comes before axisymmetric anisotropy, not with it.
           IF (AxialSymmetry) &
                CALL Fatal(Caller, 'Axially symmetric option is not supported for anisotropic materials')
 
@@ -2574,6 +2582,13 @@ CONTAINS
           IF ( RotateModuli ) THEN
              CALL RotateElasticityMatrix( G, TransformMatrix, dim )
           END IF
+
+          ! Nothing below is specific to three dimensions -- DetDefG switches on
+          ! dim, Strain2Stress carries the reduced plane packing, and the Newton
+          ! loop runs to dim -- so what stopped a plane anisotropic problem was
+          ! never the formulation, only ever being handed an unreduced matrix.
+          IF ( dim == 2 ) &
+              CALL CondensePlaneElasticityMatrix( G, PlaneStress, EzzC )
 
           !-------------------------------------------------------------------------
           ! Compute the formulation variables for the current solution iterate
@@ -3638,6 +3653,9 @@ CONTAINS
     ! nothing.
     REAL(KIND=dp) :: Strain(3,3), Stress(3,3), Stress2(3,3), Grad(3,3), DefG(3,3), Identity(3,3), &
          u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r
+    ! The plane stress out-of-plane strain coefficients, filled by the condensation
+    ! and meaningful only under plane stress. See CondensePlaneElasticityMatrix.
+    REAL(KIND=dp) :: EzzC(3)
 
     LOGICAL :: FirstTime = .TRUE., Found, OptimizeBW, GlobalBubbles, Stat, &
          PlaneStress, &
@@ -3837,6 +3855,12 @@ CONTAINS
             END IF
           END IF
           NodalLame2(1:n) = ElasticModulus(1,1,1:n)  / ( 2* (1.0d0 + PoissonRatio(1:n)) )
+       ELSE IF ( dim == 2 ) THEN
+          ! An anisotropic material in the plane needs the assumption too, since it
+          ! decides which out-of-plane component the condensation leaves to be
+          ! recovered. Read only when dim is 2, so that a three dimensional
+          ! anisotropic run keeps the .FALSE. above and behaves exactly as before.
+          PlaneStress = GetLogical( Equation, 'Plane Stress', Found )
        END IF
 
 
@@ -3882,6 +3906,13 @@ CONTAINS
              IF ( RotateModuli ) THEN
                 CALL RotateElasticityMatrix( G, TransformMatrix, dim )
              END IF
+
+             ! In the plane the constitutive model wants the reduced three
+             ! component packing, not the raw 6x6 -- see the failure mode spelled
+             ! out in AnisotropicLinearStress. This is the single step that
+             ! separated a solver with anisotropy in the plane from one without.
+             IF ( dim == 2 ) &
+                 CALL CondensePlaneElasticityMatrix( G, PlaneStress, EzzC )
           END IF
 
           Grad = 0.0d0
@@ -3909,8 +3940,17 @@ CONTAINS
 
           Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
           IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
-          IF (Isotropic .AND. PlaneStress) &
-               Strain(3,3) = -nu/(1.0d0-nu)*(Strain(1,1)+Strain(2,2))
+          ! Under plane stress the out-of-plane strain is determined by the in-plane
+          ! ones and is not carried by the system, so it is recovered for output.
+          ! The anisotropic form needs the coefficients the condensation set aside,
+          ! and has a shear term the isotropic one does not.
+          IF ( PlaneStress ) THEN
+             IF ( Isotropic ) THEN
+                Strain(3,3) = -nu/(1.0d0-nu)*(Strain(1,1)+Strain(2,2))
+             ELSE
+                Strain(3,3) = PlaneStressStrainZZ( EzzC, Strain )
+             END IF
+          END IF
 
           ! Every law goes through the constitutive interface now, so the choice
           ! here is only what to put in front of it. In the isotropic cases the
@@ -3950,6 +3990,15 @@ CONTAINS
           CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
           Stress2 = MatResponse % Stress
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
+
+          ! The plane strain counterpart of the recovery above: here it is the
+          ! out-of-plane STRESS that the plane system determines without carrying.
+          ! After the push-forward, since the modified identity leaves DefG(3,3)
+          ! zero in the plane and the term would otherwise be annihilated. The
+          ! isotropic case is not handled here because its Lame parameters already
+          ! put the right value in Stress2(3,3).
+          IF ( dim == 2 .AND. .NOT. Isotropic .AND. .NOT. PlaneStress ) &
+              Stress(3,3) = Stress(3,3) + PlaneStrainStressZZ( G, Strain )
 
           CALL NodalProjectorMass( Mass, Basis, nd, Weight )
           IF (CalculateStrains) &
