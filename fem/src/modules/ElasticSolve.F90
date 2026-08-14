@@ -359,6 +359,11 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: ModelLumping
   TYPE(ModelLumping_t) :: Lump
 
+  ! Gates for the refusal of StressSolve-only keywords: true when one is set
+  ! somewhere in the model, so that the exact per-element test is paid for only
+  ! then. See where they are assigned.
+  LOGICAL :: StressOnlyKeywords, StressLoadInBC
+
   CHARACTER(*), PARAMETER :: Caller = 'ElasticSolver'
 
   
@@ -819,6 +824,56 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   END IF
 
   !-----------------------------------------------------------------------------
+  ! STRESSSOLVE KEYWORDS THIS SOLVER DOES NOT IMPLEMENT, refused rather than
+  ! ignored. The two solvers are being merged, so sifs will be pointed here that
+  ! were written for there, and a keyword that is read and dropped looks exactly
+  ! like a converged answer. This solver has already produced that failure twice
+  ! over: thermal expansion was parsed, interpolated, passed into the assembly and
+  ! never read, and "Model Lumping" was inert while its module sat there shared.
+  ! Both returned a plausible number. Neither said anything.
+  !
+  ! The list IS the remaining retirement backlog, which is why it is in one place.
+  !
+  ! Two kinds of check, and the split is about cost rather than taste. The solver's
+  ! own section is read once here, so those tests are free and exact. The material
+  ! and body force keywords cannot be resolved exactly without knowing which lists
+  ! this solver's bodies reach, and testing them per element would cost a string
+  ! comparison per element per keyword -- of the order of a tenth of the assembly,
+  ! which is the same budget the batched constitutive entry point was written to
+  ! recover. So a model-wide test gates them: nothing set anywhere costs one
+  ! logical per element, and only a sif that does set one pays for the precise
+  ! per-element test in the assembly loop, where it Fatals on the first element.
+  !-----------------------------------------------------------------------------
+  IF ( ListCheckPresent( SolverParams, 'Stability Analysis' ) ) CALL Fatal( Caller, &
+      '"Stability Analysis" is not implemented here: it needs the geometric '// &
+      'stiffness as a mass matrix, which this solver does not build' )
+
+  IF ( ListCheckPresent( SolverParams, 'Geometric Stiffness' ) ) CALL Fatal( Caller, &
+      '"Geometric Stiffness" is not implemented here as a keyword. This solver '// &
+      'carries the geometric term through "Large Deflection" instead, where it is '// &
+      'part of the tangent rather than an addition to a small strain analysis' )
+
+  IF ( ListCheckPresent( SolverParams, 'Maxwell material' ) ) CALL Fatal( Caller, &
+      '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
+      'per-integration-point history' )
+
+  ! Set anywhere in the model, in any material or body force? Then the assembly
+  ! loop will test the lists this element actually uses. See the note above.
+  StressOnlyKeywords = &
+      ListCheckPresentAnyMaterial( Model, 'Maxwell material' ) .OR. &
+      ListCheckPrefixAnyMaterial( Model, 'Pre Stress' ) .OR. &
+      ListCheckPrefixAnyMaterial( Model, 'Pre Strain' ) .OR. &
+      ListCheckPresentAnyMaterial( Model, 'Youngs Modulus at IP' ) .OR. &
+      ListCheckPresentAnyMaterial( Model, 'Poisson Ratio at IP' ) .OR. &
+      ListCheckPresentAnyMaterial( Model, 'Heat Expansion Coefficient IP' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Gravitational Prestress Advection' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce at IP' )
+
+  ! "Stress Load" is implemented as a body force here and not yet as a boundary
+  ! condition, which StressSolve also reads it as. Gated the same way.
+  StressLoadInBC = ListCheckPrefixAnyBC( Model, 'Stress Load' )
+
+  !-----------------------------------------------------------------------------
   ! "Local Matrix Storage" lets the assembly build one element's local matrix and
   ! reuse it for every element the core has marked identical to it -- by
   ! "Local Matrix Identical" for the whole set, or "... Identical Bodies" per
@@ -990,8 +1045,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         !------------------------------------------------------------------------------------
         Equation => GetEquation()
         Material => GetMaterial()
-       
-        IF ( .NOT. ASSOCIATED( Material, PrevMaterial ) ) THEN          
+
+        ! One logical when nothing anywhere in the model asks for a StressSolve-only
+        ! capability, which is the ordinary case; the exact test only when something
+        ! does, and then it stops on this element. See where the gate is set.
+        IF ( StressOnlyKeywords ) CALL RefuseStressSolveKeywords( Material )
+
+        IF ( .NOT. ASSOCIATED( Material, PrevMaterial ) ) THEN
           IF ( UseUMAT ) THEN
             UMATName = ListGetString(Material, 'UMAT Subroutine', UnfoundFatal=.TRUE.)
             UMATSubrtn = GetProcAddr( UMATName )
@@ -1323,6 +1383,15 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
              END IF
            END IF
              
+           ! "Stress Load" as a BOUNDARY condition, which StressSolve reads and this
+           ! solver implements only as a body force. Gated model-wide, so a sif
+           ! without it anywhere pays one logical per boundary element.
+           IF ( StressLoadInBC ) THEN
+             IF ( ListCheckPrefix( BC, 'Stress Load' ) ) CALL Fatal( Caller, &
+                 '"Stress Load" is implemented here as a body force and not yet as '// &
+                 'a boundary condition' )
+           END IF
+
            GotFSIBC = GetLogical( BC, 'FSI BC', GotIt )
 
            IF ( .NOT. ( GotForceBC .OR. GotFSIBC .OR. GotSpring ) ) CYCLE
@@ -1715,6 +1784,60 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 !------------------------------------------------------------------------------
 
 CONTAINS
+
+!------------------------------------------------------------------------------
+!> Stop on a StressSolve keyword this solver does not implement, for the material
+!> and body force of the element being assembled.
+!>
+!> Reached only when the model-wide gate says one of them is set somewhere, so the
+!> string comparisons here are not on the ordinary path; see where that gate is
+!> assigned. The lists tested are THIS element's, so a mixed sif -- some bodies
+!> through StressSolve, some through here, which is what a migration looks like --
+!> is not refused for what the other solver's bodies ask.
+!>
+!> Every entry is an item of the remaining unification backlog, and the message
+!> says what is missing rather than merely that something is.
+!------------------------------------------------------------------------------
+  SUBROUTINE RefuseStressSolveKeywords( Material )
+!------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: Material
+!------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: BF
+    LOGICAL :: Found
+!------------------------------------------------------------------------------
+    IF ( ASSOCIATED( Material ) ) THEN
+      IF ( ListCheckPresent( Material, 'Maxwell material' ) ) CALL Fatal( Caller, &
+          '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
+          'per-integration-point history, which this assembly does not carry' )
+
+      IF ( ListCheckPrefix( Material, 'Pre Stress' ) .OR. &
+           ListCheckPrefix( Material, 'Pre Strain' ) ) CALL Fatal( Caller, &
+          '"Pre Stress" / "Pre Strain" are not implemented here. They enter '// &
+          'StressSolve as a GEOMETRIC STIFFNESS and not as the additive stress '// &
+          'that "Stress Load" / "Strain Load" give, which this solver does have' )
+
+      IF ( ListCheckPresent( Material, 'Youngs Modulus at IP' ) .OR. &
+           ListCheckPresent( Material, 'Poisson Ratio at IP' ) .OR. &
+           ListCheckPresent( Material, 'Heat Expansion Coefficient IP' ) ) &
+          CALL Fatal( Caller, 'Material data given AT INTEGRATION POINTS is not '// &
+          'implemented here: this assembly interpolates nodal values, and the '// &
+          'constitutive interface takes the result as pre-evaluated Props' )
+    END IF
+
+    BF => GetBodyForce()
+    IF ( ASSOCIATED( BF ) ) THEN
+      IF ( ListCheckPresent( BF, 'Gravitational Prestress Advection' ) ) &
+          CALL Fatal( Caller, '"Gravitational Prestress Advection" is not '// &
+          'implemented here' )
+
+      IF ( ListCheckPresent( BF, 'Stress Bodyforce at IP' ) ) CALL Fatal( Caller, &
+          '"Stress Bodyforce at IP" is not implemented here: the body force is '// &
+          'interpolated from nodal values' )
+    END IF
+!------------------------------------------------------------------------------
+  END SUBROUTINE RefuseStressSolveKeywords
+!------------------------------------------------------------------------------
+
 
 !------------------------------------------------------------------------------
 !> Read a symmetric tensor given in Voigt form, nodewise, from a keyword list.
