@@ -456,15 +456,20 @@ CONTAINS
 !> tests that is 1346 in place of 385, wrong by three and a half times, and wrong in
 !> the stiffness rather than only in the output.
 !>
-!> Axial symmetry does not arrive here at all: ElasticSolve's LocalMatrix still
-!> refuses it for anisotropic materials, and that guard is load bearing rather than
-!> merely unfinished. Its axisymmetric assembly orders the components (r, phi, z),
-!> putting the hoop at index 2, while this file, ElasticSolve's own postprocessor
-!> and StressSolve all order them (r, z, phi) with the hoop at index 3. For an
-!> isotropic law the difference is invisible, since the trace and the identity do
-!> not care which axis is which; for an anisotropic C it is the difference between
-!> C(2,2) and C(3,3). Reconciling those two conventions is a prerequisite for
-!> axisymmetric anisotropy, not a detail of it.
+!> Axial symmetry DOES arrive here, and takes the three-dimensional packing: Dim is
+!> the dimension of the state of stress, which is three there, and the components
+!> are ordered (r, z, phi) with the hoop at index 3 -- so C is read in the Voigt
+!> order (rr, zz, hoop, rz, z-hoop, r-hoop) it was written in.
+!>
+!> That was not always true and the history is worth keeping, because the failure it
+!> describes is silent. ElasticSolve's assemblies used to order the axisymmetric
+!> components (r, phi, z), hoop at index 2, while this file, its own postprocessor,
+!> StressSolve and the UMAT interface all used (r, z, phi). An isotropic law cannot
+!> see the difference -- the trace and the identity are blind to which axis is which
+!> -- but for an anisotropic C it is exactly C(2,2) against C(3,3), so the case was
+!> refused outright rather than answered wrongly. Aligning the conventions was the
+!> whole of the fix; the permutation adapter that had been anticipated for the
+!> elasticity matrix turned out not to be needed at all.
 !------------------------------------------------------------------------------
   SUBROUTINE AnisotropicLinearStress( Point, Props, State, Response )
 !------------------------------------------------------------------------------
