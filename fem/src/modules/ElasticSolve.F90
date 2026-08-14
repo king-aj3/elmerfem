@@ -314,7 +314,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   INTEGER :: NPROPS, NSTATEV, MAXSTATEV
 
   REAL(KIND=dp), POINTER :: Temperature(:),Pressure(:),Displacement(:), UWrk(:,:), &
-       Work(:,:), ForceVector(:), Velocity(:,:), FlowSolution(:), SaveValues(:), &
+       Work(:,:,:) => NULL(), ForceVector(:), Velocity(:,:), FlowSolution(:), SaveValues(:), &
        NodalStrain(:), NodalStress(:), VonMises(:), &
        PrincipalStress(:), PrincipalStrain(:), Tresca(:), PrincipalAngle(:)
   REAL(KIND=dp), POINTER :: MaterialConstants(:,:)
@@ -324,6 +324,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   REAL(KIND=dp), ALLOCATABLE :: LocalMassMatrix(:,:),LocalStiffMatrix(:,:),&
        LocalDampMatrix(:,:),LoadVector(:,:),InertialLoad(:,:), Viscosity(:), LocalForce(:), &
+       NodalStressLoad(:,:), NodalStrainLoad(:,:), &
        LocalTemperature(:),ElasticModulus(:,:,:),PoissonRatio(:), Density(:), &
        Damping(:), HeatExpansionCoeff(:,:,:),Alpha(:,:),Beta(:), &
        ReferenceTemperature(:),BoundaryDispl(:),LocalDisplacement(:,:), PrevSOL(:), &
@@ -351,6 +352,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   
 !------------------------------------------------------------------------------
   SAVE LocalMassMatrix,LocalStiffMatrix,LocalDampMatrix,LoadVector,InertialLoad, Viscosity, &
+       NodalStressLoad, NodalStrainLoad, Work, &
        LocalForce,ElementNodes,ParentNodes,FlowNodes,Alpha,Beta, &
        LocalTemperature,AllocationsDone,ReferenceTemperature,BoundaryDispl, &
        ElasticModulus, PoissonRatio,Density,Damping,HeatExpansionCoeff, &
@@ -488,6 +490,21 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   IF (MixedFormulation .AND. (STDOFs /= (dim + 1))) CALL Fatal(Caller, &
       'With mixed formulation variable DOFs should equal to space dimensions + 1')
   
+  !----------------------------------------------------------------------------
+  ! The affine offset channel -- "Stress Load" and "Strain Load" -- is
+  ! implemented by LocalMatrix and by neither of the other two assembly
+  ! routines. Refused here rather than read and dropped: a keyword that is
+  ! parsed, interpolated and then silently ignored is the one failure mode this
+  ! solver has produced repeatedly, and it looks exactly like a converged answer.
+  !----------------------------------------------------------------------------
+  IF ( UseUMAT .OR. NeoHookeanMaterial ) THEN
+    IF ( ListCheckPrefixAnyBodyForce( Model, 'Stress Load' ) .OR. &
+         ListCheckPrefixAnyBodyForce( Model, 'Strain Load' ) ) THEN
+      CALL Fatal( Caller, '"Stress Load" and "Strain Load" are available for the '// &
+          'linear elastic material models only, not with UMAT or the neo-Hookean model' )
+    END IF
+  END IF
+
   AnyDamping = ListCheckPresentAnyMaterial( Model,"Damping" ) .OR. &
       ListCheckPrefixAnyMaterial( Model,"Rayleigh" )
   GotDamping = .FALSE.
@@ -514,6 +531,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
              LocalStiffMatrix,  &
              LocalDampMatrix,  &
              LoadVector, InertialLoad, Alpha, Beta, &
+             NodalStressLoad, NodalStrainLoad, &
              LocalDisplacement, &
              PrevLocalDisplacement, &
              SpringCoeff, &
@@ -533,6 +551,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
           LocalStiffMatrix( STDOFs*N,STDOFs*N ),  &
           LocalDampMatrix( STDOFs*N,STDOFs*N ),  &
           LoadVector( 4,N ), InertialLoad(3,N), Alpha( 3,N ), Beta( N ), &
+          NodalStressLoad( 6,N ), NodalStrainLoad( 6,N ), &
           LocalDisplacement( 4,N ), &
           PrevLocalDisplacement( 4,N ), &
           SpringCoeff( N,3,3 ), &
@@ -976,6 +995,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         
         LoadVector = 0.0D0
         InertialLoad = 0.0D0
+        NodalStressLoad = 0.0D0
+        NodalStrainLoad = 0.0D0
 
         IF ( ASSOCIATED(BodyForce) ) THEN
           IF( ListCheckPrefix(BodyForce,'Stress Bodyforce') ) THEN
@@ -995,8 +1016,27 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
           END IF
 
           IF( STDOFS > dim ) THEN
-            LoadVector(STDOFs,1:n) = GetReal( BodyForce, 'Stress Volume Source', GotIt )                        
+            LoadVector(STDOFs,1:n) = GetReal( BodyForce, 'Stress Volume Source', GotIt )
           END IF
+
+          !----------------------------------------------------------------------
+          ! An additive stress and an eigenstrain, both in Voigt form. Together
+          ! they make the response affine rather than merely linear:
+          !
+          !   sigma = C : ( eps - "Strain Load" ) + "Stress Load"
+          !
+          ! which is StressSolve's reading of the same two keywords, and what
+          ! LocalMatrix's offset channel implements below.
+          !
+          ! Zeroed before the test and not inside it: these arrays are SAVEd, so a
+          ! body force that sets neither keyword would otherwise inherit whatever
+          ! the previous element's body force did -- the trap LoadVector above is
+          ! zeroed against for the same reason.
+          !----------------------------------------------------------------------
+          IF ( ListCheckPrefix( BodyForce, 'Stress Load' ) ) &
+              CALL GetVoigtLoad( BodyForce, 'Stress Load', NodalStressLoad, n )
+          IF ( ListCheckPrefix( BodyForce, 'Strain Load' ) ) &
+              CALL GetVoigtLoad( BodyForce, 'Strain Load', NodalStrainLoad, n )
         END IF
                 
         !------------------------------------------------------------------------------
@@ -1089,7 +1129,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 LocalStiffMatrix,LocalForce, LoadVector, InertialLoad, ElasticModulus, &
                 PoissonRatio,Density,Damping,AxialSymmetry,PlaneStress,HeatExpansionCoeff, &
                 LocalTemperature,CurrentElement,n,ntot,ElementNodes,LocalDisplacement, &
-                Isotropic, RotateModuli, TransformMatrix, LargeDeflection)
+                Isotropic, RotateModuli, TransformMatrix, LargeDeflection, &
+                NodalStressLoad, NodalStrainLoad )
           END IF
         END IF
 
@@ -1559,7 +1600,52 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 CONTAINS
 
 !------------------------------------------------------------------------------
-! This subroutine uses the subroutine umat (Abaqus software convention for 
+!> Read a symmetric tensor given in Voigt form, nodewise, from a keyword list.
+!>
+!> Two spellings, because StressSolve accepts two and a sif written for it has to
+!> keep working: the whole tensor as one array valued keyword,
+!>
+!>   Stress Load(6) = Real 1.0e5 0.0 0.0 0.0 0.0 0.0
+!>
+!> or one component at a time, "Stress Load 1" and so on. The array form wins
+!> where both are given, which is the order StressSolve tries them in.
+!>
+!> ONE DELIBERATE DIFFERENCE from StressSolve: it accepts the componentwise form
+!> for "Stress Load" only, and silently ignores "Strain Load 1". Here both
+!> keywords take both spellings. That is a superset, so nothing written for
+!> StressSolve changes meaning; the reverse direction is worth knowing about
+!> before comparing the two solvers on a componentwise "Strain Load".
+!------------------------------------------------------------------------------
+  SUBROUTINE GetVoigtLoad( List, Name, Nodal, n )
+!------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: List
+    CHARACTER(LEN=*) :: Name
+    REAL(KIND=dp) :: Nodal(:,:)
+    INTEGER :: n
+!------------------------------------------------------------------------------
+    LOGICAL :: Found
+    INTEGER :: i, k
+!------------------------------------------------------------------------------
+    CALL GetRealArray( List, Work, Name, Found )
+    IF ( Found ) THEN
+      ! The first column of what may be given as a matrix, and at most the six
+      ! independent components -- a longer keyword is the user's error, not a
+      ! reason to write past the caller's array.
+      k = MIN( SIZE(Work,1), 6 )
+      Nodal(1:k,1:n) = Work(1:k,1,1:n)
+      RETURN
+    END IF
+
+    DO i=1,6
+      Nodal(i,1:n) = GetReal( List, TRIM(Name)//' '//I2S(i), Found )
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE GetVoigtLoad
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+! This subroutine uses the subroutine umat (Abaqus software convention for
 ! defining a user-supplied material model) to get the material model.
 ! This subroutine assumes that a stress response function for the Cauchy
 ! stress is supplied (originally Elmer has employed Piola-Kirchhoff stresses).
@@ -2307,13 +2393,14 @@ CONTAINS
        LoadVector, InertialLoad, ElasticModulus, NodalPoisson, NodalDensity, NodalDamping, &
        AxialSymmetry,PlaneStress,NodalHeatExpansion, NodalTemperature, Element, n, ntot, &
        Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
-       LargeDeflection )
+       LargeDeflection, NodalStressLoad, NodalStrainLoad )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
          NodalHeatExpansion(:,:,:), ElasticModulus(:,:,:)
     REAL(KIND=dp) :: NodalTemperature(:),NodalDensity(:), &
          NodalDamping(:),LoadVector(:,:), InertialLoad(:,:)
+    REAL(KIND=dp) :: NodalStressLoad(:,:), NodalStrainLoad(:,:)
     REAL(KIND=dp) :: LocalDisplacement(:,:), TransformMatrix(3,3)
     REAL(KIND=dp), DIMENSION(:) :: ForceVector, NodalPoisson
 
@@ -2335,6 +2422,11 @@ CONTAINS
     ! describes does no virtual work, so it concerns the postprocessor alone.
     REAL(KIND=dp) :: EzzC(3)
     REAL(KIND=dp) ::  DefG(3,3), Strain(3,3), Stress2(3,3), Stress1(3,3)
+
+    ! The affine part of the response: a stress at zero strain and an eigenstrain
+    ! the elastic law does not see. StressOffset is what the two collapse into.
+    REAL(KIND=dp) :: StressLoad(6), StrainLoad(6), StressOffset(3,3), EigenStrain(3,3)
+    LOGICAL :: GotOffset
 
     REAL(KIND=dp) :: dDefG(3,3),dStress1(3,3)
     REAL(KIND=dp) :: dDefGU(3,3),dStrainU(3,3),dStress2U(3,3),dStress1U(3,3)
@@ -2467,6 +2559,12 @@ CONTAINS
     MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
         KINEMATICS_SMALL_STRAIN, LargeDeflection )
 
+    ! Whether the affine channel is live at all, tested once per element rather
+    ! than per integration point. Nothing set means not merely a zero offset but
+    ! no offset arithmetic, so an ordinary run pays for one pair of ANYs.
+    GotOffset = ANY( NodalStressLoad(1:6,1:n) /= 0.0_dp ) .OR. &
+                ANY( NodalStrainLoad(1:6,1:n) /= 0.0_dp )
+
     !-------------------------------------------------------
     !    Integration stuff
     !-------------------------------------------------------
@@ -2572,6 +2670,61 @@ CONTAINS
               RESHAPE( TRANSPOSE(G), [ ANISOLIN_NPROPS ] )
        END IF
 
+       !------------------------------------------------------------------------
+       ! The affine part of the response, gathered into ONE stress offset:
+       !
+       !   sigma = C : ( eps - eps0 ) + sigma0
+       !         = C : eps + ( sigma0 - C : eps0 )
+       !
+       ! where eps0 is "Strain Load" and sigma0 is "Stress Load". Both are
+       ! properties of this point, not of any test function, so the parenthesis is
+       ! evaluated once per integration point.
+       !
+       ! THE EIGENSTRAIN GOES THROUGH THE MODEL. C : eps0 could be formed from the
+       ! elasticity matrix directly, and for the isotropic law that is two lines;
+       ! asking the model contracts it with the same code that contracts every
+       ! other strain here, so an anisotropic C, a condensed plane C and whatever
+       ! law comes next need no second path and no second convention.
+       !
+       ! WHY THIS NEEDS NO NEW ASSEMBLY ROUTINE. An affine law is not linear in
+       ! the strain, and this assembly's Gateaux shortcut requires linearity --
+       ! MatModel % StrainLinear is asserted above for exactly that reason. The
+       ! offset survives it because of WHERE it is added: to Stress2 alone, below,
+       ! while every tangent term applies the law to a strain INCREMENT and so
+       ! excludes the offset by construction. Adding it inside the model instead
+       ! would put it into the derivative too, and the stiffness would be wrong.
+       !------------------------------------------------------------------------
+       IF ( GotOffset ) THEN
+          DO i=1,6
+             StressLoad(i) = SUM( NodalStressLoad(i,1:n)*Basis(1:n) )
+             StrainLoad(i) = SUM( NodalStrainLoad(i,1:n)*Basis(1:n) )
+          END DO
+
+          ! Voigt to tensor in the packing this configuration uses: the full six
+          ! in 3D, the reduced (11,22,12) in the plane -- where slot three is the
+          ! shear and not the out-of-plane normal -- and (rr,zz,hoop,rz) under
+          ! axial symmetry. StressLocal's own converter, so the packing is agreed
+          ! in one place and CDim is what selects it, the same argument
+          ! StressSolve passes.
+          CALL Vector62Tensor( StressLoad, StressOffset, cdim, AxialSymmetry )
+          CALL Vector62Tensor( StrainLoad, EigenStrain, cdim, AxialSymmetry )
+
+          ! Halved off the diagonal. A Voigt STRAIN vector carries engineering
+          ! shear, twice the tensor component, and the models double it back when
+          ! they pack for C -- so the round trip is exact, two being a power of
+          ! two. It is also invisible: a factor of two lost here changes no
+          ! isotropic diagonal case and no test that does not shear.
+          DO i=1,3
+             DO j=1,3
+                IF ( i /= j ) EigenStrain(i,j) = EigenStrain(i,j) / 2.0_dp
+             END DO
+          END DO
+
+          MatPoint % Strain = EigenStrain
+          CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
+          StressOffset = StressOffset - MatResponse % Stress
+       END IF
+
        !------------------------------------------------------------------
        ! Deformation gradient etc. evaluated using the current solution:
        !------------------------------------------------------------------
@@ -2627,6 +2780,11 @@ CONTAINS
        MatPoint % Strain = Strain
        CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
        Stress2 = MatResponse % Stress
+
+       ! The affine offset, and the ONE place it may be added: the residual stress
+       ! and nothing that a derivative is taken of. See where it is formed above.
+       IF ( GotOffset ) Stress2 = Stress2 + StressOffset
+
        !--------------------------------------------------
        ! The first Piola-Kirchhoff stress
        !--------------------------------------------------
