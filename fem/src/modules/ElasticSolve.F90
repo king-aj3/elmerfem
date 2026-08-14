@@ -360,7 +360,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
        LocalForce,ElementNodes,ParentNodes,FlowNodes,Alpha,Beta, &
        LocalTemperature,AllocationsDone,ReferenceTemperature,BoundaryDispl, &
        ElasticModulus, PoissonRatio,Density,Damping,HeatExpansionCoeff, &
-       LocalDisplacement, Velocity, Pressure, PrevSOL, CalculateStrains, CalculateStresses, &
+       LocalDisplacement, Velocity, Pressure, CalculateStrains, CalculateStresses, &
        NodalStrain, NodalStress, VonMises, PrincipalStress, PrincipalStrain, &
        Tresca, PrincipalAngle, CalcPrincipalAngle, CalcPrincipal, &
        PrevLocalDisplacement, SpringCoeff, Indices
@@ -720,8 +720,22 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
      END IF
   END IF
 
+  ! Allocated on every entry and deallocated before every return, and therefore
+  ! deliberately NOT in the SAVE list above -- which it used to be, and that was a
+  ! crash rather than an inefficiency.
+  !
+  ! THIS SOLVER CAN BE ENTERED WHILE IT IS ALREADY RUNNING. A block system names
+  ! its assembly slaves with "Pre Solvers", DefaultStart activates them, and if a
+  ! slave is another elasticity solver then the second instance reaches this line
+  ! with the first instance's array still allocated: "Fortran runtime error:
+  ! Attempting to allocate already allocated variable 'prevsol'". Two solid bodies
+  ! coupled through a block system is exactly that arrangement, and it is what
+  ! fem/tests/ElasticBeamSolidCoupling now covers.
+  !
+  ! The neighbours here were already correct: DisplacementRot and LocalForceSaved
+  ! are in no SAVE list, so each invocation gets its own.
   ALLOCATE( PrevSOL(SIZE(Displacement)) )
-  IF (UseUMAT) THEN  
+  IF (UseUMAT) THEN
     ALLOCATE(DisplacementRot(SIZE(Displacement)))
     ALLOCATE(LocalForceSaved(SIZE(LocalForce)))
   END IF
