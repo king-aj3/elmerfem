@@ -2358,6 +2358,15 @@ CONTAINS
     REAL(KIND=dp), DIMENSION(:), POINTER :: U_Integ,V_Integ,W_Integ,S_Integ
 
     LOGICAL :: stat
+
+    TYPE(MaterialPoint_t) :: MatPoint
+    TYPE(MaterialResponse_t) :: MatResponse
+    TYPE(MaterialState_t) :: MatState
+    TYPE(MaterialModel_t) :: MatModel
+    !> Sized for the largest model this routine selects, and passed as
+    !> MatProps(1:nProps) so each model sees exactly its own layout.
+    REAL(KIND=dp) :: MatProps(ANISOLIN_NPROPS), MatPropsT(ANISOLIN_NPROPS)
+    INTEGER :: nProps
  !------------------------------------------------------------------------------
     cdim = CoordinateSystemDimension()
 
@@ -2388,14 +2397,77 @@ CONTAINS
     MassMatrix  = 0.0D0
     DampMatrix  = 0.0d0
 
+    ! THE KINEMATIC identity, dim-diagonal, and deliberately not the one the
+    ! constitutive models build for themselves. It does double duty here -- it is
+    ! also DefG when the deflection is small -- so it belongs to the deformation
+    ! and not to the stress.
+    !
+    ! The models' ReducedIdentity is CDim-diagonal plus the out-of-plane entry
+    ! away from plane stress. The two agree in three dimensions, under plane
+    ! stress and under axial symmetry, and differ in ONE case, 2D plane strain,
+    ! where this one is diag(1,1,0) and theirs diag(1,1,1). Neither is wrong:
+    ! the assembly wants only the components that do virtual work, since a plane
+    ! weak form cannot see sigma_33, while the postprocessor wants everything
+    ! reportable.
+    !
+    ! What the difference costs here is nothing, and that is checked rather than
+    ! hoped for. It makes Stress2(3,3) nonzero in plane strain where it used to
+    ! be zero, and that entry reaches the force vector and the stiffness only
+    ! through the third row and column of DefG and dDefG -- both identically zero
+    ! in the plane, this identity being what puts DefG(3,3) at zero. Bit-identity
+    ! across fourteen probes confirms it.
     Identity = 0.0D0
     DO i = 1,dim
        Identity(i,i) = 1.0D0
     END DO
 
+    !--------------------------------------------------------------------------
+    ! ONE assembly, both materials. The two branches this replaced differed only
+    ! in how the stress follows from the strain: Grad, DefG, DetDefG, the Gateaux
+    ! terms, the Newton loop and the stiffness assembly were the same code
+    ! written twice. That duplication had already cost two uninitialised reads, a
+    ! non-conforming MATMUL that flang and gfortran resolved differently, and the
+    ! whole axisymmetric anisotropic case -- the second copy simply never grew
+    ! the hoop kinematics. Selecting the model here removes the copy rather than
+    ! adding a third.
+    !--------------------------------------------------------------------------
+    IF (Isotropic) THEN
+       MatModel = IsotropicLinearModel()
+    ELSE
+       MatModel = AnisotropicLinearModel()
+    END IF
+    nProps = MatModel % nProps
+
+    ! The Gateaux shortcut below applies the law to a strain INCREMENT and takes
+    ! the result for a directional derivative. That is a licence the model
+    ! grants, not a property of the assembly, so it is asserted rather than
+    ! assumed: a law that is not linear in its strain measure belongs in
+    ! NeoHookeanLocalMatrix or LocalMatrixWithUMAT, which exist for that reason.
+    IF ( .NOT. MatModel % StrainLinear ) CALL Fatal( Caller, 'Material model "'// &
+        TRIM(MatModel % Name)//'" is not linear in the strain and needs its own assembly' )
+
+    ! Axial symmetry stays refused for anisotropic materials, and after the
+    ! unification the reason is no longer that the kinematics are missing --
+    ! this assembly has them. It is that the axis ORDERING here is (r, phi, z),
+    ! hoop at index 2, while a matrix valued "Youngs Modulus", this solver's own
+    ! postprocessor and StressSolve all use (r, z, phi), hoop at index 3. An
+    ! isotropic law cannot see the difference, since the trace and the identity
+    ! are permutation blind; for an anisotropic C it is exactly C(2,2) against
+    ! C(3,3). What remains is an adapter permuting the Voigt slots [1,3,2,6,5,4]
+    ! on the way in, which wants its own change and its own test.
+    IF ( AxialSymmetry .AND. .NOT. Isotropic ) CALL Fatal( Caller, &
+        'Axially symmetric option is not supported for anisotropic materials' )
+
+    MatPoint % Dim = dim
+    MatPoint % CDim = cdim
+    MatPoint % PlaneStress = PlaneStress
+    MatPoint % AxiSymmetric = AxialSymmetry
+    MatPoint % Kinematics = MERGE( KINEMATICS_LARGE_DEFLECTION, &
+        KINEMATICS_SMALL_STRAIN, LargeDeflection )
+
     !-------------------------------------------------------
     !    Integration stuff
-    !-------------------------------------------------------    
+    !-------------------------------------------------------
     IntegStuff = GaussPoints( element, RelOrder = RelIntegOrder )
 
     U_Integ => IntegStuff % u
@@ -2446,6 +2518,21 @@ CONTAINS
        Density = SUM( NodalDensity(1:n)*Basis(1:n) )
        Damping = SUM( NodalDamping(1:n)*Basis(1:n) )
 
+       !------------------------------------------------------------------------
+       ! The material data the model reads, pre-evaluated here. A model left to
+       ! look its own keywords up per integration point would spend a string
+       ! comparison per call, one to two orders of magnitude more than the entire
+       ! interface costs.
+       !
+       ! MatPropsT carries the ADJOINT of the same data, and it is not decoration.
+       ! The tangent term below contracts the test function gradient with the
+       ! adjoint of the elasticity tensor while the residual terms use the tensor
+       ! itself, and for a C that is not symmetric those are different matrices.
+       ! The anisotropic branch this replaces wrote it as TRANSPOSE(G) at its one
+       ! call site, which sat INSIDE the p,i loop; here the transpose is taken
+       ! once per integration point instead of 208 times per hex. A self-adjoint
+       ! law simply hands over the same numbers twice.
+       !------------------------------------------------------------------------
        IF (Isotropic) THEN
           !-------------------------------------------------
           ! Lame parameters at the integration point
@@ -2453,157 +2540,10 @@ CONTAINS
           Lame1 = SUM( NodalLame1(1:n)*Basis(1:n) )
           Lame2 = SUM( NodalLame2(1:n)*Basis(1:n) )
 
-          !------------------------------------------------------------------
-          ! Deformation gradient etc. evaluated using the current solution:
-          !------------------------------------------------------------------
-          Grad = 0.0d0
-          IF (AxialSymmetry) THEN
-             Grad(1,1) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,1) )
-             Grad(1,3) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) ) 
-             Grad(2,2) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
-             Grad(3,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
-             Grad(3,3) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
-          ELSE           
-             Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
-          END IF
-          ! Small strain keeps the reference and current configurations
-          ! coincident, which also makes DetDefG come out as one below.
-          IF (LargeDeflection) THEN
-             DefG = Identity + Grad
-          ELSE
-             DefG = Identity
-          END IF
-          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
-          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
-          Stress2 = 2.0D0*Lame2*Strain + Lame1*TRACE(Strain,dim)*Identity
-          Stress1 = MATMUL(DefG,Stress2)
-
-          SELECT CASE( dim )
-          CASE( 1 )
-             DetDefG = DefG(1,1)
-          CASE( 2 )
-             DetDefG = DefG(1,1)*DefG(2,2) - DefG(1,2)*DefG(2,1)
-          CASE( 3 )
-             DetDefG = DefG(1,1) * ( DefG(2,2)*DefG(3,3) - DefG(2,3)*DefG(3,2) ) + &
-                  DefG(1,2) * ( DefG(2,3)*DefG(3,1) - DefG(2,1)*DefG(3,3) ) + &
-                  DefG(1,3) * ( DefG(2,1)*DefG(3,2) - DefG(2,2)*DefG(3,1) )
-          END SELECT
-
-          !-----------------------------------------------------------------------
-          !  Gateaux derivatives of the solution with respect to the displacement:
-          !  ---------------------------------------------------------------------
-          dDefGU = Grad
-          dStrainU = (MATMUL(TRANSPOSE(DefG),dDefGU) &
-               + MATMUL(TRANSPOSE(dDefGU),DefG))/2.0D0
-          dStress2U = 2.0D0*Lame2*dStrainU + Lame1*TRACE(dStrainU,dim)*Identity
-          dStress1U = MATMUL(DefG,dStress2U)
-          IF (LargeDeflection) dStress1U = dStress1U + MATMUL(dDefGU,Stress2)
-
-          !----------------------------------------------------------------------------
-          ! Loop over the test functions (stiffness matrix for Newton linearization):
-          ! ---------------------------------------------------------------------------
-          DO p = 1,ntot
-             DO i = 1,cdim
-                !------------------------------------------------------------------------
-                !  Gateaux derivatives of the solution with respect to the test functions:
-                ! -----------------------------------------------------------------------
-                dDefG = 0.0D0
-                IF (AxialSymmetry) THEN
-                   SELECT CASE(i)
-                   CASE (1)
-                      dDefG(1,1) = dBasisdx(p,1)
-                      dDefG(1,3) = dBasisdx(p,2)
-                      dDefG(2,2) = 1.0d0/r * Basis(p)
-                   CASE (2)
-                      dDefG(3,1) = dBasisdx(p,1)
-                      dDefG(3,3) = dBasisdx(p,2)                   
-                   END SELECT
-                ELSE                 
-                   dDefG(i,:) = dBasisdx(p,:)
-                END IF
-
-                dStrain = (MATMUL(TRANSPOSE(DefG),dDefG) &
-                     + MATMUL(TRANSPOSE(dDefG),DefG))/2.0D0
-                dStress2 = 2.0D0*Lame2*dStrain + Lame1*TRACE(dStrain,dim)*Identity
-                dStress1 = MATMUL(DefG,dStress2)
-                IF (LargeDeflection) dStress1 = dStress1 + MATMUL(dDefG,Stress2)
-
-                IF (AxialSymmetry) THEN
-
-                   ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
-                        +(Basis(p)*Force(i)*DetDefG &
-                        +Basis(p)*InertialForce(i)*Density &
-                        -DDOTPROD(dDefG,Stress1,dim) &
-                        +DDOTPROD(dDefG,dStress1U,dim))*s
-
-                   DO q = 1,ntot
-                      DO j = 1,cdim
-                         SELECT CASE(j)
-                         CASE(1)
-                            StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                                 = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                                 + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,3) &
-                                 + 1.0d0/r*Basis(q)*dStress1(2,2))*s
-                         CASE(2)
-                            StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                                 = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                                 + (dBasisdx(q,1)*dStress1(3,1) + dBasisdx(q,2)*dStress1(3,3) ) * s
-                         END SELECT
-                      END DO
-                   END DO
-
-                ELSE
-
-                   ForceVector(dim*(p-1)+i) = ForceVector(dim*(p-1)+i) &
-                        +(Basis(p)*Force(i)*DetDefG &
-                        +Basis(p)*InertialForce(i)*Density &
-                        -DOT_PRODUCT(dBasisdx(p,:),Stress1(i,:)) &
-                        +DOT_PRODUCT(dBasisdx(p,:),dStress1U(i,:)))*s
-
-                   DO q = 1,ntot
-                      DO j = 1,dim
-                         StiffMatrix(dim*(p-1)+i,dim*(q-1)+j) &
-                              = StiffMatrix(dim*(p-1)+i,dim*(q-1)+j) &
-                              + DOT_PRODUCT(dBasisdx(q,:),dStress1(j,:))*s
-                      END DO
-                   END DO
-                END IF
-             END DO
-          END DO
-
+          MatProps(ISOLIN_LAME1) = Lame1
+          MatProps(ISOLIN_LAME2) = Lame2
+          MatPropsT(1:ISOLIN_NPROPS) = MatProps(1:ISOLIN_NPROPS)
        ELSE
-          ! print *, 'anisotropy active...'
-          !--------------------------------------------------------------------------
-          ! Anisotropic material is handled in this branch. 
-          !-------------------------------------------------------------------------
-          ! Axial symmetry remains refused, and for TWO independent reasons, either
-          ! of which alone would be enough:
-          !
-          !   This branch has no axisymmetric kinematics at all. Grad below is the
-          !   plain displacement gradient, with no hoop term, where the isotropic
-          !   branch builds one specially and carries a matching Newton loop and
-          !   stiffness mapping. That machinery is missing here, not merely
-          !   differently written.
-          !
-          !   And the axis ordering differs. This routine orders the axisymmetric
-          !   components (r, phi, z) with the hoop at index 2, while a matrix valued
-          !   "Youngs Modulus" is written (r, z, phi) like everything else the user
-          !   sees, so the matrix would need permuting on the way in -- the Voigt
-          !   slot permutation [1,3,2,6,5,4], applied as C(P(i),P(j)), which is its
-          !   own inverse and needs no shear factors since it exchanges two direct
-          !   slots and two shear slots. That has to be an ADAPTER and not a
-          !   renumbering of this routine, because the ordering here is shared with
-          !   LocalMatrixWithUMAT and is part of what every UMAT is handed:
-          !   Stran = (Strain(1,1), Strain(2,2), Strain(3,3), 2 Strain(1,3)) reads
-          !   as (e_rr, e_hoop, e_zz, 2 e_rz) only under this ordering.
-          !
-          ! The two branches here differ only in how the stress follows from the
-          ! strain, so the way to get axial symmetry for anisotropy is to make them
-          ! one assembly over the constitutive interface rather than to grow a second
-          ! copy of the axisymmetric machinery.
-          IF (AxialSymmetry) &
-               CALL Fatal(Caller, 'Axially symmetric option is not supported for anisotropic materials')
-
           G = 0.0d0
           DO i=1,SIZE(ElasticModulus,1)
              DO j=1,SIZE(ElasticModulus,2)
@@ -2615,112 +2555,141 @@ CONTAINS
              CALL RotateElasticityMatrix( G, TransformMatrix, dim )
           END IF
 
-          ! Nothing below is specific to three dimensions -- DetDefG switches on
-          ! dim, Strain2Stress carries the reduced plane packing, and the Newton
-          ! loop runs to dim -- so what stopped a plane anisotropic problem was
-          ! never the formulation, only ever being handed an unreduced matrix.
+          ! Reduced to the plane packing that a two-dimensional contraction
+          ! expects. Handed the raw 6x6, a plane assembly reads C(3,3) -- the 33
+          ! modulus -- as the shear modulus: 1346 in place of 385 on the test
+          ! material, and wrong in the stiffness rather than only in the output.
           IF ( dim == 2 ) &
               CALL CondensePlaneElasticityMatrix( G, PlaneStress, EzzC )
 
-          !-------------------------------------------------------------------------
-          ! Compute the formulation variables for the current solution iterate
-          !--------------------------------------------------------------------
-          ! Sliced to dim on both factors, as the isotropic branch above does.
-          ! LocalDisplacement is allocated with four rows for the mixed
-          ! formulation, so the unsliced product is dim-by-3 against a 3x3
-          ! target: a non-conforming assignment, and therefore undefined. The
-          ! compilers disagree about it in practice -- gfortran indexes the
-          ! temporary through its descriptor and lands on the right values,
-          ! flang copies the first nine elements linearly and scrambles the
-          ! columns -- which is why this passed here and failed the anisotropic
-          ! cases on flang.
-          Grad = 0.0d0
+          ! Flattened in Fortran's own column major order, so the model indexes
+          ! back with 6*(j-1)+i and no packing convention has to be agreed twice.
+          MatProps(ANISOLIN_C:ANISOLIN_C+ANISOLIN_NPROPS-1) = &
+              RESHAPE( G, [ ANISOLIN_NPROPS ] )
+          MatPropsT(ANISOLIN_C:ANISOLIN_C+ANISOLIN_NPROPS-1) = &
+              RESHAPE( TRANSPOSE(G), [ ANISOLIN_NPROPS ] )
+       END IF
+
+       !------------------------------------------------------------------
+       ! Deformation gradient etc. evaluated using the current solution:
+       !------------------------------------------------------------------
+       Grad = 0.0d0
+       IF (AxialSymmetry) THEN
+          Grad(1,1) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,1) )
+          Grad(1,3) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) )
+          Grad(2,2) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
+          Grad(3,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
+          Grad(3,3) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
+       ELSE
           Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
-          ! Small strain keeps the reference and current configurations
-          ! coincident, which also makes DetDefG come out as one below.
-          IF (LargeDeflection) THEN
-             DefG = Identity + Grad
-          ELSE
-             DefG = Identity
-          END IF
-          Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
-          IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
+       END IF
+       ! Small strain keeps the reference and current configurations
+       ! coincident, which also makes DetDefG come out as one below.
+       IF (LargeDeflection) THEN
+          DefG = Identity + Grad
+       ELSE
+          DefG = Identity
+       END IF
+       Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
+       IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
 
-          SELECT CASE( dim )
-          CASE( 1 )
-             DetDefG = DefG(1,1)
-          CASE( 2 )
-             DetDefG = DefG(1,1)*DefG(2,2) - DefG(1,2)*DefG(2,1)
-          CASE( 3 )
-             DetDefG = DefG(1,1) * ( DefG(2,2)*DefG(3,3) - DefG(2,3)*DefG(3,2) ) + &
-                  DefG(1,2) * ( DefG(2,3)*DefG(3,1) - DefG(2,1)*DefG(3,3) ) + &
-                  DefG(1,3) * ( DefG(2,1)*DefG(3,2) - DefG(2,2)*DefG(3,1) )
-          END SELECT
+       SELECT CASE( dim )
+       CASE( 1 )
+          DetDefG = DefG(1,1)
+       CASE( 2 )
+          DetDefG = DefG(1,1)*DefG(2,2) - DefG(1,2)*DefG(2,1)
+       CASE( 3 )
+          DetDefG = DefG(1,1) * ( DefG(2,2)*DefG(3,3) - DefG(2,3)*DefG(3,2) ) + &
+               DefG(1,2) * ( DefG(2,3)*DefG(3,1) - DefG(2,1)*DefG(3,3) ) + &
+               DefG(1,3) * ( DefG(2,1)*DefG(3,2) - DefG(2,2)*DefG(3,1) )
+       END SELECT
 
-          !-------------------------------------------------------------
-          ! The second Piola-Kirchhoff stress for the current iterate
-          !--------------------------------------------------------------
-          ! Zeroed because Strain2Stress does not: with dim 2 it writes only the
-          ! four in-plane entries and leaves row and column 3 alone, so an
-          ! unzeroed target carries stack garbage into Stress1 through the matmul
-          ! below and then into the force vector, where dBasisdx(p,3) is zero in
-          ! the plane and multiplies it away -- unless the garbage is a NaN, which
-          ! is how this showed up as an intermittent NaN rather than a wrong
-          ! answer. With dim 3 all six slots are written and zeroing changes
-          ! nothing.
-          Stress2 = 0.0D0
-          CALL Strain2Stress(Stress2, Strain, G, dim, .FALSE.)
-          !--------------------------------------------------
-          ! The first Piola-Kirchhoff stress
-          !--------------------------------------------------
-          Stress1 = MATMUL(DefG,Stress2)
+       !-------------------------------------------------------------
+       ! The second Piola-Kirchhoff stress for the current iterate
+       !--------------------------------------------------------------
+       ! Response % Stress is INTENT(OUT) with a default initialiser, so the
+       ! whole tensor is written on every call. That subsumes the zeroing this
+       ! branch used to need: Strain2Stress with dim 2 wrote only the four
+       ! in-plane entries and left row and column three carrying stack garbage,
+       ! which reached the force vector through a dBasisdx(p,3) that is zero in
+       ! the plane -- silent unless the garbage happened to be a NaN.
+       MatPoint % Strain = Strain
+       CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
+       Stress2 = MatResponse % Stress
+       !--------------------------------------------------
+       ! The first Piola-Kirchhoff stress
+       !--------------------------------------------------
+       Stress1 = MATMUL(DefG,Stress2)
 
-          !-----------------------------------------------------------------
-          ! dStress2U will be the derivative term Dg(F_k)[grad u_k] with
-          ! g the response function giving the second Piola-Kirchhoff stress
-          ! in terms of the deformation gradient F
-          !------------------------------------------------------------------
-          dDefGU = Grad
-          dStrainU = (MATMUL(TRANSPOSE(DefG),Grad) &
-               + MATMUL(TRANSPOSE(Grad),DefG))/2.0D0
-          dStress2U = 0.0D0
-          CALL Strain2Stress(dStress2U, dStrainU, G, dim, .FALSE.)
-          !-------------------------------------------------------------
-          ! dStress1U presents the derivative term DS(F_k)[grad u_k] with
-          ! S the first  Piola-Kirchhoff stress
-          !-------------------------------------------------------------
-          dStress1U = MATMUL(DefG,dStress2U)
-          IF (LargeDeflection) dStress1U = dStress1U + MATMUL(Grad,Stress2)
+       !-----------------------------------------------------------------------
+       !  Gateaux derivatives of the solution with respect to the displacement:
+       !  ---------------------------------------------------------------------
+       dDefGU = Grad
+       dStrainU = (MATMUL(TRANSPOSE(DefG),dDefGU) &
+            + MATMUL(TRANSPOSE(dDefGU),DefG))/2.0D0
+       MatPoint % Strain = dStrainU
+       CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
+       dStress2U = MatResponse % Stress
+       dStress1U = MATMUL(DefG,dStress2U)
+       IF (LargeDeflection) dStress1U = dStress1U + MATMUL(dDefGU,Stress2)
 
-          !---------------------------------------------------------
-          ! Newton iteration:
-          !------------------------------------------------
-          DO p = 1,ntot
-             DO i = 1,dim
-                !------------------------------------------------------------------------
-                ! Grad will now be the velocity gradient corresponding to the velocity
-                ! test function
-                ! -----------------------------------------------------------------------
-                Grad = 0.0d0
-                Grad(i,:) = dBasisdx(p,:)
+       !----------------------------------------------------------------------------
+       ! Loop over the test functions (stiffness matrix for Newton linearization):
+       ! ---------------------------------------------------------------------------
+       DO p = 1,ntot
+          DO i = 1,cdim
+             !------------------------------------------------------------------------
+             !  Gateaux derivatives of the solution with respect to the test functions:
+             ! -----------------------------------------------------------------------
+             dDefG = 0.0D0
+             IF (AxialSymmetry) THEN
+                SELECT CASE(i)
+                CASE (1)
+                   dDefG(1,1) = dBasisdx(p,1)
+                   dDefG(1,3) = dBasisdx(p,2)
+                   dDefG(2,2) = 1.0d0/r * Basis(p)
+                CASE (2)
+                   dDefG(3,1) = dBasisdx(p,1)
+                   dDefG(3,3) = dBasisdx(p,2)
+                END SELECT
+             ELSE
+                dDefG(i,:) = dBasisdx(p,:)
+             END IF
 
-                !---------------------------------------------------------------------
-                ! dStress2 will correspond to the term (G*)dStrainU, with G* the adjoint
-                ! of the elasticity tensor and the strain field dStrainU defined as 
-                ! follows: 
-                !------------------------------------------------------------------
-                dStrainU = (MATMUL(TRANSPOSE(DefG),Grad) &
-                     + MATMUL(TRANSPOSE(Grad),DefG))/2.0D0
-                dStress2 = 0.0D0
-                CALL Strain2Stress(dStress2, dStrainU, TRANSPOSE(G), dim, .FALSE.)
-
-                !-------------------------------------------------------------
-                ! Then dStress1 relates to having an equivalent expression for
-                ! the derivative DS(F_k)[grad u_{k+1}] with S the first  
-                ! Piola-Kirchhoff stress.
-                !-------------------------------------------------------------
+             dStrain = (MATMUL(TRANSPOSE(DefG),dDefG) &
+                  + MATMUL(TRANSPOSE(dDefG),DefG))/2.0D0
+             ! The adjoint of the tensor, not the tensor: see MatPropsT above.
+             MatPoint % Strain = dStrain
+             CALL MatModel % Stress( MatPoint, MatPropsT(1:nProps), MatState, MatResponse )
+             dStress2 = MatResponse % Stress
              dStress1 = MATMUL(DefG,dStress2)
-             IF (LargeDeflection) dStress1 = dStress1 + MATMUL(Grad,Stress2)
+             IF (LargeDeflection) dStress1 = dStress1 + MATMUL(dDefG,Stress2)
+
+             IF (AxialSymmetry) THEN
+
+                ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
+                     +(Basis(p)*Force(i)*DetDefG &
+                     +Basis(p)*InertialForce(i)*Density &
+                     -DDOTPROD(dDefG,Stress1,dim) &
+                     +DDOTPROD(dDefG,dStress1U,dim))*s
+
+                DO q = 1,ntot
+                   DO j = 1,cdim
+                      SELECT CASE(j)
+                      CASE(1)
+                         StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                              = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                              + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,3) &
+                              + 1.0d0/r*Basis(q)*dStress1(2,2))*s
+                      CASE(2)
+                         StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                              = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                              + (dBasisdx(q,1)*dStress1(3,1) + dBasisdx(q,2)*dStress1(3,3) ) * s
+                      END SELECT
+                   END DO
+                END DO
+
+             ELSE
 
                 ForceVector(dim*(p-1)+i) = ForceVector(dim*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
@@ -2735,9 +2704,9 @@ CONTAINS
                            + DOT_PRODUCT(dBasisdx(q,:),dStress1(j,:))*s
                    END DO
                 END DO
-             END DO
+             END IF
           END DO
-       END IF
+       END DO
 
 
        !      Integrate mass matrix:
