@@ -2625,7 +2625,17 @@ CONTAINS
           !-------------------------------------------------------------------------
           ! Compute the formulation variables for the current solution iterate
           !--------------------------------------------------------------------
-          Grad = MATMUL(LocalDisplacement(:,1:ntot),dBasisdx)
+          ! Sliced to dim on both factors, as the isotropic branch above does.
+          ! LocalDisplacement is allocated with four rows for the mixed
+          ! formulation, so the unsliced product is dim-by-3 against a 3x3
+          ! target: a non-conforming assignment, and therefore undefined. The
+          ! compilers disagree about it in practice -- gfortran indexes the
+          ! temporary through its descriptor and lands on the right values,
+          ! flang copies the first nine elements linearly and scrambles the
+          ! columns -- which is why this passed here and failed the anisotropic
+          ! cases on flang.
+          Grad = 0.0d0
+          Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
           ! Small strain keeps the reference and current configurations
           ! coincident, which also makes DetDefG come out as one below.
           IF (LargeDeflection) THEN
