@@ -187,6 +187,43 @@ MODULE Constitutive
       TYPE(MaterialState_t), INTENT(INOUT) :: State
       TYPE(MaterialResponse_t), INTENT(OUT) :: Response
     END SUBROUTINE ConstitutiveTangent_i
+
+    !> Many strains at ONE point, in one call. Optional, and purely a cost
+    !> measure: a model that omits it loses nothing but speed, because
+    !> ConstitutiveStresses below falls back to looping the single-strain entry.
+    !>
+    !> It exists because of what a Gateaux assembly actually asks for. Forming
+    !> the tangent by directional derivatives applies the law once per
+    !> (integration point, test function, component) -- 208 times per trilinear
+    !> hexahedron where a B^T C B form asks 8 times -- and all 208 share one
+    !> Point, one Props and one State. Only the strain differs. Measured on that
+    !> assembly, routing it through the single-strain entry point added 25% to
+    !> it, with the constitutive arithmetic eliminated as the cause: gutting the
+    !> isotropic law to a single assignment left the overhead unchanged. Batching
+    !> gives 21 of those 25 points back.
+    !>
+    !> POINT % STRAIN IS IGNORED HERE, and deliberately not quietly used as the
+    !> first entry: the strains are the array, all n of them, and a model that
+    !> reads Point % Strain in this entry point is reading a stale value from
+    !> whatever the driver last did.
+    !>
+    !> Stresses must be written IN FULL, every one of the nine components of
+    !> every slice. The single-strain entry gets its zeroing free, from
+    !> MaterialResponse_t being INTENT(OUT) with default initialisers; here there
+    !> is no such type, and a model that writes only the components its dimension
+    !> reaches leaves the rest carrying whatever the driver's stack held. That is
+    !> not hypothetical -- it is the exact defect (unzeroed out-of-plane row,
+    !> masked by a multiplication by zero, surfacing only as an intermittent NaN)
+    !> that this file's own history records.
+    SUBROUTINE ConstitutiveStressBatch_i( Point, Props, State, n, Strains, Stresses )
+      IMPORT :: dp, MaterialPoint_t, MaterialState_t
+      TYPE(MaterialPoint_t), INTENT(IN) :: Point
+      REAL(KIND=dp), INTENT(IN) :: Props(:)
+      TYPE(MaterialState_t), INTENT(INOUT) :: State
+      INTEGER, INTENT(IN) :: n
+      REAL(KIND=dp), INTENT(IN) :: Strains(3,3,n)
+      REAL(KIND=dp), INTENT(OUT) :: Stresses(3,3,n)
+    END SUBROUTINE ConstitutiveStressBatch_i
   END INTERFACE
 
 !------------------------------------------------------------------------------
@@ -196,6 +233,9 @@ MODULE Constitutive
   TYPE :: MaterialModel_t
     PROCEDURE(ConstitutiveStress_i), POINTER, NOPASS :: Stress => NULL()
     PROCEDURE(ConstitutiveTangent_i), POINTER, NOPASS :: Tangent => NULL()
+    !> The batched form of Stress, or null. A driver does not test this: it calls
+    !> ConstitutiveStresses, which dispatches. See ConstitutiveStressBatch_i.
+    PROCEDURE(ConstitutiveStressBatch_i), POINTER, NOPASS :: StressBatch => NULL()
     !> True when the response is linear in the strain measure, so that applying
     !> Stress to a strain INCREMENT gives the directional derivative of the
     !> stress. That is the licence for the cheap Gateaux path, and it is a
@@ -258,6 +298,48 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> Evaluate a model at n strains sharing one point, through its batched entry
+!> point where it has one and by looping the single-strain one where it has not.
+!>
+!> This is what a driver calls. It is a plain procedure and not a pointer on the
+!> model, so that the fallback is written once here rather than as an "if the
+!> model has a batch" at every call site -- a model gains the batch entry point
+!> without its callers changing, and loses it the same way.
+!------------------------------------------------------------------------------
+  SUBROUTINE ConstitutiveStresses( Model, Point, Props, State, n, Strains, Stresses )
+!------------------------------------------------------------------------------
+    TYPE(MaterialModel_t), INTENT(IN) :: Model
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp), INTENT(IN) :: Props(:)
+    TYPE(MaterialState_t), INTENT(INOUT) :: State
+    INTEGER, INTENT(IN) :: n
+    REAL(KIND=dp), INTENT(IN) :: Strains(3,3,n)
+    REAL(KIND=dp), INTENT(OUT) :: Stresses(3,3,n)
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t) :: P
+    TYPE(MaterialResponse_t) :: Response
+    INTEGER :: k
+!------------------------------------------------------------------------------
+    IF ( ASSOCIATED( Model % StressBatch ) ) THEN
+      CALL Model % StressBatch( Point, Props, State, n, Strains, Stresses )
+      RETURN
+    END IF
+
+    ! The fallback. The point is copied once rather than per strain, and it is
+    ! copied rather than aliased because Strain is the one field that varies and
+    ! the caller's Point is INTENT(IN).
+    P = Point
+    DO k=1,n
+      P % Strain = Strains(:,:,k)
+      CALL Model % Stress( P, Props, State, Response )
+      Stresses(:,:,k) = Response % Stress
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE ConstitutiveStresses
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Isotropic linear elasticity: sigma = 2 mu eps + lambda tr(eps) I.
 !>
 !> Read as Cauchy from an infinitesimal strain and as second Piola-Kirchhoff from
@@ -299,6 +381,46 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> The batched form of the above. Identity and the two constants are hoisted out
+!> of the loop; the arithmetic per strain is otherwise the same expression in the
+!> same association, which is what makes the two forms agree to the bit rather
+!> than merely to a tolerance.
+!>
+!> TwoMu is the one thing worth checking rather than assuming: the single-strain
+!> form evaluates 2 * mu * eps left to right, so hoisting 2 * mu is exact -- and
+!> exact for the ordinary reason that a factor of two is a power of two, not for
+!> any general licence to rearrange.
+!------------------------------------------------------------------------------
+  SUBROUTINE IsotropicLinearStressBatch( Point, Props, State, n, Strains, Stresses )
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp), INTENT(IN) :: Props(:)
+    TYPE(MaterialState_t), INTENT(INOUT) :: State
+    INTEGER, INTENT(IN) :: n
+    REAL(KIND=dp), INTENT(IN) :: Strains(3,3,n)
+    REAL(KIND=dp), INTENT(OUT) :: Stresses(3,3,n)
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: Identity(3,3), Lame1, TwoMu, tr
+    INTEGER :: i, k, d
+!------------------------------------------------------------------------------
+    Identity = ReducedIdentity( Point )
+    Lame1 = Props(ISOLIN_LAME1)
+    TwoMu = 2.0_dp * Props(ISOLIN_LAME2)
+    d = Point % Dim
+
+    DO k=1,n
+      tr = 0.0_dp
+      DO i=1,d
+        tr = tr + Strains(i,i,k)
+      END DO
+      Stresses(:,:,k) = TwoMu * Strains(:,:,k) + Lame1 * tr * Identity
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE IsotropicLinearStressBatch
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> The model record for the above, for a driver to select and interrogate.
 !------------------------------------------------------------------------------
   FUNCTION IsotropicLinearModel() RESULT( Model )
@@ -306,6 +428,7 @@ CONTAINS
     TYPE(MaterialModel_t) :: Model
 !------------------------------------------------------------------------------
     Model % Stress => IsotropicLinearStress
+    Model % StressBatch => IsotropicLinearStressBatch
     Model % StrainLinear = .TRUE.
     Model % nState = 0
     Model % nProps = ISOLIN_NPROPS
@@ -404,6 +527,82 @@ CONTAINS
 
 
 !------------------------------------------------------------------------------
+!> The batched form of the above. The packing decision, the index tables and the
+!> Fatal are hoisted out of the loop; the contraction itself is the same sum in
+!> the same order, so the two forms agree to the bit.
+!>
+!> THE ZEROING IS NOT INCIDENTAL. The single-strain form gets it free, from
+!> MaterialResponse_t being INTENT(OUT) with a default initialiser, and in two
+!> dimensions it needs it: the loop writes four of the nine components and the
+!> out-of-plane row and column are never touched. Here nothing zeroes them for
+!> us. Left out, this routine would hand the assembly the driver's stack, in the
+!> one entry a plane assembly multiplies by a dBasisdx that is zero -- silent
+!> until the garbage happens to carry a NaN pattern, which is precisely the
+!> defect valgrind found in this assembly once already.
+!------------------------------------------------------------------------------
+  SUBROUTINE AnisotropicLinearStressBatch( Point, Props, State, n, Strains, Stresses )
+!------------------------------------------------------------------------------
+    TYPE(MaterialPoint_t), INTENT(IN) :: Point
+    REAL(KIND=dp), INTENT(IN) :: Props(:)
+    TYPE(MaterialState_t), INTENT(INOUT) :: State
+    INTEGER, INTENT(IN) :: n
+    REAL(KIND=dp), INTENT(IN) :: Strains(3,3,n)
+    REAL(KIND=dp), INTENT(OUT) :: Stresses(3,3,n)
+!------------------------------------------------------------------------------
+    INTEGER, PARAMETER :: I1(6) = [ 1,2,3,1,2,1 ], I2(6) = [ 1,2,3,2,3,3 ]
+    INTEGER, PARAMETER :: I1P(3) = [ 1,2,1 ], I2P(3) = [ 1,2,2 ]
+    REAL(KIND=dp) :: S(6), csum
+    INTEGER :: i, j, k, p, q, m, P1(6), P2(6)
+!------------------------------------------------------------------------------
+    SELECT CASE ( Point % Dim )
+    CASE ( 2 )
+      m = 3
+      P1(1:3) = I1P
+      P2(1:3) = I2P
+    CASE ( 3 )
+      m = 6
+      P1 = I1
+      P2 = I2
+    CASE DEFAULT
+      CALL Fatal( 'AnisotropicLinearStressBatch', &
+          'Material anisotropy implemented for two and three dimensions only' )
+    END SELECT
+
+    Stresses = 0.0_dp
+
+    DO k=1,n
+      ! Engineering shear on the off-diagonals, doubled because C is indexed for
+      ! it. A factor of two lost here is invisible in any isotropic test.
+      IF ( m == 3 ) THEN
+        S(1) = Strains(1,1,k)
+        S(2) = Strains(2,2,k)
+        S(3) = 2.0_dp * Strains(1,2,k)
+      ELSE
+        S(1) = Strains(1,1,k)
+        S(2) = Strains(2,2,k)
+        S(3) = Strains(3,3,k)
+        S(4) = 2.0_dp * Strains(1,2,k)
+        S(5) = 2.0_dp * Strains(2,3,k)
+        S(6) = 2.0_dp * Strains(1,3,k)
+      END IF
+
+      DO i=1,m
+        p = P1(i)
+        q = P2(i)
+        csum = 0.0_dp
+        DO j=1,m
+          csum = csum + Props(ANISOLIN_C - 1 + 6*(j-1) + i) * S(j)
+        END DO
+        Stresses(p,q,k) = csum
+        Stresses(q,p,k) = csum
+      END DO
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE AnisotropicLinearStressBatch
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> The model record for the above.
 !------------------------------------------------------------------------------
   FUNCTION AnisotropicLinearModel() RESULT( Model )
@@ -411,6 +610,7 @@ CONTAINS
     TYPE(MaterialModel_t) :: Model
 !------------------------------------------------------------------------------
     Model % Stress => AnisotropicLinearStress
+    Model % StressBatch => AnisotropicLinearStressBatch
     Model % StrainLinear = .TRUE.
     Model % nState = 0
     Model % nProps = ANISOLIN_NPROPS

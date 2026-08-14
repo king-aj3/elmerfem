@@ -2342,8 +2342,15 @@ CONTAINS
     REAL(KIND=dp) :: EzzC(3)
     REAL(KIND=dp) ::  DefG(3,3), Strain(3,3), Stress2(3,3), Stress1(3,3)
 
-    REAL(KIND=dp) :: dDefG(3,3),dStrain(3,3),dStress2(3,3),dStress1(3,3)
+    REAL(KIND=dp) :: dDefG(3,3),dStress1(3,3)
     REAL(KIND=dp) :: dDefGU(3,3),dStrainU(3,3),dStress2U(3,3),dStress1U(3,3)
+
+    ! The test function directions, one per (test function, component), and the
+    ! constitutive response to all of them. Sized 3*ntot rather than cdim*ntot
+    ! because an automatic array is dimensioned on entry to the routine, before
+    ! cdim has been assigned; cdim is at most three, so the bound is safe and
+    ! only the tail goes unused.
+    REAL(KIND=dp) :: dDefGs(3,3,3*ntot), dStrains(3,3,3*ntot), dStresses(3,3,3*ntot)
 
     REAL(KIND=dp) :: Temperature, HeatExpansion(3,3)
 
@@ -2633,36 +2640,54 @@ CONTAINS
        dStress1U = MATMUL(DefG,dStress2U)
        IF (LargeDeflection) dStress1U = dStress1U + MATMUL(dDefGU,Stress2)
 
+       !------------------------------------------------------------------------
+       !  Gateaux derivatives of the solution with respect to the test functions,
+       !  for every (test function, component) at this integration point.
+       !
+       !  Kept apart from the assembly below so that the constitutive law is
+       !  applied to all of them in ONE call. Those cdim*ntot evaluations -- 24
+       !  per integration point on a trilinear hexahedron, 192 of the element's
+       !  208 -- share this point, these Props and this State; only the strain
+       !  differs, which is exactly the shape the batched entry point is for.
+       !  One call per point rather than cdim*ntot of them is worth 21 of the 25
+       !  percent the interface had cost this assembly, and what it saves is the
+       !  mechanism rather than the arithmetic: see ConstitutiveStressBatch_i.
+       !------------------------------------------------------------------------
+       DO p = 1,ntot
+          DO i = 1,cdim
+             k = cdim*(p-1)+i
+             dDefGs(:,:,k) = 0.0D0
+             IF (AxialSymmetry) THEN
+                SELECT CASE(i)
+                CASE (1)
+                   dDefGs(1,1,k) = dBasisdx(p,1)
+                   dDefGs(1,3,k) = dBasisdx(p,2)
+                   dDefGs(2,2,k) = 1.0d0/r * Basis(p)
+                CASE (2)
+                   dDefGs(3,1,k) = dBasisdx(p,1)
+                   dDefGs(3,3,k) = dBasisdx(p,2)
+                END SELECT
+             ELSE
+                dDefGs(i,:,k) = dBasisdx(p,:)
+             END IF
+
+             dStrains(:,:,k) = (MATMUL(TRANSPOSE(DefG),dDefGs(:,:,k)) &
+                  + MATMUL(TRANSPOSE(dDefGs(:,:,k)),DefG))/2.0D0
+          END DO
+       END DO
+
+       ! The adjoint of the tensor, not the tensor: see MatPropsT above.
+       CALL ConstitutiveStresses( MatModel, MatPoint, MatPropsT(1:nProps), &
+            MatState, cdim*ntot, dStrains, dStresses )
+
        !----------------------------------------------------------------------------
        ! Loop over the test functions (stiffness matrix for Newton linearization):
        ! ---------------------------------------------------------------------------
        DO p = 1,ntot
           DO i = 1,cdim
-             !------------------------------------------------------------------------
-             !  Gateaux derivatives of the solution with respect to the test functions:
-             ! -----------------------------------------------------------------------
-             dDefG = 0.0D0
-             IF (AxialSymmetry) THEN
-                SELECT CASE(i)
-                CASE (1)
-                   dDefG(1,1) = dBasisdx(p,1)
-                   dDefG(1,3) = dBasisdx(p,2)
-                   dDefG(2,2) = 1.0d0/r * Basis(p)
-                CASE (2)
-                   dDefG(3,1) = dBasisdx(p,1)
-                   dDefG(3,3) = dBasisdx(p,2)
-                END SELECT
-             ELSE
-                dDefG(i,:) = dBasisdx(p,:)
-             END IF
-
-             dStrain = (MATMUL(TRANSPOSE(DefG),dDefG) &
-                  + MATMUL(TRANSPOSE(dDefG),DefG))/2.0D0
-             ! The adjoint of the tensor, not the tensor: see MatPropsT above.
-             MatPoint % Strain = dStrain
-             CALL MatModel % Stress( MatPoint, MatPropsT(1:nProps), MatState, MatResponse )
-             dStress2 = MatResponse % Stress
-             dStress1 = MATMUL(DefG,dStress2)
+             k = cdim*(p-1)+i
+             dDefG = dDefGs(:,:,k)
+             dStress1 = MATMUL(DefG,dStresses(:,:,k))
              IF (LargeDeflection) dStress1 = dStress1 + MATMUL(dDefG,Stress2)
 
              IF (AxialSymmetry) THEN
