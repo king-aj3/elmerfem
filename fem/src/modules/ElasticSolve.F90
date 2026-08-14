@@ -288,6 +288,10 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: GotForceBC, GotFSIBC, GotSpring, GotIt, NewtonLinearization = .FALSE., &
       Isotropic = .TRUE., RotateModuli, LinearModel = .FALSE., MeshDisplacementActive, &
       NeoHookeanMaterial = .FALSE., AxialSymmetry
+  ! InputTensor reports whether the heat expansion coefficient was given as a
+  ! single scalar. Nothing here needs to know -- the coefficient is expanded onto
+  ! the diagonal either way -- but the argument is not optional.
+  LOGICAL :: IsotropicHeatExpansion
   LOGICAL :: UseUMAT, InitializeStateVars, HenckyStrain
   LOGICAL :: LargeDeflection
   LOGICAL :: MixedFormulation
@@ -502,6 +506,17 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
          ListCheckPrefixAnyBodyForce( Model, 'Strain Load' ) ) THEN
       CALL Fatal( Caller, '"Stress Load" and "Strain Load" are available for the '// &
           'linear elastic material models only, not with UMAT or the neo-Hookean model' )
+    END IF
+  END IF
+
+  ! Thermal expansion travels the same channel, so the same applies -- but to the
+  ! neo-Hookean model only. A UMAT owns its constitutive law entirely and is handed
+  ! the temperature to do with as it likes, so the keyword is its business there
+  ! rather than something this solver has dropped.
+  IF ( NeoHookeanMaterial ) THEN
+    IF ( ListCheckPresentAnyMaterial( Model, 'Heat Expansion Coefficient' ) ) THEN
+      CALL Fatal( Caller, '"Heat Expansion Coefficient" is available for the linear '// &
+          'elastic material models only, not with the neo-Hookean model' )
     END IF
   END IF
 
@@ -974,10 +989,16 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
            IF (Isotropic) PoissonRatio(1:n) = GetReal( Material, 'Poisson Ratio' )
         END IF
         
-        HeatExpansionCoeff = 0.0D0
-        DO i=1,3
-           HeatExpansionCoeff(i,i,1:n) = GetReal( Material,'Heat Expansion Coefficient', GotIt )
-        END DO
+        ! Scalar, one value per direction, or a full tensor -- InputTensor decides
+        ! from the shape of what the sif gave, and fills the diagonal in the first
+        ! two cases. StressSolve reads the keyword through this same routine, so the
+        ! spellings a thermal sif may use are the same on both solvers.
+        !
+        ! Only the DIAGONAL is used, here as in StressSolve: the thermal eigenstrain
+        ! is diag(alpha) * dT, so an off-diagonal expansion coefficient is read and
+        ! then ignored by both. That is pre-existing and deliberately left alone.
+        CALL InputTensor( HeatExpansionCoeff, IsotropicHeatExpansion, &
+            'Heat Expansion Coefficient', Material, n, NodeIndexes, GotIt )
         ReferenceTemperature(1:n) = GetReal( Material, 'Reference Temperature', GotIt )
         
         Density(1:n) = GetReal( Material, 'Density', GotIt )
@@ -2426,7 +2447,7 @@ CONTAINS
     ! The affine part of the response: a stress at zero strain and an eigenstrain
     ! the elastic law does not see. StressOffset is what the two collapse into.
     REAL(KIND=dp) :: StressLoad(6), StrainLoad(6), StressOffset(3,3), EigenStrain(3,3)
-    LOGICAL :: GotOffset
+    LOGICAL :: GotOffset, GotVoigtLoad, NeedHeat
 
     REAL(KIND=dp) :: dDefG(3,3),dStress1(3,3)
     REAL(KIND=dp) :: dDefGU(3,3),dStrainU(3,3),dStress2U(3,3),dStress1U(3,3)
@@ -2561,9 +2582,16 @@ CONTAINS
 
     ! Whether the affine channel is live at all, tested once per element rather
     ! than per integration point. Nothing set means not merely a zero offset but
-    ! no offset arithmetic, so an ordinary run pays for one pair of ANYs.
-    GotOffset = ANY( NodalStressLoad(1:6,1:n) /= 0.0_dp ) .OR. &
-                ANY( NodalStrainLoad(1:6,1:n) /= 0.0_dp )
+    ! no offset arithmetic, so an ordinary run pays for three ANYs.
+    !
+    ! NodalTemperature is the difference from the reference temperature, so an
+    ! isothermal body is all zeros here whatever its reference temperature was,
+    ! and a material with no expansion coefficient contributes nothing either.
+    GotVoigtLoad = ANY( NodalStressLoad(1:6,1:n) /= 0.0_dp ) .OR. &
+                   ANY( NodalStrainLoad(1:6,1:n) /= 0.0_dp )
+    NeedHeat = ANY( NodalTemperature(1:ntot) /= 0.0_dp ) .AND. &
+               ANY( NodalHeatExpansion(1:3,1:3,1:n) /= 0.0_dp )
+    GotOffset = GotVoigtLoad .OR. NeedHeat
 
     !-------------------------------------------------------
     !    Integration stuff
@@ -2618,6 +2646,17 @@ CONTAINS
        Density = SUM( NodalDensity(1:n)*Basis(1:n) )
        Damping = SUM( NodalDamping(1:n)*Basis(1:n) )
 
+       ! The thermal state at this point. NodalTemperature is already the
+       ! DIFFERENCE from the reference temperature, taken where it is gathered.
+       IF ( NeedHeat ) THEN
+          Temperature = SUM( NodalTemperature(1:ntot)*Basis(1:ntot) )
+          DO i=1,3
+             DO j=1,3
+                HeatExpansion(i,j) = SUM( NodalHeatExpansion(i,j,1:n)*Basis(1:n) )
+             END DO
+          END DO
+       END IF
+
        !------------------------------------------------------------------------
        ! The material data the model reads, pre-evaluated here. A model left to
        ! look its own keywords up per integration point would spend a string
@@ -2655,6 +2694,22 @@ CONTAINS
              CALL RotateElasticityMatrix( G, TransformMatrix, dim )
           END IF
 
+          ! Plane strain confines the out-of-plane thermal expansion, and for an
+          ! anisotropic material the stress that confinement produces has in-plane
+          ! normal components. Folded into the in-plane coefficients here, which is
+          ! where StressSolve folds it too -- and it has to happen BEFORE the
+          ! condensation below, since it reads the out-of-plane couplings the
+          ! condensation clears. Under plane stress the out-of-plane direction is
+          ! free and there is nothing to fold; for an isotropic material neither
+          ! solver folds anything, which is its own small inconsistency and left as
+          ! it stands.
+          IF ( NeedHeat .AND. dim == 2 .AND. .NOT. PlaneStress ) THEN
+             HeatExpansion(1,1) = HeatExpansion(1,1) + HeatExpansion(3,3) * &
+                 ( G(2,2)*G(1,3)-G(1,2)*G(2,3) ) / ( G(1,1)*G(2,2) - G(1,2)*G(2,1) )
+             HeatExpansion(2,2) = HeatExpansion(2,2) + HeatExpansion(3,3) * &
+                 ( G(1,1)*G(2,3)-G(1,2)*G(1,3) ) / ( G(1,1)*G(2,2) - G(1,2)*G(2,1) )
+          END IF
+
           ! Reduced to the plane packing that a two-dimensional contraction
           ! expects. Handed the raw 6x6, a plane assembly reads C(3,3) -- the 33
           ! modulus -- as the shear modulus: 1346 in place of 385 on the test
@@ -2680,6 +2735,16 @@ CONTAINS
        ! properties of this point, not of any test function, so the parenthesis is
        ! evaluated once per integration point.
        !
+       ! THERMAL EXPANSION IS THE SAME CHANNEL, and it is here rather than in a
+       ! term of its own for that reason: alpha * dT is an eigenstrain, so it adds
+       ! to eps0 and the arithmetic below carries it. StressSolve keeps them apart
+       ! -- its thermal term contracts G*C with the expansion coefficient in the
+       ! force vector, its "Strain Load" multiplies C by hand first -- but they are
+       ! one capability, and one of them was already implemented here as nothing at
+       ! all: this routine took NodalHeatExpansion and NodalTemperature as
+       ! arguments and read neither. Thermal strain was silently dropped, and no
+       ! test in the tree ran ElasticSolve with a heat expansion coefficient.
+       !
        ! THE EIGENSTRAIN GOES THROUGH THE MODEL. C : eps0 could be formed from the
        ! elasticity matrix directly, and for the isotropic law that is two lines;
        ! asking the model contracts it with the same code that contracts every
@@ -2695,10 +2760,14 @@ CONTAINS
        ! would put it into the derivative too, and the stiffness would be wrong.
        !------------------------------------------------------------------------
        IF ( GotOffset ) THEN
-          DO i=1,6
-             StressLoad(i) = SUM( NodalStressLoad(i,1:n)*Basis(1:n) )
-             StrainLoad(i) = SUM( NodalStrainLoad(i,1:n)*Basis(1:n) )
-          END DO
+          StressLoad = 0.0_dp
+          StrainLoad = 0.0_dp
+          IF ( GotVoigtLoad ) THEN
+             DO i=1,6
+                StressLoad(i) = SUM( NodalStressLoad(i,1:n)*Basis(1:n) )
+                StrainLoad(i) = SUM( NodalStrainLoad(i,1:n)*Basis(1:n) )
+             END DO
+          END IF
 
           ! Voigt to tensor in the packing this configuration uses: the full six
           ! in 3D, the reduced (11,22,12) in the plane -- where slot three is the
@@ -2719,6 +2788,20 @@ CONTAINS
                 IF ( i /= j ) EigenStrain(i,j) = EigenStrain(i,j) / 2.0_dp
              END DO
           END DO
+
+          ! The thermal eigenstrain, alpha * dT, diagonal and unsheared -- so the
+          ! halving above does not concern it and it is added after. Over Dim and
+          ! not over three: Dim is already the dimension of the state of STRESS, so
+          ! it is three under axial symmetry, where the hoop expands and carries
+          ! stress, and two in the plane, where the out-of-plane expansion is not
+          ! part of the plane system. The confined plane strain case is the
+          ! exception and it has been dealt with above, by folding the out-of-plane
+          ! coefficient into the in-plane ones.
+          IF ( NeedHeat ) THEN
+             DO i=1,dim
+                EigenStrain(i,i) = EigenStrain(i,i) + HeatExpansion(i,i) * Temperature
+             END DO
+          END IF
 
           MatPoint % Strain = EigenStrain
           CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
@@ -3868,6 +3951,10 @@ CONTAINS
     ! nothing.
     REAL(KIND=dp) :: Strain(3,3), Stress(3,3), Stress2(3,3), Grad(3,3), DefG(3,3), Identity(3,3), &
          u, v, w, Weight, detJ, res, Lame1, Lame2, nu, DetDefG, G(6,6), r
+    ! The temperature difference at the integration point. Not called Temperature:
+    ! that name belongs to the host's temperature FIELD, which this routine reads.
+    REAL(KIND=dp) :: TempAtIp
+    LOGICAL :: NeedHeat
     ! The plane stress out-of-plane strain coefficients, filled by the condensation
     ! and meaningful only under plane stress. See CondensePlaneElasticityMatrix.
     REAL(KIND=dp) :: EzzC(3)
@@ -4079,13 +4166,36 @@ CONTAINS
        END IF
 
 
+       ! The thermal state of this element, gathered exactly as the assembly loop
+       ! gathers it: the temperature DIFFERENCE from the material's reference
+       ! temperature, and the expansion coefficient in whatever shape the sif gave.
+       ! What is reported below is then the ELASTIC strain, the thermal part taken
+       ! out, and the stress that follows from it -- which is what StressSolve
+       ! reports and the only reading consistent with the stress.
+       NeedHeat = .FALSE.
+       IF ( ASSOCIATED( TempSol ) .AND. .NOT. NeoHookeanMaterial ) THEN
+          CALL InputTensor( HeatExpansionCoeff, IsotropicHeatExpansion, &
+               'Heat Expansion Coefficient', Material, n, Indices, Found )
+          IF ( Found ) THEN
+             ReferenceTemperature(1:n) = ListGetReal( Material, 'Reference Temperature', &
+                  n, Indices, Found )
+             IF ( .NOT. Found ) ReferenceTemperature(1:n) = 0.0_dp
+             LocalTemperature(1:n) = 0.0_dp
+             WHERE( TempPerm( Element % NodeIndexes(1:n) ) > 0 )
+                LocalTemperature(1:n) = Temperature(TempPerm(Element % NodeIndexes(1:n))) - &
+                     ReferenceTemperature(1:n)
+             END WHERE
+             NeedHeat = ANY( LocalTemperature(1:n) /= 0.0_dp )
+          END IF
+       END IF
+
        Identity = 0.0D0
        DO i = 1,cdim
           Identity(i,i) = 1.0D0
        END DO
        IF (AxialSymmetry .OR. (Isotropic .AND. (.NOT. PlaneStress))) Identity(3,3) = 1.0D0
 
-       IntegStuff = GaussPoints( Element )      
+       IntegStuff = GaussPoints( Element )
        Strain = 0.0d0
        Stress = 0.0d0
        Mass = 0.0d0
@@ -4155,6 +4265,20 @@ CONTAINS
 
           Strain = (TRANSPOSE(Grad)+Grad)/2.0D0
           IF (LargeDeflection) Strain = Strain + MATMUL(TRANSPOSE(Grad),Grad)/2.0D0
+
+          ! The thermal part taken out, leaving the elastic strain -- and taken out
+          ! HERE, before the out-of-plane recovery below, because the recovery is a
+          ! statement about the elastic strain and StressSolve orders the two the
+          ! same way. Over Dim, so the hoop is included under axial symmetry and the
+          ! out-of-plane direction is not in the plane.
+          IF ( NeedHeat ) THEN
+             TempAtIp = SUM( LocalTemperature(1:n)*Basis(1:n) )
+             DO i=1,dim
+                Strain(i,i) = Strain(i,i) - &
+                     SUM( HeatExpansionCoeff(i,i,1:n)*Basis(1:n) ) * TempAtIp
+             END DO
+          END IF
+
           ! Under plane stress the out-of-plane strain is determined by the in-plane
           ! ones and is not carried by the system, so it is recovered for output.
           ! The anisotropic form needs the coefficients the condensation set aside,
