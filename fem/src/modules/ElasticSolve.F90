@@ -1795,17 +1795,15 @@ CONTAINS
       Grad = 0.0d0
       Grad0 = 0.0d0
       IF (AxialSymmetry) THEN
-        Grad(1,1) = SUM( NodalDisplacement(1,1:nd) * dBasis(1:nd,1) )
-        Grad(1,3) = SUM( NodalDisplacement(1,1:nd) * dBasis(1:nd,2) ) 
-        Grad(2,2) = 1.0d0/r * SUM( NodalDisplacement(1,1:nd) * Basis(1:nd) )
-        Grad(3,1) = SUM( NodalDisplacement(2,1:nd) * dBasis(1:nd,1) )
-        Grad(3,3) = SUM( NodalDisplacement(2,1:nd) * dBasis(1:nd,2) )
+        ! Ordered (r, z, phi), hoop at 3, which is the UMAT interface's own
+        ! (rr, zz, theta-theta, rz) and Elmer's convention everywhere outside
+        ! this solver's assemblies. So the in-plane block is the same cdim
+        ! product as the Cartesian branch below, with only the hoop appended.
+        Grad(1:cdim,1:cdim) = MATMUL(NodalDisplacement(1:cdim,1:nd),dBasis(1:nd,1:cdim))
+        Grad(3,3) = 1.0d0/r * SUM( NodalDisplacement(1,1:nd) * Basis(1:nd) )
 
-        Grad0(1,1) = SUM( PrevNodalDisplacement(1,1:nd) * dBasis(1:nd,1) )
-        Grad0(1,3) = SUM( PrevNodalDisplacement(1,1:nd) * dBasis(1:nd,2) ) 
-        Grad0(2,2) = 1.0d0/r * SUM( PrevNodalDisplacement(1,1:nd) * Basis(1:nd) )
-        Grad0(3,1) = SUM( PrevNodalDisplacement(2,1:nd) * dBasis(1:nd,1) )
-        Grad0(3,3) = SUM( PrevNodalDisplacement(2,1:nd) * dBasis(1:nd,2) )          
+        Grad0(1:cdim,1:cdim) = MATMUL(PrevNodalDisplacement(1:cdim,1:nd),dBasis(1:nd,1:cdim))
+        Grad0(3,3) = 1.0d0/r * SUM( PrevNodalDisplacement(1,1:nd) * Basis(1:nd) )
       ELSE
         ! Note that in the plane stress case we don't have means to create the fully
         ! consistent displacement gradient in the third direction:
@@ -1917,28 +1915,25 @@ CONTAINS
       END IF SELECT_STRAIN_MEASURE
 
       ! The umat (engineering) strain variable giving the strain before the increment:
+      ! With the axisymmetric ordering (r, z, phi) these slots are UMAT's own
+      ! (11, 22, 33, 12) in both coordinate systems -- rr, zz, hoop, rz under
+      ! axial symmetry and xx, yy, zz, xy in the plane -- so there is no
+      ! axisymmetric special case left to write. Slots 5 and 6 are set beyond
+      ! ntens = 4 there and simply not passed.
       Stran(1) = Strain0(1,1)
       Stran(2) = Strain0(2,2)
       Stran(3) = Strain0(3,3)
-      IF (AxialSymmetry) THEN
-        Stran(4) = 2.0d0 * Strain0(1,3)
-      ELSE
-        Stran(4) = 2.0d0 * Strain0(1,2)
-        Stran(5) = 2.0d0 * Strain0(1,3)
-        Stran(6) = 2.0d0 * Strain0(2,3)
-      END IF
+      Stran(4) = 2.0d0 * Strain0(1,2)
+      Stran(5) = 2.0d0 * Strain0(1,3)
+      Stran(6) = 2.0d0 * Strain0(2,3)
 
       ! The umat variable giving the candidate for the strain increment:
       dStran(1) = Strain(1,1) - Strain0(1,1)
       dStran(2) = Strain(2,2) - Strain0(2,2)
       dStran(3) = Strain(3,3) - Strain0(3,3)
-      IF (AxialSymmetry) THEN
-        dStran(4) = 2.0d0 * (Strain(1,3) - Strain0(1,3))
-      ELSE
-        dStran(4) = 2.0d0 * (Strain(1,2) - Strain0(1,2))
-        dStran(5) = 2.0d0 * (Strain(1,3) - Strain0(1,3))
-        dStran(6) = 2.0d0 * (Strain(2,3) - Strain0(2,3))
-      END IF
+      dStran(4) = 2.0d0 * (Strain(1,2) - Strain0(1,2))
+      dStran(5) = 2.0d0 * (Strain(1,3) - Strain0(1,3))
+      dStran(6) = 2.0d0 * (Strain(2,3) - Strain0(2,3))
 
       ! -----------------------------------------------------------------------------
       ! Get the state variables and 
@@ -2011,10 +2006,14 @@ CONTAINS
         ! Create the strain-displacement matrix B:
         ! ----------------------------------------
         IF (AxialSymmetry) THEN
+          ! Rows in UMAT's (rr, zz, theta-theta, rz) order. The hoop is row 3,
+          ! not row 2: it used to sit in row 2 with zz in row 3, self-consistently
+          ! with the old (r, phi, z) tensor ordering but swapped against the
+          ! convention the user's own umat subroutine is written to.
           DO p=1,ntot
             B(1,(p-1)*dofs+1) = dBasis(p,1)
-            B(2,(p-1)*dofs+1) = 1.0d0/r * Basis(p)
-            B(3,(p-1)*dofs+2) = dBasis(p,2)
+            B(2,(p-1)*dofs+2) = dBasis(p,2)
+            B(3,(p-1)*dofs+1) = 1.0d0/r * Basis(p)
             B(4,(p-1)*dofs+1) = dBasis(p,2)
             B(4,(p-1)*dofs+2) = dBasis(p,1)
           END DO
@@ -2069,11 +2068,12 @@ CONTAINS
             StressVec(3)*SymBasis3
         SELECT CASE(nshr)
         CASE(1)
-          IF (AxialSymmetry) THEN
-            Stress = Stress + 2.0d0*StressVec(4)*SymBasis5
-          ELSE
-            Stress = Stress + 2.0d0*StressVec(4)*SymBasis4
-          END IF
+          ! SymBasis4 is the symmetric (1,2) basis, and slot 4 is the in-plane
+          ! shear in both coordinate systems now that axial symmetry orders the
+          ! components (r, z, phi): rz there, xy in the plane. The axisymmetric
+          ! branch that mapped slot 4 onto SymBasis5, the (1,3) basis, went with
+          ! the old ordering and is gone with it.
+          Stress = Stress + 2.0d0*StressVec(4)*SymBasis4
         CASE(3)
           Stress = Stress + 2.0d0*StressVec(4)*SymBasis4 + &
               2.0d0*StressVec(5)*SymBasis5 + 2.0d0*StressVec(6)*SymBasis6
@@ -2095,11 +2095,11 @@ CONTAINS
               SELECT CASE(i)
               CASE (1)
                 Grad(1,1) = dBasis(p,1)
-                Grad(1,3) = dBasis(p,2)
-                Grad(2,2) = 1.0d0/r * Basis(p)
+                Grad(1,2) = dBasis(p,2)
+                Grad(3,3) = 1.0d0/r * Basis(p)
               CASE (2)
-                Grad(3,1) = dBasis(p,1)
-                Grad(3,3) = dBasis(p,2)                   
+                Grad(2,1) = dBasis(p,1)
+                Grad(2,2) = dBasis(p,2)
               END SELECT
             ELSE
               Grad(i,:) = dBasis(p,:)
@@ -2124,11 +2124,9 @@ CONTAINS
             WorkVec1(3,1) = WorkTensor1(3,3)
             SELECT CASE(nshr)
             CASE(1)
-              IF (AxialSymmetry) THEN
-                WorkVec1(4,1) = WorkTensor1(1,3) +  WorkTensor1(3,1)
-              ELSE
-                WorkVec1(4,1) = WorkTensor1(1,2) +  WorkTensor1(2,1)
-              END IF
+              ! Slot 4 is the in-plane shear in both coordinate systems: see the
+              ! note on the stress unpacking above.
+              WorkVec1(4,1) = WorkTensor1(1,2) +  WorkTensor1(2,1)
             CASE(3)
               WorkVec1(4,1) = WorkTensor1(1,2) +  WorkTensor1(2,1)
               WorkVec1(5,1) = WorkTensor1(1,3) +  WorkTensor1(3,1)
@@ -2141,11 +2139,7 @@ CONTAINS
                 WorkVec2(3,1)*SymBasis3
             SELECT CASE(nshr)
             CASE(1)
-              IF (AxialSymmetry) THEN
-                WorkTensor3 = WorkTensor3 + 2.0d0*WorkVec2(4,1)*SymBasis5
-              ELSE
-                WorkTensor3 = WorkTensor3 + 2.0d0*WorkVec2(4,1)*SymBasis4
-              END IF
+              WorkTensor3 = WorkTensor3 + 2.0d0*WorkVec2(4,1)*SymBasis4
             CASE(3)
               WorkTensor3 = WorkTensor3 + 2.0d0*WorkVec2(4,1)*SymBasis4 + &
                   2.0d0*WorkVec2(5,1)*SymBasis5 + 2.0d0*WorkVec2(6,1)*SymBasis6
@@ -2200,12 +2194,12 @@ CONTAINS
                   CASE(1)
                     StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
                         = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                        + (dBasis(q,1)*dStress1(1,1) + dBasis(q,2)*dStress1(1,3) &
-                        + 1.0d0/r*Basis(q)*dStress1(2,2))*s
+                        + (dBasis(q,1)*dStress1(1,1) + dBasis(q,2)*dStress1(1,2) &
+                        + 1.0d0/r*Basis(q)*dStress1(3,3))*s
                   CASE(2)
                     StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
                         = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                        + (dBasis(q,1)*dStress1(3,1) + dBasis(q,2)*dStress1(3,3) ) * s
+                        + (dBasis(q,1)*dStress1(2,1) + dBasis(q,2)*dStress1(2,2) ) * s
                   END SELECT
                 END DO
               END DO
@@ -2221,11 +2215,11 @@ CONTAINS
               SELECT CASE(i)
               CASE(1)
                 ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
-                    -(dBasis(p,1) * Stress1(1,1) + dBasis(p,2) * Stress1(1,3) &
-                    + 1.0d0/r * Basis(p) * Stress1(2,2)) * s 
+                    -(dBasis(p,1) * Stress1(1,1) + dBasis(p,2) * Stress1(1,2) &
+                    + 1.0d0/r * Basis(p) * Stress1(3,3)) * s
               CASE(2)
                 ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
-                    -(dBasis(p,1) * Stress1(3,1) + dBasis(p,2) * Stress1(3,3)) * s 
+                    -(dBasis(p,1) * Stress1(2,1) + dBasis(p,2) * Stress1(2,2)) * s
               END SELECT
             ELSE
               DO q = 1,ntot
@@ -2453,17 +2447,18 @@ CONTAINS
     IF ( .NOT. MatModel % StrainLinear ) CALL Fatal( Caller, 'Material model "'// &
         TRIM(MatModel % Name)//'" is not linear in the strain and needs its own assembly' )
 
-    ! Axial symmetry stays refused for anisotropic materials, and after the
-    ! unification the reason is no longer that the kinematics are missing --
-    ! this assembly has them. It is that the axis ORDERING here is (r, phi, z),
-    ! hoop at index 2, while a matrix valued "Youngs Modulus", this solver's own
-    ! postprocessor and StressSolve all use (r, z, phi), hoop at index 3. An
-    ! isotropic law cannot see the difference, since the trace and the identity
-    ! are permutation blind; for an anisotropic C it is exactly C(2,2) against
-    ! C(3,3). What remains is an adapter permuting the Voigt slots [1,3,2,6,5,4]
-    ! on the way in, which wants its own change and its own test.
-    IF ( AxialSymmetry .AND. .NOT. Isotropic ) CALL Fatal( Caller, &
-        'Axially symmetric option is not supported for anisotropic materials' )
+    ! Axial symmetry with an anisotropic material used to be refused here, and the
+    ! reason was the axis ORDERING: this assembly ordered the components
+    ! (r, phi, z) with the hoop at index 2, while a matrix valued "Youngs Modulus",
+    ! this solver's own postprocessor and StressSolve all use (r, z, phi) with the
+    ! hoop at index 3. An isotropic law cannot see the difference, the trace and
+    ! the identity being permutation blind; for an anisotropic C it is exactly
+    ! C(2,2) against C(3,3).
+    !
+    ! The assemblies now order the components (r, z, phi) too, so the elasticity
+    ! matrix is read in the same Voigt order it is written in -- (rr, zz, hoop,
+    ! rz, z-hoop, r-hoop) -- and the anticipated permutation adapter turned out
+    ! not to be needed at all. Aligning the conventions WAS the whole of the work.
 
     MatPoint % Dim = dim
     MatPoint % CDim = cdim
@@ -2582,11 +2577,20 @@ CONTAINS
        !------------------------------------------------------------------
        Grad = 0.0d0
        IF (AxialSymmetry) THEN
+          ! Ordered (r, z, phi), so the hoop is index 3. This is Elmer's
+          ! axisymmetric convention everywhere else -- ComputeStressAndStrain
+          ! below, StressSolve's LocalStress, and the UMAT interface's own
+          ! (rr, zz, theta-theta, rz) -- and this assembly used to be the one
+          ! place ordering them (r, phi, z) with the hoop at index 2. Invisible
+          ! for an isotropic law, since the trace and the identity are blind to
+          ! which axis is which; for an anisotropic C it was the difference
+          ! between C(2,2) and C(3,3), and it is why anisotropy could not come
+          ! near axial symmetry until the two orderings were reconciled.
           Grad(1,1) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,1) )
-          Grad(1,3) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) )
-          Grad(2,2) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
-          Grad(3,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
-          Grad(3,3) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
+          Grad(1,2) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) )
+          Grad(3,3) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
+          Grad(2,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
+          Grad(2,2) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
        ELSE
           Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
        END IF
@@ -2658,14 +2662,15 @@ CONTAINS
              k = cdim*(p-1)+i
              dDefGs(:,:,k) = 0.0D0
              IF (AxialSymmetry) THEN
+                ! (r, z, phi), hoop at 3, as Grad above.
                 SELECT CASE(i)
                 CASE (1)
                    dDefGs(1,1,k) = dBasisdx(p,1)
-                   dDefGs(1,3,k) = dBasisdx(p,2)
-                   dDefGs(2,2,k) = 1.0d0/r * Basis(p)
+                   dDefGs(1,2,k) = dBasisdx(p,2)
+                   dDefGs(3,3,k) = 1.0d0/r * Basis(p)
                 CASE (2)
-                   dDefGs(3,1,k) = dBasisdx(p,1)
-                   dDefGs(3,3,k) = dBasisdx(p,2)
+                   dDefGs(2,1,k) = dBasisdx(p,1)
+                   dDefGs(2,2,k) = dBasisdx(p,2)
                 END SELECT
              ELSE
                 dDefGs(i,:,k) = dBasisdx(p,:)
@@ -2702,14 +2707,15 @@ CONTAINS
                    DO j = 1,cdim
                       SELECT CASE(j)
                       CASE(1)
+                         ! (r, z, phi): the radial row, the r-z shear and the hoop.
                          StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
                               = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                              + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,3) &
-                              + 1.0d0/r*Basis(q)*dStress1(2,2))*s
+                              + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,2) &
+                              + 1.0d0/r*Basis(q)*dStress1(3,3))*s
                       CASE(2)
                          StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
                               = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                              + (dBasisdx(q,1)*dStress1(3,1) + dBasisdx(q,2)*dStress1(3,3) ) * s
+                              + (dBasisdx(q,1)*dStress1(2,1) + dBasisdx(q,2)*dStress1(2,2) ) * s
                       END SELECT
                    END DO
                 END DO
@@ -2922,11 +2928,12 @@ CONTAINS
        !--------------------------------------------------------------------
        Grad = 0.0d0
        IF (AxialSymmetry) THEN
+          ! (r, z, phi), hoop at 3 -- see the note in LocalMatrix.
           Grad(1,1) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,1) )
-          Grad(1,3) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) ) 
-          Grad(2,2) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
-          Grad(3,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
-          Grad(3,3) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
+          Grad(1,2) = SUM( LocalDisplacement(1,1:ntot) * dBasisdx(1:ntot,2) )
+          Grad(3,3) = 1.0d0/r * SUM( LocalDisplacement(1,1:ntot) * Basis(1:ntot) )
+          Grad(2,1) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,1) )
+          Grad(2,2) = SUM( LocalDisplacement(2,1:ntot) * dBasisdx(1:ntot,2) )
        ELSE           
           Grad(1:dim,1:dim) = MATMUL(LocalDisplacement(1:dim,1:ntot),dBasisdx(1:ntot,1:dim))
        END IF
@@ -2992,11 +2999,11 @@ CONTAINS
                 SELECT CASE(i)
                 CASE (1)
                    Grad(1,1) = dBasisdx(p,1)
-                   Grad(1,3) = dBasisdx(p,2)
-                   Grad(2,2) = 1.0d0/r * Basis(p)
+                   Grad(1,2) = dBasisdx(p,2)
+                   Grad(3,3) = 1.0d0/r * Basis(p)
                 CASE (2)
-                   Grad(3,1) = dBasisdx(p,1)
-                   Grad(3,3) = dBasisdx(p,2)                   
+                   Grad(2,1) = dBasisdx(p,1)
+                   Grad(2,2) = dBasisdx(p,2)
                 END SELECT
              ELSE
                 Grad(i,:) = dBasisdx(p,:)
@@ -3033,12 +3040,12 @@ CONTAINS
                       CASE(1)
                          StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                               = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
-                              + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,3) &
-                              + 1.0d0/r*Basis(q)*dStress1(2,2))*s
+                              + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,2) &
+                              + 1.0d0/r*Basis(q)*dStress1(3,3))*s
                       CASE(2)
                          StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                               = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
-                              + (dBasisdx(q,1)*dStress1(3,1) + dBasisdx(q,2)*dStress1(3,3) ) * s
+                              + (dBasisdx(q,1)*dStress1(2,1) + dBasisdx(q,2)*dStress1(2,2) ) * s
                       END SELECT
                    END DO
                 END DO
@@ -3108,14 +3115,17 @@ CONTAINS
              DO i = 1,cdim
                IF (AxialSymmetry) THEN
                  SELECT CASE(i)
+                 ! (r, z, phi), and note InvDefG is indexed TRANSPOSED here --
+                 ! the contraction is InvDefG(b,a) * dGrad(a,b), so the shear
+                 ! partner of dGrad(1,2) is InvDefG(2,1) and not InvDefG(1,2).
                  CASE(1)
                    StiffMatrix(DOFs*p,DOFs*(q-1)+i) = StiffMatrix(DOFs*p,DOFs*(q-1)+i) + &
-                       DetDefG**2 * ( dBasisdx(q,1) * InvDefG(1,1) + dBasisdx(q,2) * InvDefG(3,1) + &
-                       Basis(q)/r * InvDefG(2,2) ) *  Basis(p) * s
+                       DetDefG**2 * ( dBasisdx(q,1) * InvDefG(1,1) + dBasisdx(q,2) * InvDefG(2,1) + &
+                       Basis(q)/r * InvDefG(3,3) ) *  Basis(p) * s
                  CASE(2)
                    StiffMatrix(DOFs*p,DOFs*(q-1)+i) = StiffMatrix(DOFs*p,DOFs*(q-1)+i) + &
-                       DetDefG**2 * ( dBasisdx(q,1) * InvDefG(1,3) + dBasisdx(q,2) * InvDefG(3,3) ) * &
-                       Basis(p) * s                  
+                       DetDefG**2 * ( dBasisdx(q,1) * InvDefG(1,2) + dBasisdx(q,2) * InvDefG(2,2) ) * &
+                       Basis(p) * s
                  END SELECT
                ELSE
                  ! Use Newton's method:
@@ -3145,11 +3155,11 @@ CONTAINS
                SELECT CASE(i)
                CASE (1)
                  Grad(1,1) = dBasisdx(p,1)
-                 Grad(1,3) = dBasisdx(p,2)
-                 Grad(2,2) = 1.0d0/r * Basis(p)
+                 Grad(1,2) = dBasisdx(p,2)
+                 Grad(3,3) = 1.0d0/r * Basis(p)
                CASE (2)
-                 Grad(3,1) = dBasisdx(p,1)
-                 Grad(3,3) = dBasisdx(p,2)                   
+                 Grad(2,1) = dBasisdx(p,1)
+                 Grad(2,2) = dBasisdx(p,2)
                END SELECT
 
              ELSE
@@ -3171,13 +3181,13 @@ CONTAINS
                      StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                          = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                          - Pressure * ( dBasisdx(q,1) * Grad(1,1) &
-                         + dBasisdx(q,2) * Grad(1,3) &
-                         + Basis(q)/r * Grad(2,2) ) * s 
+                         + dBasisdx(q,2) * Grad(1,2) &
+                         + Basis(q)/r * Grad(3,3) ) * s
                    CASE(2)
                      StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                          = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
-                         - Pressure * ( dBasisdx(q,1) * Grad(3,1) &
-                         + dBasisdx(q,2) * Grad(3,3) ) * s 
+                         - Pressure * ( dBasisdx(q,1) * Grad(2,1) &
+                         + dBasisdx(q,2) * Grad(2,2) ) * s
                    END SELECT
                  ELSE
                    StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &

@@ -35,13 +35,13 @@
 ! material is an isotropic base (E = 1e3, nu = 0.3) in Elmer's Voigt order
 ! (11,22,33,12,23,13) with engineering shear, plus C(3,4) = C(4,3).
 !
-! Axial symmetry is deliberately NOT covered, because ElasticSolve still refuses it
-! for anisotropic materials and that guard is load bearing: its axisymmetric
-! assembly orders the components (r, phi, z) with the hoop at index 2, while its
-! own postprocessor and StressSolve use (r, z, phi) with the hoop at index 3. An
-! isotropic law cannot see the difference, an anisotropic one is exactly the
-! difference between C(2,2) and C(3,3), and reconciling the two conventions is a
-! prerequisite rather than a detail.
+! Axial symmetry is covered by ElasticAnisotropicAxi, not here. It was refused
+! outright when this test was written, the assemblies having ordered the components
+! (r, phi, z) with the hoop at index 2 while the postprocessor and StressSolve used
+! (r, z, phi) with the hoop at index 3; the assemblies were then moved to (r, z, phi)
+! and the capability came with it. That test needs a material this one cannot
+! supply -- one whose C(2,2) and C(3,3) DIFFER -- since an isotropic base is
+! symmetric in those two slots and would pass under either convention.
 
 Header
   Mesh DB "." "square"
