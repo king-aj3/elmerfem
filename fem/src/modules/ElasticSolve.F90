@@ -364,6 +364,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! then. See where they are assigned.
   LOGICAL :: StressOnlyKeywords, StressLoadInBC
 
+  ! Staged construction, "Update Reference Displacement": which bodies ask for it,
+  ! and which of them are to have the solution copied into the reference at the end.
+  ! Allocated per call rather than SAVEd, so a nested instance has its own.
+  LOGICAL :: UpdateReference
+  LOGICAL, ALLOCATABLE :: UpdatePresent(:), UpdateActive(:)
+  TYPE(Variable_t), POINTER :: ReferenceSol
+
   CHARACTER(*), PARAMETER :: Caller = 'ElasticSolver'
 
   
@@ -874,6 +881,48 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   StressLoadInBC = ListCheckPrefixAnyBC( Model, 'Stress Load' )
 
   !-----------------------------------------------------------------------------
+  ! STAGED CONSTRUCTION -- "Update Reference Displacement" in a body force. The
+  ! keyword is a switch on a sign rather than a value: where its nodal values are
+  ! mostly non-negative the body's displacement is to BECOME the new reference at
+  ! the end of the step, and where they are mostly negative the body is solved
+  ! measured FROM the reference already stored, by adding K u_ref to its load. A
+  ! sif drives a construction sequence by flipping that sign over time, which is
+  ! what fem/tests/staged_sim does.
+  !
+  ! The reference itself lives in a variable named "Reference Displacement", which
+  ! the sif exports. StressSolve tests for the keyword only where that variable
+  ! exists, so a sif that forgets to export it gets the keyword ignored without a
+  ! word; here that is the one thing refused outright, since the keyword is then
+  ! doing nothing and the answer is the unstaged one.
+  !-----------------------------------------------------------------------------
+  ReferenceSol => VariableGet( Mesh % Variables, 'Reference Displacement' )
+  UpdateReference = .FALSE.
+
+  IF ( ListCheckPresentAnyBodyForce( Model, 'Update Reference Displacement' ) ) THEN
+    IF ( .NOT. ASSOCIATED( ReferenceSol ) ) CALL Fatal( Caller, &
+        '"Update Reference Displacement" needs a variable named "Reference '// &
+        'Displacement" to store the reference in: export one from this solver' )
+
+    IF ( LargeDeflection ) CALL Fatal( Caller, &
+        '"Update Reference Displacement" needs "Large Deflection = False": the '// &
+        'reference is subtracted through the linear stiffness, which is not the '// &
+        'tangent of a geometrically nonlinear step' )
+
+    ALLOCATE( UpdatePresent( Model % NumberOfBodies ), &
+              UpdateActive( Model % NumberOfBodies ) )
+    UpdatePresent = .FALSE.
+    UpdateActive = .FALSE.
+
+    DO i = 1, Model % NumberOfBodies
+      j = GetInteger( Model % Bodies(i) % Values, 'Body Force', GotIt )
+      IF ( .NOT. GotIt ) CYCLE
+      UpdatePresent(i) = ListCheckPresent( Model % BodyForces(j) % Values, &
+          'Update Reference Displacement' )
+    END DO
+    UpdateReference = ANY( UpdatePresent )
+  END IF
+
+  !-----------------------------------------------------------------------------
   ! "Local Matrix Storage" lets the assembly build one element's local matrix and
   ! reuse it for every element the core has marked identical to it -- by
   ! "Local Matrix Identical" for the whole set, or "... Identical Bodies" per
@@ -1275,6 +1324,11 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 NodalStressLoad, NodalStrainLoad )
           END IF
         END IF
+
+        ! Staged construction: this body's displacement is measured from a stored
+        ! reference rather than from the mesh. Between the local matrix and the
+        ! update, since it needs the one to build a contribution to the other.
+        IF ( UpdateReference ) CALL AddReferenceDisplacement( CurrentElement, n )
 
         IF( GotRayleighAlpha ) THEN
           LocalDampMatrix = LocalDampMatrix + RayleighAlpha * LocalMassMatrix
@@ -1692,6 +1746,26 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   END DO ! of nonlinear iter
   !------------------------------------------------------------------------------
 
+  !-----------------------------------------------------------------------------
+  ! Staged construction: the bodies whose "Update Reference Displacement" came out
+  ! non-negative take this step's solution as their new reference, so that the next
+  ! stage is measured from where this one left off. Body by body, since a
+  ! construction sequence has some bodies advancing while others are held.
+  !-----------------------------------------------------------------------------
+  IF ( UpdateReference ) THEN
+    DO t = 1, Solver % NumberOfActiveElements
+      CurrentElement => GetActiveElement(t)
+      IF ( .NOT. UpdateActive( CurrentElement % BodyId ) ) CYCLE
+      n = GetElementNOFNodes( CurrentElement )
+      DO j = 1, n
+        k = ReferenceSol % Perm( CurrentElement % NodeIndexes(j) )
+        i = StressPerm( CurrentElement % NodeIndexes(j) )
+        IF ( k == 0 .OR. i == 0 ) CYCLE
+        ReferenceSol % Values( ReferenceSol % DOFs*(k-1)+1 : ReferenceSol % DOFs*k ) = &
+            Displacement( ReferenceSol % DOFs*(i-1)+1 : ReferenceSol % DOFs*i )
+      END DO
+    END DO
+  END IF
 
   !-----------------------------------------------------------------------------
   !   Perform strain and stress computation...
@@ -1798,6 +1872,69 @@ CONTAINS
 !> Every entry is an item of the remaining unification backlog, and the message
 !> says what is missing rather than merely that something is.
 !------------------------------------------------------------------------------
+!------------------------------------------------------------------------------
+!> Staged construction, one element: decide from the sign of "Update Reference
+!> Displacement" whether this body is to become the new reference or to be solved
+!> measured from the existing one, and in the second case add K u_ref to the load.
+!>
+!> The sign convention is StressSolve's and it is a majority vote over the nodes,
+!> not a test of one value -- a keyword given as a table over time crosses zero
+!> between stages, and the nodes of one element can straddle the crossing.
+!>
+!> Only the NODAL block of the local matrix is contracted, which is what
+!> StressSolve does: the reference is a nodal field and has nothing to say about
+!> bubble degrees of freedom.
+!------------------------------------------------------------------------------
+  SUBROUTINE AddReferenceDisplacement( Element, n )
+!------------------------------------------------------------------------------
+    TYPE(Element_t), POINTER :: Element
+    INTEGER :: n
+!------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: BF
+    INTEGER :: i, j, k, body, RefDofs, nref
+    LOGICAL :: Found
+    REAL(KIND=dp) :: UpdateRef(n), NodalRefD(STDOFs*n)
+!------------------------------------------------------------------------------
+    body = Element % BodyId
+    IF ( body < 1 .OR. body > SIZE(UpdatePresent) ) RETURN
+    IF ( .NOT. UpdatePresent(body) ) RETURN
+
+    BF => GetBodyForce()
+    IF ( .NOT. ASSOCIATED( BF ) ) RETURN
+
+    UpdateRef(1:n) = GetReal( BF, 'Update Reference Displacement', Found )
+    IF ( .NOT. Found ) RETURN
+
+    ! Non-negative in the majority: this body's solution becomes the reference,
+    ! which happens after the solve rather than here.
+    IF ( COUNT( UpdateRef(1:n) < 0.0_dp ) <= COUNT( UpdateRef(1:n) >= 0.0_dp ) ) THEN
+      UpdateActive(body) = .TRUE.
+      RETURN
+    END IF
+
+    UpdateActive(body) = .FALSE.
+
+    RefDofs = ReferenceSol % DOFs
+    nref = RefDofs * n
+    DO i = 1, n
+      k = ReferenceSol % Perm( Element % NodeIndexes(i) )
+      IF ( k == 0 ) THEN
+        NodalRefD( RefDofs*(i-1)+1 : RefDofs*i ) = 0.0_dp
+      ELSE
+        NodalRefD( RefDofs*(i-1)+1 : RefDofs*i ) = &
+            ReferenceSol % Values( RefDofs*(k-1)+1 : RefDofs*k )
+      END IF
+    END DO
+
+    DO i = 1, nref
+      LocalForce(i) = LocalForce(i) + &
+          SUM( LocalStiffMatrix(i,1:nref) * NodalRefD(1:nref) )
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE AddReferenceDisplacement
+!------------------------------------------------------------------------------
+
+
   SUBROUTINE RefuseStressSolveKeywords( Material )
 !------------------------------------------------------------------------------
     TYPE(ValueList_t), POINTER :: Material
