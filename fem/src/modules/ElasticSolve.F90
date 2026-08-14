@@ -263,6 +263,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   USE MaterialModels
   USE StressLocal
   USE Constitutive
+  USE ModelLumping
   USE MainUtils, ONLY : SetGlobalBubblesFlag
   
   IMPLICIT NONE
@@ -351,6 +352,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: AnyDamping, GotDamping, GotRayleighAlpha, GotRayleighBeta, NeedMass
   REAL(KIND=dp) :: RayleighAlpha, RayleighBeta  
   
+  ! Model lumping: six load cases whose reactions become one 6x6 spring matrix for
+  ! the boundary. State of the run, deliberately NOT in any SAVE list -- it has to
+  ! live across the six cases of THIS call and no longer, which is exactly the
+  ! mistake PrevSOL used to make.
+  LOGICAL :: ModelLumping
+  TYPE(ModelLumping_t) :: Lump
+
   CHARACTER(*), PARAMETER :: Caller = 'ElasticSolver'
 
   
@@ -777,6 +785,40 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   IF (.NOT. LargeDeflection) HenckyStrain = .FALSE.
 
   !-----------------------------------------------------------------------------
+  ! MODEL LUMPING: reduce the body to a 6x6 spring matrix for one boundary, by
+  ! solving six load cases -- three translations and three rotations, imposed
+  ! either as displacements or as pure forces and moments -- and reading the
+  ! reactions off the lumping boundary.
+  !
+  ! The whole of it is in ModelLumping.F90, which was extracted from StressSolve
+  ! as shared code precisely so that this solver could call it, and which this
+  ! solver then did not call at all: "Model Lumping" was silently inert here.
+  ! Four calls do it, and the module needs nothing else from the driver.
+  !
+  ! THE SIX CASES ARE LOAD CASES, NOT NEWTON STEPS. They ride the nonlinear
+  ! iteration counter, so both bounds are forced to six and the convergence tests
+  ! never get a chance to stop early. That is only sound for a law whose residual
+  ! is independent of the iterate -- which is what "Constant Bulk System" below
+  ! already demands, and its Fatal covers large deflection, UMAT and neo-Hookean.
+  !
+  ! "Constant Bulk System" is ADDED to the list rather than merely assumed,
+  ! because the same keyword does two things and lumping needs both: it makes the
+  ! six cases share one assembled stiffness, and it is what makes
+  ! DefaultFinishBulkAssembly save BulkValues -- which ModelLumpingSprings
+  ! multiplies the solution by to recover the reactions. StressSolve sets its own
+  ! internal flag here instead, so a lumping sif that omits the keyword gets the
+  ! reuse without the saved bulk matrix; adding it to the list keeps the two in
+  ! agreement by construction.
+  !-----------------------------------------------------------------------------
+  ModelLumping = ListGetLogical( SolverParams, 'Model Lumping', GotIt )
+  IF ( ModelLumping ) THEN
+    IF ( dim /= 3 ) CALL Fatal( Caller, 'Model lumping is implemented in 3D only' )
+    NonlinearIter = 6
+    MinNonlinearIter = 6
+    CALL ListAddLogical( SolverParams, 'Constant Bulk System', .TRUE. )
+  END IF
+
+  !-----------------------------------------------------------------------------
   ! "Local Matrix Storage" lets the assembly build one element's local matrix and
   ! reuse it for every element the core has marked identical to it -- by
   ! "Local Matrix Identical" for the whole set, or "... Identical Bodies" per
@@ -854,7 +896,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   
   
   time = GetTime()
-  
+
+  ! The geometry of the lumping boundary -- its area, centre and second moments --
+  ! and the rigid body mass. Computed once, before the load cases, since every case
+  ! reads it and none of it moves.
+  IF ( ModelLumping ) CALL ModelLumpingInit( Lump, Solver, Model )
+
   CALL DefaultStart()
 
   DO iter=1,NonlinearIter
@@ -1243,6 +1290,23 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
            IF (.NOT. GotIt) Beta(1:n) = GetReal( BC, 'Normal Force', gotIt )
            GotForceBC = GotForceBC .OR. GotIt
 
+           ! The other way to drive a lumping load case: a pure force or a pure
+           ! moment over the lumping boundary, in place of a prescribed
+           ! displacement. It OVERWRITES the surface load read above, which is the
+           ! routine's own doing -- it zeroes the array it is given -- and is what
+           ! StressSolve does too. Nothing but a "Model Lumping Boundary" reaches
+           ! this, so a sif that does not lump cannot see it.
+           IF ( ModelLumping .AND. .NOT. Lump % FixDisplacement ) THEN
+             IF ( GetLogical( BC, 'Model Lumping Boundary', GotIt ) ) THEN
+               ! ElementNodes still holds the last BULK element here, and the moment
+               ! cases need the coordinates of THIS boundary element. Harmless to
+               ! refresh: LocalBoundaryMatrix fetches its own nodes.
+               CALL GetElementNodes( ElementNodes, CurrentElement )
+               CALL ModelLumpingLoads( Lump, iter, ElementNodes, n, LoadVector )
+               GotForceBC = .TRUE.
+             END IF
+           END IF
+
            GotSpring = ListCheckPrefix( BC,'Spring' )
            IF( GotSpring ) THEN           
              SpringCoeff(1:n,1,1) = GetReal( BC, 'Spring', NormalSpring )           
@@ -1406,6 +1470,16 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
          'Friction Direction')
      
      CALL DefaultFinishAssembly()
+
+     ! One load case imposed as a prescribed displacement of the lumping boundary --
+     ! a pure translation or a pure rotation. Between the assembly and the Dirichlet
+     ! conditions, which is where StressSolve puts it and what the routine's own
+     ! comment requires: it sets boundary values directly into the matrix, and the
+     ! sif's own conditions must be applied after so that they win where both speak.
+     IF ( ModelLumping .AND. Lump % FixDisplacement ) THEN
+       CALL ModelLumpingDisplacements( Lump, Solver, Model, iter )
+     END IF
+
      CALL DefaultDirichletBCs()
 
      IF (UseUMAT) THEN
@@ -1515,6 +1589,14 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
      !     Solve the system and check for convergence
      !------------------------------------------------------------------------------
      UNorm = DefaultSolve()
+
+     ! One row or column of the lumped 6x6 stiffness, from the reactions this load
+     ! case produced on the lumping boundary; after the sixth it is inverted and
+     ! written out. Before the convergence tests below, not after: the sixth case
+     ! leaves through one of those EXITs, and a row missed there is a matrix never
+     ! written. The reactions come from BulkValues times the solution, which is why
+     ! "Constant Bulk System" had to be added to the list and not merely assumed.
+     IF ( ModelLumping ) CALL ModelLumpingSprings( Lump, Solver, Model, iter )
 
      IF (UseUmat) THEN
        Displacement(:) = TotalSol(:) + Displacement(:)
