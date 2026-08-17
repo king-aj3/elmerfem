@@ -368,9 +368,23 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! term is live on THIS pass (it is not on the static first one), and the sif's own
   ! "Eigen Analysis" setting, which the two passes toggle between.
   LOGICAL :: StabilityAnalysis, GeometricStiffness, GeometricActive, OrigEigenAnalysis
+  ! "Quasi Stationary": the transient run without its inertial term.
+  LOGICAL :: QuasiStationary
   ! "Gravitational Prestress Advection": whether this element's body force asks for
   ! the term, and the rho*g it is scaled by.
   LOGICAL :: GotGPA
+  ! "Stress Pressure", the pressure-like body load.
+  LOGICAL :: GotPressureLoad
+  ! Handles for material data and loads read AT the integration point, shared by the
+  ! assembly and the postprocessing. They are keyword descriptors and nothing else --
+  ! the same for every instance of this solver -- so SAVEing them is safe where SAVEing
+  ! state would not be.
+  TYPE(ValueHandle_t), SAVE :: YoungIP_h, PoissonIP_h, BetaIP_h, LoadIP_h(4)
+  LOGICAL, SAVE :: IPHandlesDone = .FALSE.
+  ! Material data and loads given AT THE INTEGRATION POINTS rather than at the nodes:
+  ! "Youngs Modulus at IP", "Poisson Ratio at IP", "Heat Expansion Coefficient IP" and
+  ! "Stress Bodyforce at IP". What they change is only WHERE the value comes from.
+  LOGICAL :: EvalYoungIP, EvalPoissonIP, EvalBetaIP, EvalLoadIP
   TYPE(Variable_t), POINTER :: VeStress => NULL()
   INTEGER :: nve
   LOGICAL :: PseudoTraction, GlobalPseudoTraction
@@ -408,7 +422,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   REAL(KIND=dp), ALLOCATABLE :: LocalMassMatrix(:,:),LocalStiffMatrix(:,:),&
        LocalDampMatrix(:,:),LoadVector(:,:),InertialLoad(:,:), Viscosity(:), LocalForce(:), &
-       MaxwellViscosity(:), NodalGPA(:), &
+       MaxwellViscosity(:), NodalGPA(:), NodalPressureLoad(:), &
        NodalStressLoad(:,:), NodalStrainLoad(:,:), &
        LocalTemperature(:),ElasticModulus(:,:,:),PoissonRatio(:), Density(:), &
        Damping(:), HeatExpansionCoeff(:,:,:),Alpha(:,:),Beta(:), &
@@ -461,7 +475,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   
 !------------------------------------------------------------------------------
   SAVE LocalMassMatrix,LocalStiffMatrix,LocalDampMatrix,LoadVector,InertialLoad, Viscosity, &
-       MaxwellViscosity, NodalGPA, &
+       MaxwellViscosity, NodalGPA, NodalPressureLoad, &
        NodalStressLoad, NodalStrainLoad, Work, &
        LocalForce,ElementNodes,ParentNodes,FlowNodes,Alpha,Beta, &
        LocalTemperature,AllocationsDone,ReferenceTemperature,BoundaryDispl, &
@@ -762,6 +776,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
              ElasticModulus, PoissonRatio, &
              Density, Damping, &
              LocalForce, LocalExternalForce, Viscosity, MaxwellViscosity, NodalGPA, &
+             NodalPressureLoad, &
              LocalMassMatrix,  &
              LocalStiffMatrix,  &
              LocalDampMatrix,  &
@@ -782,7 +797,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
           ElasticModulus( 6,6,N ), PoissonRatio( N ), &
           Density( N ), Damping( N ), &
           LocalForce( STDOFs*N ), LocalExternalForce( STDOFs*N ), Viscosity( N ), &
-          MaxwellViscosity( N ), NodalGPA( N ), &
+          MaxwellViscosity( N ), NodalGPA( N ), NodalPressureLoad( N ), &
           LocalMassMatrix(  STDOFs*N,STDOFs*N ),  &
           LocalStiffMatrix( STDOFs*N,STDOFs*N ),  &
           LocalDampMatrix( STDOFs*N,STDOFs*N ),  &
@@ -1125,15 +1140,20 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! logical per element, and only a sif that does set one pays for the precise
   ! per-element test in the assembly loop, where it Fatals on the first element.
   !-----------------------------------------------------------------------------
-  ! Two driver options of StressSolve's with no counterpart here. Both change the
-  ! answer rather than merely the work done, so neither may be read and dropped:
-  ! "Quasi Stationary" suppresses the inertial term of a transient run -- though
-  ! there it also conflates the mass with the damping, so what a sif asking for it
-  ! should get is not obvious enough to guess at -- and "Update Transient System"
-  ! decides whether a reused constant system is refreshed as the timestep changes.
-  IF ( ListCheckPresent( SolverParams, 'Quasi Stationary' ) ) CALL Fatal( Caller, &
-      '"Quasi Stationary" is not implemented here: it drops the inertial term from a '// &
-      'transient run, and in StressSolve the same flag governs the damping matrix too' )
+  !-----------------------------------------------------------------------------
+  ! "Quasi Stationary": drop the inertial term from a transient run, keeping the
+  ! density for whatever else reads it -- "no mass-matrix, despite finite densities",
+  ! as the sif that asks for it puts it.
+  !
+  ! StressSolve conflates the mass with the damping in this one flag: it sets
+  ! NeedMass from the keyword, and then any damping present turns NeedMass back on,
+  ! which builds BOTH matrices again. That is reproduced rather than tidied, and the
+  ! test is made on the element's own nodal values as it is made there -- see where
+  ! the mass is integrated.
+  !-----------------------------------------------------------------------------
+  QuasiStationary = ListGetLogical( SolverParams, 'Quasi Stationary', GotIt )
+  IF ( QuasiStationary .AND. .NOT. TransientSimulation ) CALL Warn( Caller, &
+      '"Quasi Stationary" only has meaning in a transient simulation' )
 
   ! StressSolve lets an Equation section name the temperature field it couples to.
   ! This solver reads the variable called "Temperature" and nothing else, so the
@@ -1154,12 +1174,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   StressOnlyKeywords = &
       ListCheckPrefixAnyMaterial( Model, 'Pre Stress' ) .OR. &
       ListCheckPrefixAnyMaterial( Model, 'Pre Strain' ) .OR. &
-      ListCheckPresentAnyMaterial( Model, 'Youngs Modulus at IP' ) .OR. &
-      ListCheckPresentAnyMaterial( Model, 'Poisson Ratio at IP' ) .OR. &
-      ListCheckPresentAnyMaterial( Model, 'Heat Expansion Coefficient IP' ) .OR. &
-      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce at IP' ) .OR. &
       ListCheckPrefixAnyMaterial( Model, 'Mesh Velocity' ) .OR. &
-      ListCheckPrefixAnyBodyForce( Model, 'Stress Pressure' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Stress Pressure im' ) .OR. &
       ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 1 im' ) .OR. &
       ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 2 im' ) .OR. &
       ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 3 im' )
@@ -1309,6 +1325,20 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   CALL DefaultStart()
 
+  ! The keyword handles for integration point data, bound once for the whole run.
+  ! Bound whether or not any sif asks for them, so that no binding happens inside an
+  ! element loop.
+  IF ( .NOT. IPHandlesDone ) THEN
+    CALL ListInitElementKeyword( YoungIP_h, 'Material', 'Youngs Modulus' )
+    CALL ListInitElementKeyword( PoissonIP_h, 'Material', 'Poisson Ratio' )
+    CALL ListInitElementKeyword( BetaIP_h, 'Material', 'Heat Expansion Coefficient' )
+    DO i=1,3
+      CALL ListInitElementKeyword( LoadIP_h(i), 'Body Force', 'Stress Bodyforce '//I2S(i) )
+    END DO
+    CALL ListInitElementKeyword( LoadIP_h(4), 'Body Force', 'Stress Pressure' )
+    IPHandlesDone = .TRUE.
+  END IF
+
   DO iter=1,NonlinearIter
 
      ! The two passes of a prestressed eigen analysis. The first is a static solve
@@ -1426,6 +1456,19 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         PlaneStress = GetLogical( Equation, 'Plane Stress', GotIt )
         PoissonRatio = 0.0d0
 
+        ! Data given at the integration points, per material as StressSolve reads it.
+        ! An IP-evaluated quantity is one whose keyword is a procedure or a table
+        ! wanting the position rather than a nodal value -- the permafrost case passes
+        ! functions of ground temperature and water content this way.
+        !
+        ! Read HERE, before anything reads the material: these decide whether the nodal
+        ! reads below may happen at all, and ListGetReal refuses such a keyword outright.
+        ! Read late they would carry the previous element's answer, or nothing at all on
+        ! the first -- which is exactly how this was found.
+        EvalYoungIP   = GetLogical( Material, 'Youngs Modulus at IP', GotIt )
+        EvalPoissonIP = GetLogical( Material, 'Poisson Ratio at IP', GotIt )
+        EvalBetaIP    = GetLogical( Material, 'Heat Expansion Coefficient IP', GotIt )
+
         ! The constraint div u = 0 in two dimensions is the plane STRAIN statement, so
         ! it contradicts plane stress -- where it is the out-of-plane strain that
         ! preserves the volume. StressSolve resolves that by ignoring the keyword
@@ -1447,8 +1490,18 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
               ElasticModulus(1,1,1:n) = ListGetReal( Material, &
                    'Youngs Modulus', n, NodeIndexes, GotIt )
             ELSE
-              CALL InputTensor( ElasticModulus, Isotropic, &
-                   'Youngs Modulus', Material, n, NodeIndexes )
+              ! Asked for at the integration points instead, so it must not be read
+              ! at the nodes at all: ListGetReal refuses a keyword whose value is a
+              ! function of quantities that live on the points. Isotropy is assumed
+              ! with it, which is the same assumption StressSolve makes -- a matrix
+              ! valued modulus at the points is not offered by either.
+              IF ( EvalYoungIP ) THEN
+                 ElasticModulus = 0.0_dp
+                 Isotropic = .TRUE.
+              ELSE
+                 CALL InputTensor( ElasticModulus, Isotropic, &
+                      'Youngs Modulus', Material, n, NodeIndexes )
+              END IF
 
               ! Isotropy is known only now, from this element's own material, which
               ! is where the other half of the "Incompressible" refusal belongs.
@@ -1486,7 +1539,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                  END DO
               END IF
            END IF
-           IF (Isotropic) PoissonRatio(1:n) = GetReal( Material, 'Poisson Ratio' )
+           IF ( Isotropic .AND. .NOT. EvalPoissonIP ) &
+               PoissonRatio(1:n) = GetReal( Material, 'Poisson Ratio' )
         END IF
         
         ! Scalar, one value per direction, or a full tensor -- InputTensor decides
@@ -1497,8 +1551,14 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         ! Only the DIAGONAL is used, here as in StressSolve: the thermal eigenstrain
         ! is diag(alpha) * dT, so an off-diagonal expansion coefficient is read and
         ! then ignored by both. That is pre-existing and deliberately left alone.
-        CALL InputTensor( HeatExpansionCoeff, IsotropicHeatExpansion, &
-            'Heat Expansion Coefficient', Material, n, NodeIndexes, GotIt )
+        IF ( EvalBetaIP ) THEN
+          HeatExpansionCoeff = 0.0_dp
+          IsotropicHeatExpansion = .TRUE.
+          GotIt = .TRUE.
+        ELSE
+          CALL InputTensor( HeatExpansionCoeff, IsotropicHeatExpansion, &
+              'Heat Expansion Coefficient', Material, n, NodeIndexes, GotIt )
+        END IF
         ReferenceTemperature(1:n) = GetReal( Material, 'Reference Temperature', GotIt )
         
         Density(1:n) = GetReal( Material, 'Density', GotIt )
@@ -1538,9 +1598,16 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         NodalStrainLoad = 0.0D0
         GotGPA = .FALSE.
         NodalGPA = 0.0D0
+        GotPressureLoad = .FALSE.
+        NodalPressureLoad = 0.0D0
+        EvalLoadIP = .FALSE.
 
         IF ( ASSOCIATED(BodyForce) ) THEN
-          IF( ListCheckPrefix(BodyForce,'Stress Bodyforce') ) THEN
+          ! Read at the points below instead when the keyword says so, and then not
+          ! here: the same restriction as on the material data above.
+          EvalLoadIP = GetLogical( BodyForce, 'Stress Bodyforce at IP', GotIt )
+
+          IF( ListCheckPrefix(BodyForce,'Stress Bodyforce') .AND. .NOT. EvalLoadIP ) THEN
             LoadVector(1,1:n) = GetReal( BodyForce, 'Stress Bodyforce 1', GotIt )
             LoadVector(2,1:n) = GetReal( BodyForce, 'Stress Bodyforce 2', GotIt )
             IF ( dim > 2 ) THEN
@@ -1559,6 +1626,15 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
           IF( STDOFS > dim ) THEN
             LoadVector(STDOFs,1:n) = GetReal( BodyForce, 'Stress Volume Source', GotIt )
           END IF
+
+          ! "Stress Pressure": a pressure-like body load, which enters the force as
+          ! p times the divergence of the test function rather than as a force
+          ! density. Poroelasticity is what asks for it -- the ElmerIce permafrost
+          ! case passes a groundwater pressure through it. NOT the same keyword as
+          ! "Stress Volume Source" above, which feeds the constraint row of the
+          ! mixed formulation.
+          IF ( .NOT. EvalLoadIP ) NodalPressureLoad(1:n) = &
+              GetReal( BodyForce, 'Stress Pressure', GotPressureLoad )
 
           !----------------------------------------------------------------------
           ! "Gravitational Prestress Advection": the restoring force that arises
@@ -1690,7 +1766,9 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 Isotropic, RotateModuli, TransformMatrix, LargeDeflection, &
                 NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
                 MaxwellHere, MaxwellViscosity, PrevLocalDisplacement, GotGPA, NodalGPA, &
-                GeometricActive, StabilityAnalysis )
+                GeometricActive, StabilityAnalysis, QuasiStationary, &
+                GotPressureLoad, NodalPressureLoad, &
+                EvalYoungIP, EvalPoissonIP, EvalBetaIP, EvalLoadIP )
           END IF
         END IF
 
@@ -2353,12 +2431,6 @@ CONTAINS
           '"Mesh Velocity" is not implemented here: StressSolve carries it as an '// &
           'advection term in the damping matrix, which this assembly does not build' )
 
-      IF ( ListCheckPresent( Material, 'Youngs Modulus at IP' ) .OR. &
-           ListCheckPresent( Material, 'Poisson Ratio at IP' ) .OR. &
-           ListCheckPresent( Material, 'Heat Expansion Coefficient IP' ) ) &
-          CALL Fatal( Caller, 'Material data given AT INTEGRATION POINTS is not '// &
-          'implemented here: this assembly interpolates nodal values, and the '// &
-          'constitutive interface takes the result as pre-evaluated Props' )
     END IF
 
     BF => GetBodyForce()
@@ -2380,16 +2452,16 @@ CONTAINS
             'would be read and dropped' )
       END DO
 
-      ! A pressure-like body load, which StressSolve contracts with the divergence of
-      ! the test function. Not the same thing as "Stress Volume Source", which this
-      ! solver does read: that one feeds the constraint row of the mixed formulation.
-      IF ( ListCheckPrefix( BF, 'Stress Pressure' ) ) CALL Fatal( Caller, &
-          '"Stress Pressure" is not implemented here. Note it is not the mixed '// &
-          'formulation''s "Stress Volume Source", which this solver does read' )
+      ! "Stress Pressure" itself is implemented; only its imaginary half is not, and
+      ! that on its value like the rest of the harmonic channel.
+      IF ( ListCheckPresent( BF, 'Stress Pressure im' ) ) THEN
+        Imag(1:n) = GetReal( BF, 'Stress Pressure im', Found )
+        IF ( ANY( Imag(1:n) /= 0.0_dp ) ) CALL Fatal( Caller, &
+            'The imaginary part of a body force is not implemented here: this solver '// &
+            'assembles the real system only, so "Stress Pressure im" would be read '// &
+            'and dropped' )
+      END IF
 
-      IF ( ListCheckPresent( BF, 'Stress Bodyforce at IP' ) ) CALL Fatal( Caller, &
-          '"Stress Bodyforce at IP" is not implemented here: the body force is '// &
-          'interpolated from nodal values' )
     END IF
 !------------------------------------------------------------------------------
   END SUBROUTINE RefuseStressSolveKeywords
@@ -3192,7 +3264,9 @@ CONTAINS
        Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
        LargeDeflection, NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
        MaxwellHere, NodalViscosity, PrevLocalDispl, GotGPA, NodalGPA, &
-       GeometricActive, StabilityAnalysis )
+       GeometricActive, StabilityAnalysis, QuasiStationary, &
+       GotPressureLoad, NodalPressureLoad, &
+       EvalYoungIP, EvalPoissonIP, EvalBetaIP, EvalLoadIP )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
@@ -3206,7 +3280,14 @@ CONTAINS
     LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli, LargeDeflection
     LOGICAL :: LinearIncompressible
     LOGICAL :: MaxwellHere, GotGPA
-    LOGICAL :: GeometricActive, StabilityAnalysis
+    LOGICAL :: GeometricActive, StabilityAnalysis, QuasiStationary, GotPressureLoad
+    LOGICAL :: EvalYoungIP, EvalPoissonIP, EvalBetaIP, EvalLoadIP
+    ! For the integration point reads, whose Found flag nothing here acts on: a
+    ! keyword asked for at the points and absent gives zero, as it does at the nodes.
+    LOGICAL :: Found
+    ! Whether the inertial term is actually dropped at this element -- see the mass.
+    LOGICAL :: QuasiActive
+    REAL(KIND=dp) :: NodalPressureLoad(:)
     REAL(KIND=dp) :: NodalViscosity(:), PrevLocalDispl(:,:), NodalGPA(:)
 
     TYPE(Element_t) :: Element
@@ -3243,7 +3324,8 @@ CONTAINS
     REAL(KIND=dp) :: NodalVelo(3,ntot)
     INTEGER :: VeBase, VeIdx, nIP
     ! rho*g at this point, for the gravitational prestress advection term.
-    REAL(KIND=dp) :: GPAatIP
+    REAL(KIND=dp) :: GPAatIP, PressureLoadAtIP
+    REAL(KIND=dp) :: YoungAtIP, PoissonAtIP
     ! The stress the geometric stiffness is built from -- the constitutive response
     ! of the current iterate, before any relaxation or affine offset, which is the
     ! stress StressSolve's own separate LocalStress call for this term returns.
@@ -3480,6 +3562,15 @@ CONTAINS
           InertialForce(i) = SUM( InertialLoad(i,1:n)*Basis(1:n) )
        END DO
 
+       ! "Stress Bodyforce at IP": the same load, asked for at this point rather than
+       ! interpolated from the nodes. The inertial load is not part of the keyword and
+       ! stays nodal, as it is there.
+       IF ( EvalLoadIP ) THEN
+          DO i=1,cdim
+             Force(i) = ListGetElementReal( LoadIP_h(i), Basis, GetCurrentElement(), Found, GaussPoint=t )
+          END DO
+       END IF
+
        ! Density and damping are properties of the material and not of whether it
        ! happens to be isotropic, and the mass and damping matrices below are
        ! assembled outside that branch. Interpolated here, in the common part, for
@@ -3500,6 +3591,17 @@ CONTAINS
        GPAatIP = 0.0_dp
        IF ( GotGPA ) GPAatIP = SUM( NodalGPA(1:n)*Basis(1:n) )
 
+       ! The pressure-like body load, likewise -- and it travels with the body force
+       ! when that is asked for at the integration points, which is where StressSolve
+       ! reads it too: one keyword governs the four components together.
+       PressureLoadAtIP = 0.0_dp
+       IF ( EvalLoadIP ) THEN
+          PressureLoadAtIP = ListGetElementReal( LoadIP_h(4), Basis, GetCurrentElement(), Found, &
+              GaussPoint=t )
+       ELSE IF ( GotPressureLoad ) THEN
+          PressureLoadAtIP = SUM( NodalPressureLoad(1:n)*Basis(1:n) )
+       END IF
+
        ! The thermal state at this point. NodalTemperature is already the
        ! DIFFERENCE from the reference temperature, taken where it is gathered.
        IF ( NeedHeat ) THEN
@@ -3509,6 +3611,17 @@ CONTAINS
                 HeatExpansion(i,j) = SUM( NodalHeatExpansion(i,j,1:n)*Basis(1:n) )
              END DO
           END DO
+
+          ! At the integration point instead, and on the DIAGONAL only -- which is all
+          ! either solver reads of this coefficient, and all StressSolve fills from the
+          ! same handle.
+          IF ( EvalBetaIP ) THEN
+             HeatExpansion = 0.0_dp
+             DO i=1,3
+                HeatExpansion(i,i) = ListGetElementReal( BetaIP_h, Basis, GetCurrentElement(), &
+                    Found, GaussPoint=t )
+             END DO
+          END IF
        END IF
 
        !------------------------------------------------------------------------
@@ -3532,6 +3645,43 @@ CONTAINS
           !------------------------------------------------
           Lame1 = SUM( NodalLame1(1:n)*Basis(1:n) )
           Lame2 = SUM( NodalLame2(1:n)*Basis(1:n) )
+
+          !--------------------------------------------------------------------
+          ! Material data given AT this integration point. Only the SOURCE of the
+          ! two numbers changes: the Lame parameters follow from Young and Poisson
+          ! by the same formulas as the nodal path above, plane stress and the
+          ! incompressible override included, which is why they are rebuilt here
+          ! rather than a second convention being introduced.
+          !
+          ! Either keyword may be given alone, so whichever is not asked for at the
+          ! point is interpolated from the nodes as before.
+          !--------------------------------------------------------------------
+          IF ( EvalYoungIP .OR. EvalPoissonIP ) THEN
+             IF ( EvalYoungIP ) THEN
+                YoungAtIP = ListGetElementReal( YoungIP_h, Basis, GetCurrentElement(), Found, GaussPoint=t )
+             ELSE
+                YoungAtIP = SUM( ElasticModulus(1,1,1:n)*Basis(1:n) )
+             END IF
+
+             IF ( EvalPoissonIP ) THEN
+                PoissonAtIP = ListGetElementReal( PoissonIP_h, Basis, GetCurrentElement(), Found, GaussPoint=t )
+             ELSE
+                PoissonAtIP = SUM( NodalPoisson(1:n)*Basis(1:n) )
+             END IF
+
+             IF ( PlaneStress ) THEN
+                Lame1 = YoungAtIP * PoissonAtIP / ( 1.0d0 - PoissonAtIP**2 )
+             ELSE
+                Lame1 = YoungAtIP * PoissonAtIP / &
+                    ( (1.0d0 + PoissonAtIP) * (1.0d0 - 2.0d0*PoissonAtIP) )
+             END IF
+             Lame2 = YoungAtIP / ( 2.0d0 * (1.0d0 + PoissonAtIP) )
+
+             IF ( LinearIncompressible ) THEN
+                Lame1 = 0.0d0
+                Lame2 = YoungAtIP / 3.0d0
+             END IF
+          END IF
 
           MatProps(ISOLIN_LAME1) = Lame1
           MatProps(ISOLIN_LAME2) = Lame2
@@ -3876,6 +4026,7 @@ CONTAINS
                 ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
                      +Basis(p)*InertialForce(i)*Density &
+                     +PressureLoadAtIP*dBasisdx(p,i) &
                      -DDOTPROD(dDefG,Stress1,dim) &
                      +DDOTPROD(dDefG,dStress1U,dim))*s
 
@@ -3901,6 +4052,7 @@ CONTAINS
                 ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
                      +Basis(p)*InertialForce(i)*Density &
+                     +PressureLoadAtIP*dBasisdx(p,i) &
                      -DOT_PRODUCT(dBasisdx(p,:),Stress1(i,:)) &
                      +DOT_PRODUCT(dBasisdx(p,:),dStress1U(i,:)))*s
 
@@ -3990,7 +4142,15 @@ CONTAINS
        ! Not under stability analysis: there the mass slot carries the geometric
        ! stiffness instead, and a density mass added to it would turn the buckling
        ! eigenproblem into something that is neither buckling nor vibration.
-       IF ( .NOT. StabilityAnalysis ) THEN
+       !
+       ! Nor under "Quasi Stationary", which asks for the transient run without its
+       ! inertial term. StressSolve conflates the two matrices in that one flag --
+       ! it clears NeedMass from the keyword and then lets any damping present set it
+       ! again, which restores BOTH -- so the test here is the one it makes, on this
+       ! element's own nodal damping rather than on the keyword being mentioned.
+       QuasiActive = QuasiStationary .AND. .NOT. ANY( NodalDamping(1:n) /= 0.0_dp )
+
+       IF ( .NOT. ( StabilityAnalysis .OR. QuasiActive ) ) THEN
          DO p = 1,ntot
            DO q = 1,ntot
              DO i = 1,cdim
@@ -4038,7 +4198,7 @@ CONTAINS
 
        !      Utilize the nodal damping:
        !      -----------------------------
-       IF( GotDamping ) THEN
+       IF( GotDamping .AND. .NOT. QuasiActive ) THEN
          DO p = 1,ntot
            DO q = 1,ntot
              DO i = 1,cdim
@@ -5017,6 +5177,9 @@ CONTAINS
     REAL(KIND=dp) :: TempAtIp
     ! The pressure unknown of the linear mixed formulation at the integration point.
     REAL(KIND=dp) :: Pressure
+    ! Material data read at the integration point rather than interpolated.
+    LOGICAL :: EvalYoungIP, EvalPoissonIP, EvalBetaIP
+    REAL(KIND=dp) :: YoungAtIP, PoissonAtIP
     LOGICAL :: NeedHeat
     ! The plane stress out-of-plane strain coefficients, filled by the condensation
     ! and meaningful only under plane stress. See CondensePlaneElasticityMatrix.
@@ -5141,10 +5304,18 @@ CONTAINS
           Isotropic = .TRUE.
           ElasticModulus(1,1,1:n) = ListGetReal( Material, &
                'Youngs Modulus', n, Indices, Found )
+       ELSE IF ( GetLogical( Material, 'Youngs Modulus at IP', Found ) ) THEN
+          ! At the integration points, so not readable at the nodes at all -- and
+          ! isotropy assumed with it, as in the assembly and as in StressSolve.
+          ElasticModulus = 0.0_dp
+          Isotropic = .TRUE.
        ELSE
           CALL InputTensor( ElasticModulus, Isotropic, &
                'Youngs Modulus', Material, n, Indices )
        END IF
+       EvalYoungIP = GetLogical( Material, 'Youngs Modulus at IP', Found )
+       EvalPoissonIP = GetLogical( Material, 'Poisson Ratio at IP', Found )
+       EvalBetaIP = GetLogical( Material, 'Heat Expansion Coefficient IP', Found )
 
        ! Selected per element rather than per integration point, since the choice
        ! turns on which keywords the material and solver gave and not on position.
@@ -5201,7 +5372,8 @@ CONTAINS
        ! while undefined. Defined here instead, which changes no outcome.
        PlaneStress = .FALSE.
        IF (Isotropic) THEN
-          PoissonRatio(1:n) = ListGetReal( Material, 'Poisson Ratio', n, Indices )
+          IF ( .NOT. EvalPoissonIP ) &
+              PoissonRatio(1:n) = ListGetReal( Material, 'Poisson Ratio', n, Indices )
           IF (MixedFormulation) THEN
             NodalLame1(1:n) = 0.0d0
             PlaneStress = .FALSE.
@@ -5394,6 +5566,37 @@ CONTAINS
              MatProps(NEOHOOKE_LAME1) = Lame1
              MatProps(NEOHOOKE_LAME2) = Lame2
           ELSE IF ( Isotropic ) THEN
+             ! The same rebuilding as the assembly does when the data lives at the
+             ! points: only the source of the two numbers differs, so the formulas are
+             ! the ones above rather than a second convention.
+             IF ( EvalYoungIP .OR. EvalPoissonIP ) THEN
+                IF ( EvalYoungIP ) THEN
+                   YoungAtIP = ListGetElementReal( YoungIP_h, Basis, GetCurrentElement(), &
+                          Found, GaussPoint=t )
+                ELSE
+                   YoungAtIP = SUM( ElasticModulus(1,1,1:n)*Basis(1:n) )
+                END IF
+                IF ( EvalPoissonIP ) THEN
+                   PoissonAtIP = ListGetElementReal( PoissonIP_h, Basis, GetCurrentElement(), &
+                          Found, GaussPoint=t )
+                ELSE
+                   PoissonAtIP = SUM( PoissonRatio(1:n)*Basis(1:n) )
+                END IF
+
+                IF ( PlaneStress ) THEN
+                   Lame1 = YoungAtIP * PoissonAtIP / ( 1.0d0 - PoissonAtIP**2 )
+                ELSE
+                   Lame1 = YoungAtIP * PoissonAtIP / &
+                          ( (1.0d0 + PoissonAtIP) * (1.0d0 - 2.0d0*PoissonAtIP) )
+                END IF
+                Lame2 = YoungAtIP / ( 2.0d0 * (1.0d0 + PoissonAtIP) )
+                nu = PoissonAtIP
+
+                IF ( LinearIncompressible ) THEN
+                   Lame1 = 0.0d0
+                   Lame2 = YoungAtIP / 3.0d0
+                END IF
+             END IF
              MatProps(ISOLIN_LAME1) = Lame1
              MatProps(ISOLIN_LAME2) = Lame2
           ELSE
