@@ -378,6 +378,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
   LOGICAL :: CalcPrincipalStress, CalcPrincipalStrain
   LOGICAL :: AllocationsDone = .FALSE., HarmonicAnalysis
+  ! Whether the SAVEd per-element storage has to be (re)allocated for THIS call.
+  LOGICAL :: Realloc
   LOGICAL :: ConstantBulkMatrix, ConstantBulkSystem, ConstantSystem
   LOGICAL :: ConstantBulkMatrixInUse
   LOGICAL :: CompressibilityDefined = .FALSE.
@@ -727,9 +729,29 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   !------------------------------------------------------------------------------
   !     Allocate some permanent storage, this is done first time only
   !------------------------------------------------------------------------------
-  IF ( .NOT. AllocationsDone .OR. Solver % MeshChanged ) THEN
-     N = Mesh % MaxElementDOFs
+  N = Mesh % MaxElementDOFs
 
+  !----------------------------------------------------------------------------
+  ! The storage below is SAVEd, so it is shared by every ElasticSolve instance in
+  ! the sif and was sized by whichever of them ran first. A second instance with
+  ! more degrees of freedom per node -- one under a mixed formulation beside a
+  ! plain one -- would index arrays sized for the other. So the guard asks whether
+  ! what is there is big enough for THIS instance, and not merely whether somebody
+  ! allocated something once.
+  !
+  ! Grown and never shrunk: an instance that finds the arrays larger than it asked
+  ! for leaves them alone, which keeps the one that allocated them safe. LocalForce
+  ! carries both factors, STDOFs and the element's degrees of freedom, so it is the
+  ! one to measure.
+  !
+  ! Two statements and not one expression, because Fortran does not promise to stop
+  ! evaluating an .OR. once it is decided, and SIZE of an unallocated array is not
+  ! a question with an answer.
+  !----------------------------------------------------------------------------
+  Realloc = .NOT. AllocationsDone .OR. Solver % MeshChanged
+  IF ( .NOT. Realloc ) Realloc = SIZE( LocalForce ) < STDOFs * N
+
+  IF ( Realloc ) THEN
      IF ( AllocationsDone ) THEN
         DEALLOCATE( &
              BoundaryDispl, &
@@ -836,23 +858,34 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
        InitializeStateVars = GetLogical(SolverParams, 'Initialize State Variables',GotIt)
      END IF
 
-     !----------------------------------------------------------------
-     ! Check whether strains and stresses are computed...
-     !----------------------------------------------------------------
-     CalculateStrains = GetLogical(SolverParams, 'Calculate Strains', GotIt )    
-     CalculateStresses = GetLogical(SolverParams, 'Calculate Stresses', GotIt ) 
-
-     IF (UseUMAT) THEN
-        ! Principal tensors are not yet available:
-        CalcPrincipal = .FALSE.
-        CalcPrincipalAngle = .FALSE.
-     ELSE
-        CalcPrincipal = GetLogical(SolverParams, 'Calculate Principal', GotIt )     
-        CalcPrincipalAngle = GetLogical(SolverParams, 'Calculate PAngle', GotIt )
-        ! Principal angle computation enforces component calculation:
-        IF (CalcPrincipalAngle) CalcPrincipal = .TRUE. 
-     END IF
      AllocationsDone = .TRUE.
+  END IF
+
+  !----------------------------------------------------------------------------
+  ! What this solver is asked to postprocess. Read on EVERY call, and outside the
+  ! allocation guard above, which is where these four used to sit -- so a second
+  ! ElasticSolve instance in the same sif never read its own keywords at all and
+  ! silently inherited the first one's, these variables being SAVEd as well.
+  !
+  ! The symptom was the familiar one: a first solver that does not ask for stresses
+  ! leaves CalculateStresses false, the second one asks and is not heard, and its
+  ! projected stress comes back a converged ZERO. Note that the size test on the
+  ! guard does not reach this -- two instances with the same STDOFs need no
+  ! reallocation, so the guard stays shut and the keywords would still go unread.
+  ! They are two defects in one place, and this is the half that was measured.
+  !----------------------------------------------------------------------------
+  CalculateStrains = GetLogical(SolverParams, 'Calculate Strains', GotIt )
+  CalculateStresses = GetLogical(SolverParams, 'Calculate Stresses', GotIt )
+
+  IF (UseUMAT) THEN
+     ! Principal tensors are not yet available:
+     CalcPrincipal = .FALSE.
+     CalcPrincipalAngle = .FALSE.
+  ELSE
+     CalcPrincipal = GetLogical(SolverParams, 'Calculate Principal', GotIt )
+     CalcPrincipalAngle = GetLogical(SolverParams, 'Calculate PAngle', GotIt )
+     ! Principal angle computation enforces component calculation:
+     IF (CalcPrincipalAngle) CalcPrincipal = .TRUE.
   END IF
 
   !---------------------------------------------------------------------------------------------------
