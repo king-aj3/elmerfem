@@ -447,7 +447,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! Gates for the refusal of StressSolve-only keywords: true when one is set
   ! somewhere in the model, so that the exact per-element test is paid for only
   ! then. See where they are assigned.
-  LOGICAL :: StressOnlyKeywords, StressLoadInBC
+  LOGICAL :: StressOnlyKeywords, StressLoadInBC, ImagLoadInBC
 
   ! Staged construction, "Update Reference Displacement": which bodies ask for it,
   ! and which of them are to have the solution copied into the reference at the end.
@@ -1125,6 +1125,30 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! logical per element, and only a sif that does set one pays for the precise
   ! per-element test in the assembly loop, where it Fatals on the first element.
   !-----------------------------------------------------------------------------
+  ! Two driver options of StressSolve's with no counterpart here. Both change the
+  ! answer rather than merely the work done, so neither may be read and dropped:
+  ! "Quasi Stationary" suppresses the inertial term of a transient run -- though
+  ! there it also conflates the mass with the damping, so what a sif asking for it
+  ! should get is not obvious enough to guess at -- and "Update Transient System"
+  ! decides whether a reused constant system is refreshed as the timestep changes.
+  IF ( ListCheckPresent( SolverParams, 'Quasi Stationary' ) ) CALL Fatal( Caller, &
+      '"Quasi Stationary" is not implemented here: it drops the inertial term from a '// &
+      'transient run, and in StressSolve the same flag governs the damping matrix too' )
+
+  ! StressSolve lets an Equation section name the temperature field it couples to.
+  ! This solver reads the variable called "Temperature" and nothing else, so the
+  ! keyword would silently point at a field that is never fetched. Implementing it
+  ! means a per-BODY lookup, since the Equation section is per body while this
+  ! solver's temperature pointer is taken once per call.
+  IF ( ListCheckPresentAnyEquation( Model, 'Temperature Name' ) ) CALL Fatal( Caller, &
+      '"Temperature Name" is not implemented here: this solver couples to the '// &
+      'variable named "Temperature"' )
+
+  IF ( ListCheckPresent( SolverParams, 'Update Transient System' ) ) CALL Fatal( Caller, &
+      '"Update Transient System" is not implemented here: this solver''s reuse of an '// &
+      'assembled system is governed by the "Constant Bulk Matrix", "Constant Bulk '// &
+      'System" and "Constant System" keywords instead' )
+
   ! Set anywhere in the model, in any material or body force? Then the assembly
   ! loop will test the lists this element actually uses. See the note above.
   StressOnlyKeywords = &
@@ -1133,11 +1157,22 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       ListCheckPresentAnyMaterial( Model, 'Youngs Modulus at IP' ) .OR. &
       ListCheckPresentAnyMaterial( Model, 'Poisson Ratio at IP' ) .OR. &
       ListCheckPresentAnyMaterial( Model, 'Heat Expansion Coefficient IP' ) .OR. &
-      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce at IP' )
+      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce at IP' ) .OR. &
+      ListCheckPrefixAnyMaterial( Model, 'Mesh Velocity' ) .OR. &
+      ListCheckPrefixAnyBodyForce( Model, 'Stress Pressure' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 1 im' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 2 im' ) .OR. &
+      ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce 3 im' )
 
   ! "Stress Load" is implemented as a body force here and not yet as a boundary
   ! condition, which StressSolve also reads it as. Gated the same way.
   StressLoadInBC = ListCheckPrefixAnyBC( Model, 'Stress Load' )
+
+  ! The imaginary half of a boundary load, gated the same way. Real system only here.
+  ImagLoadInBC = ListCheckPresentAnyBC( Model, 'Force 1 im' ) .OR. &
+      ListCheckPresentAnyBC( Model, 'Force 2 im' ) .OR. &
+      ListCheckPresentAnyBC( Model, 'Force 3 im' ) .OR. &
+      ListCheckPresentAnyBC( Model, 'Normal Force im' )
 
   !-----------------------------------------------------------------------------
   ! STAGED CONSTRUCTION -- "Update Reference Displacement" in a body force. The
@@ -1784,6 +1819,16 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                  'a boundary condition' )
            END IF
 
+           IF ( ImagLoadInBC ) THEN
+             IF ( ListCheckPresent( BC, 'Force 1 im' ) .OR. &
+                  ListCheckPresent( BC, 'Force 2 im' ) .OR. &
+                  ListCheckPresent( BC, 'Force 3 im' ) .OR. &
+                  ListCheckPresent( BC, 'Normal Force im' ) ) CALL Fatal( Caller, &
+                 'The imaginary part of a boundary load is not implemented here: this '// &
+                 'solver assembles the real system only, so "Force N im" and "Normal '// &
+                 'Force im" would be read and dropped' )
+           END IF
+
            GotFSIBC = GetLogical( BC, 'FSI BC', GotIt )
 
            IF ( .NOT. ( GotForceBC .OR. GotFSIBC .OR. GotSpring ) ) CYCLE
@@ -2291,6 +2336,12 @@ CONTAINS
           'StressSolve as a GEOMETRIC STIFFNESS and not as the additive stress '// &
           'that "Stress Load" / "Strain Load" give, which this solver does have' )
 
+      ! The mesh velocity of a moving-mesh advection term, which StressSolve carries
+      ! in its damping matrix. Group B in the plan document; no sif in the tree uses it.
+      IF ( ListCheckPrefix( Material, 'Mesh Velocity' ) ) CALL Fatal( Caller, &
+          '"Mesh Velocity" is not implemented here: StressSolve carries it as an '// &
+          'advection term in the damping matrix, which this assembly does not build' )
+
       IF ( ListCheckPresent( Material, 'Youngs Modulus at IP' ) .OR. &
            ListCheckPresent( Material, 'Poisson Ratio at IP' ) .OR. &
            ListCheckPresent( Material, 'Heat Expansion Coefficient IP' ) ) &
@@ -2301,6 +2352,23 @@ CONTAINS
 
     BF => GetBodyForce()
     IF ( ASSOCIATED( BF ) ) THEN
+      ! The imaginary half of a harmonic load. This solver assembles the real system
+      ! only, so an imaginary body force would be read and dropped -- and the two
+      ! harmonic tests that set one set it to zero, which is why nothing has noticed.
+      IF ( ListCheckPresent( BF, 'Stress Bodyforce 1 im' ) .OR. &
+           ListCheckPresent( BF, 'Stress Bodyforce 2 im' ) .OR. &
+           ListCheckPresent( BF, 'Stress Bodyforce 3 im' ) ) CALL Fatal( Caller, &
+          'The imaginary part of a body force is not implemented here: this solver '// &
+          'assembles the real system only, so "Stress Bodyforce N im" would be read '// &
+          'and dropped' )
+
+      ! A pressure-like body load, which StressSolve contracts with the divergence of
+      ! the test function. Not the same thing as "Stress Volume Source", which this
+      ! solver does read: that one feeds the constraint row of the mixed formulation.
+      IF ( ListCheckPrefix( BF, 'Stress Pressure' ) ) CALL Fatal( Caller, &
+          '"Stress Pressure" is not implemented here. Note it is not the mixed '// &
+          'formulation''s "Stress Volume Source", which this solver does read' )
+
       IF ( ListCheckPresent( BF, 'Stress Bodyforce at IP' ) ) CALL Fatal( Caller, &
           '"Stress Bodyforce at IP" is not implemented here: the body force is '// &
           'interpolated from nodal values' )
