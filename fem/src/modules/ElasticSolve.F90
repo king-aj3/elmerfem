@@ -70,7 +70,7 @@ END SUBROUTINE ElasticSolver_Init0
 SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
   USE DefUtils
-  USE StressLocal, ONLY: StressFieldDefinition
+  USE StressLocal, ONLY: StressFieldDefinition, SymTensorComponents
   IMPLICIT NONE
 
   TYPE(Model_t)  :: Model
@@ -81,6 +81,7 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
   TYPE(ValueList_t), POINTER :: SolverParams
   INTEGER :: dim, i, DOFs
   LOGICAL :: Found, AxialSymmetry, MixedFormulation
+  LOGICAL :: MaxwellMaterial
   LOGICAL :: CalculateStrains, CalculateStresses
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
   LOGICAL :: CalcPrincipalStress, CalcPrincipalStrain
@@ -119,10 +120,62 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
     CALL ListAddInteger( SolverParams, 'Variable DOFs', DOFs )
   END IF
 
+  !----------------------------------------------------------------------------
+  ! MAXWELL VISCOELASTICITY, set up exactly as StressSolve sets it up, because a
+  ! sif written for there has to mean the same thing here. Four of these are not
+  ! defaults but impositions, and they are what makes the scheme the scheme:
+  !
+  ! - the law relates a stress RATE to a strain rate, so the time integration is
+  !   first order and single step: BDF of order one. This is also why the keyword
+  !   above had to start honouring "Time derivative order" before this could work;
+  ! - the lag stress lives at the integration points, in an -ip variable whose
+  !   components are the independent ones of a symmetric tensor. Under axial
+  !   symmetry that is what makes room for the hoop component at all;
+  ! - at least two nonlinear iterations, since the lag stress is updated during the
+  !   assembly and the first pass therefore solves with a stress from the previous
+  !   step rather than this one;
+  ! - and the axisymmetric incompressible combination is refused, as it is there:
+  !   the pressure would reach the hoop equation both through the lag stress and
+  !   through the mixed formulation.
+  !
+  ! "Maxwell material" is accepted in the solver section as well as in a material,
+  ! and copied onto every material when it is given there -- again as StressSolve
+  ! does, since the assembly reads it per material.
+  !----------------------------------------------------------------------------
+  MaxwellMaterial = ListGetLogicalAnyMaterial( Model, 'Maxwell material' )
+  IF ( .NOT. MaxwellMaterial ) THEN
+    MaxwellMaterial = GetLogical( SolverParams, 'Maxwell material', Found )
+    IF ( MaxwellMaterial ) THEN
+      DO i=1,Model % NumberOfMaterials
+        CALL ListAddLogical( Model % Materials(i) % Values, 'Maxwell material', .TRUE. )
+      END DO
+    END IF
+  END IF
+
+  IF ( MaxwellMaterial ) THEN
+    CALL ListAddString( SolverParams, 'Timestepping Method', 'BDF' )
+    CALL ListAddInteger( SolverParams, 'BDF Order', 1 )
+    CALL ListAddInteger( SolverParams, 'Time derivative Order', 1 )
+
+    IF ( AxialSymmetry .AND. GetLogical( SolverParams, 'Incompressible', Found ) ) &
+        CALL Fatal( Caller, 'Maxwell material with "Incompressible" is not '// &
+        'supported in axisymmetric coordinates' )
+
+    CALL ListAddString( SolverParams, &
+        NextFreeKeyword('Exported Variable ',SolverParams), &
+        '-dofs '//I2S(SymTensorComponents(dim,AxialSymmetry))//' -ip ve_stress' )
+
+    i = GetInteger( SolverParams, 'Nonlinear System Min Iterations', Found )
+    CALL ListAddInteger( SolverParams, 'Nonlinear System Min Iterations', MAX(i,2) )
+    i = GetInteger( SolverParams, 'Nonlinear System Max Iterations', Found )
+    CALL ListAddInteger( SolverParams, 'Nonlinear System Max Iterations', MAX(i,2) )
+  END IF
+
   ! Second order in time is this solver's default, but let a sif ask for the first
   ! order transient StressSolve has always offered: it is the same keyword, and
   ! ListAddInteger would overwrite the value the user gave. The core reads it too
   ! (Solver % TimeOrder), so the assembly and the time history have to agree.
+  ! ListAddNew, so the order one that a Maxwell material just imposed survives.
   CALL ListAddNewInteger( SolverParams,'Time derivative order', 2 )
   CALL ListAddNewLogical( SolverParams,'Bubbles in Global System',.TRUE.)
   CALL ListAddNewLogical( SolverParams,'Displace Mesh At Init',.TRUE.)
@@ -307,6 +360,15 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! Either mixed formulation: all that the boundary assembly and the stress
   ! postprocessing need to know is that the local stride carries a pressure.
   LOGICAL :: PressureUnknown
+  ! Maxwell viscoelasticity: whether any material in the model asks for it, the
+  ! integration point lag stress it keeps its history in, and how many independent
+  ! components that tensor has in this configuration.
+  LOGICAL :: MaxwellMaterial, MaxwellHere
+  ! "Gravitational Prestress Advection": whether this element's body force asks for
+  ! the term, and the rho*g it is scaled by.
+  LOGICAL :: GotGPA
+  TYPE(Variable_t), POINTER :: VeStress => NULL()
+  INTEGER :: nve
   LOGICAL :: PseudoTraction, GlobalPseudoTraction
   LOGICAL :: PlaneStress, CalculateStrains, CalculateStresses
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
@@ -340,6 +402,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   REAL(KIND=dp), ALLOCATABLE :: LocalMassMatrix(:,:),LocalStiffMatrix(:,:),&
        LocalDampMatrix(:,:),LoadVector(:,:),InertialLoad(:,:), Viscosity(:), LocalForce(:), &
+       MaxwellViscosity(:), NodalGPA(:), &
        NodalStressLoad(:,:), NodalStrainLoad(:,:), &
        LocalTemperature(:),ElasticModulus(:,:,:),PoissonRatio(:), Density(:), &
        Damping(:), HeatExpansionCoeff(:,:,:),Alpha(:,:),Beta(:), &
@@ -392,6 +455,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   
 !------------------------------------------------------------------------------
   SAVE LocalMassMatrix,LocalStiffMatrix,LocalDampMatrix,LoadVector,InertialLoad, Viscosity, &
+       MaxwellViscosity, NodalGPA, &
        NodalStressLoad, NodalStrainLoad, Work, &
        LocalForce,ElementNodes,ParentNodes,FlowNodes,Alpha,Beta, &
        LocalTemperature,AllocationsDone,ReferenceTemperature,BoundaryDispl, &
@@ -584,6 +648,47 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   PressureUnknown = MixedFormulation .OR. LinearIncompressible
 
   !----------------------------------------------------------------------------
+  ! MAXWELL VISCOELASTICITY. The law is the linear one with its stiffness scaled
+  ! by xPhi = 1/(1 + mu/eta dt) and an additive stress offset carrying the lag
+  ! stress from the previous step -- so it is a RHEOLOGY around the existing
+  ! constitutive model rather than a new model, which is what §3's scouting said
+  ! and what makes it cheap. What it does need is per-integration-point history,
+  ! which is the "ve_stress" -ip variable that _Init exports, read as v0 and
+  ! written as v through MaterialState_t.
+  !
+  ! Read per material and not per solver, because that is where StressSolve reads
+  ! it and a body may be viscoelastic while its neighbour is not -- the model-wide
+  ! test here only decides whether any of the machinery is needed at all.
+  !----------------------------------------------------------------------------
+  MaxwellMaterial = ListGetLogicalAnyMaterial( Model, 'Maxwell material' )
+  IF ( MaxwellMaterial ) THEN
+    IF ( .NOT. TransientSimulation ) CALL Fatal( Caller, &
+        '"Maxwell material" is a rate law and needs a transient simulation' )
+    IF ( UseUMAT .OR. NeoHookeanMaterial ) CALL Fatal( Caller, &
+        '"Maxwell material" is implemented by LocalMatrix, so not with UMAT or the '// &
+        'neo-Hookean model -- a user routine or a finite strain law owns its own '// &
+        'rate behaviour' )
+
+    ! The lag stress at the integration points. Its component count is the number
+    ! of independent components of a symmetric tensor in this configuration, and
+    ! _Init sizes the variable by the same rule; if the two ever disagree the
+    ! indexing below would run into the neighbouring point, so say so instead.
+    VeStress => VariableGet( Mesh % Variables, 've_stress' )
+    IF ( .NOT. ASSOCIATED( VeStress ) ) CALL Fatal( Caller, &
+        '"Maxwell material" is set but the "ve_stress" variable is missing' )
+
+    nve = SymTensorComponents( dim, AxialSymmetry )
+    IF ( VeStress % DOFs /= nve ) CALL Fatal( Caller, &
+        'Variable "ve_stress" has '//I2S(VeStress % DOFs)//' components per point, '// &
+        'expected '//I2S(nve) )
+
+    IF ( .NOT. ASSOCIATED( VeStress % PrevValues ) ) THEN
+      ALLOCATE( VeStress % PrevValues( SIZE(VeStress % Values), 1 ) )
+      VeStress % PrevValues = 0.0_dp
+    END IF
+  END IF
+
+  !----------------------------------------------------------------------------
   ! The affine offset channel -- "Stress Load" and "Strain Load" -- is
   ! implemented by LocalMatrix and by neither of the other two assembly
   ! routines. Refused here rather than read and dropped: a keyword that is
@@ -630,7 +735,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
              Pressure, Velocity, &
              ElasticModulus, PoissonRatio, &
              Density, Damping, &
-             LocalForce, LocalExternalForce, Viscosity, &
+             LocalForce, LocalExternalForce, Viscosity, MaxwellViscosity, NodalGPA, &
              LocalMassMatrix,  &
              LocalStiffMatrix,  &
              LocalDampMatrix,  &
@@ -651,6 +756,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
           ElasticModulus( 6,6,N ), PoissonRatio( N ), &
           Density( N ), Damping( N ), &
           LocalForce( STDOFs*N ), LocalExternalForce( STDOFs*N ), Viscosity( N ), &
+          MaxwellViscosity( N ), NodalGPA( N ), &
           LocalMassMatrix(  STDOFs*N,STDOFs*N ),  &
           LocalStiffMatrix( STDOFs*N,STDOFs*N ),  &
           LocalDampMatrix( STDOFs*N,STDOFs*N ),  &
@@ -872,6 +978,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       '"Incompressible" is a small strain formulation: set "Large Deflection = False", '// &
       'or use the neo-Hookean mixed formulation for a finite strain one')
 
+  ! Maxwell likewise: StressSolve has no finite strain kinematics at all, so there is
+  ! nothing to reproduce and the lag stress would be pushed forward by a deformation
+  ! gradient the law knows nothing about.
+  IF ( MaxwellMaterial .AND. LargeDeflection ) CALL Fatal(Caller, &
+      '"Maxwell material" is implemented for small strain only, as in StressSolve: '// &
+      'set "Large Deflection = False"')
+
   !-----------------------------------------------------------------------------
   ! MODEL LUMPING: reduce the body to a 6x6 spring matrix for one boundary, by
   ! solving six load cases -- three translations and three rotations, imposed
@@ -936,20 +1049,14 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       'carries the geometric term through "Large Deflection" instead, where it is '// &
       'part of the tangent rather than an addition to a small strain analysis' )
 
-  IF ( ListCheckPresent( SolverParams, 'Maxwell material' ) ) CALL Fatal( Caller, &
-      '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
-      'per-integration-point history' )
-
   ! Set anywhere in the model, in any material or body force? Then the assembly
   ! loop will test the lists this element actually uses. See the note above.
   StressOnlyKeywords = &
-      ListCheckPresentAnyMaterial( Model, 'Maxwell material' ) .OR. &
       ListCheckPrefixAnyMaterial( Model, 'Pre Stress' ) .OR. &
       ListCheckPrefixAnyMaterial( Model, 'Pre Strain' ) .OR. &
       ListCheckPresentAnyMaterial( Model, 'Youngs Modulus at IP' ) .OR. &
       ListCheckPresentAnyMaterial( Model, 'Poisson Ratio at IP' ) .OR. &
       ListCheckPresentAnyMaterial( Model, 'Heat Expansion Coefficient IP' ) .OR. &
-      ListCheckPresentAnyBodyForce( Model, 'Gravitational Prestress Advection' ) .OR. &
       ListCheckPresentAnyBodyForce( Model, 'Stress Bodyforce at IP' )
 
   ! "Stress Load" is implemented as a body force here and not yet as a boundary
@@ -1061,7 +1168,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   GlobalPseudoTraction = GetLogical( SolverParams, 'Pseudo-Traction', GotIt)
 
 
-  ! If we need the previous timestep for UMAT, what is the step we need? 
+  ! If we need the previous timestep for UMAT, what is the step we need?
   previ = 0
   IF (UseUMAT) THEN
     IF( TransientSimulation ) THEN
@@ -1070,6 +1177,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       previ = 1
     END IF
   END IF
+  ! Maxwell needs it too, for the pressure of the previous step under the mixed
+  ! formulation and for the velocity a non-Newtonian viscosity is a function of.
+  ! Column one and not three: the second order transient keeps the displacement at
+  ! t-dt in the third, but a Maxwell material is integrated first order, where it
+  ! is the first -- which is also what GetVectorLocalSolution(tStep=-1) returns,
+  ! the call StressSolve makes for the same data.
+  IF ( MaxwellMaterial .AND. TransientSimulation ) previ = 1
   IF(previ > 0) THEN
     CALL Info('ElasticSolver','Taking previous displacement from PrevValues(:,'//I2S(previ)//')',Level=30)
   END IF
@@ -1266,6 +1380,24 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         
         Density(1:n) = GetReal( Material, 'Density', GotIt )
 
+        ! Viscoelasticity is a property of THIS element's material: a body may be
+        ! Maxwell while its neighbour is elastic, which is what the earth tests do.
+        ! MaxwellMaterial above only says whether anything in the model asks for it.
+        MaxwellHere = .FALSE.
+        IF( MaxwellMaterial ) THEN
+          MaxwellHere = GetLogical( Material, 'Maxwell material', GotIt )
+          IF( MaxwellHere ) THEN
+            MaxwellViscosity(1:n) = GetReal( Material, 'Viscosity', GotIt )
+            IF( .NOT. GotIt ) CALL Fatal( Caller, &
+                '"Maxwell material" needs a "Viscosity": without one the relaxation '// &
+                'time is zero and the stiffness vanishes' )
+            IF( .NOT. Isotropic ) CALL Fatal( Caller, &
+                '"Maxwell material" is implemented for an isotropic material only: '// &
+                'the relaxation needs a shear modulus, and an elasticity matrix does '// &
+                'not offer one' )
+          END IF
+        END IF
+
         IF( AnyDamping ) THEN
           Damping(1:n) = GetReal( Material, 'Damping' ,GotDamping )
           RayleighAlpha = GetCReal( Material, 'Rayleigh Damping alpha',GotRayleighAlpha )
@@ -1281,6 +1413,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         InertialLoad = 0.0D0
         NodalStressLoad = 0.0D0
         NodalStrainLoad = 0.0D0
+        GotGPA = .FALSE.
+        NodalGPA = 0.0D0
 
         IF ( ASSOCIATED(BodyForce) ) THEN
           IF( ListCheckPrefix(BodyForce,'Stress Bodyforce') ) THEN
@@ -1301,6 +1435,23 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
           IF( STDOFS > dim ) THEN
             LoadVector(STDOFs,1:n) = GetReal( BodyForce, 'Stress Volume Source', GotIt )
+          END IF
+
+          !----------------------------------------------------------------------
+          ! "Gravitational Prestress Advection": the restoring force that arises
+          ! when a body under its own weight is displaced vertically, so that a
+          ! column of material of density rho is advected through a gravity field g.
+          ! One term in the stiffness, coupling every momentum row to the VERTICAL
+          ! displacement, with rho*g given as "GPA Coeff". Read here and applied in
+          ! LocalMatrix; it is not a constitutive property and does not go near the
+          ! material model.
+          !----------------------------------------------------------------------
+          GotGPA = GetLogical( BodyForce, 'Gravitational Prestress Advection', GotIt )
+          IF( GotGPA ) THEN
+            NodalGPA(1:n) = GetReal( BodyForce, 'GPA Coeff', GotIt )
+            IF( .NOT. GotIt ) CALL Warn( Caller, &
+                '"Gravitational Prestress Advection" is set with no "GPA Coeff": '// &
+                'the term is then identically zero' )
           END IF
 
           !----------------------------------------------------------------------
@@ -1414,7 +1565,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 PoissonRatio,Density,Damping,AxialSymmetry,PlaneStress,HeatExpansionCoeff, &
                 LocalTemperature,CurrentElement,n,ntot,ElementNodes,LocalDisplacement, &
                 Isotropic, RotateModuli, TransformMatrix, LargeDeflection, &
-                NodalStressLoad, NodalStrainLoad, LinearIncompressible )
+                NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
+                MaxwellHere, MaxwellViscosity, PrevLocalDisplacement, GotGPA, NodalGPA )
           END IF
         END IF
 
@@ -2044,10 +2196,6 @@ CONTAINS
     LOGICAL :: Found
 !------------------------------------------------------------------------------
     IF ( ASSOCIATED( Material ) ) THEN
-      IF ( ListCheckPresent( Material, 'Maxwell material' ) ) CALL Fatal( Caller, &
-          '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
-          'per-integration-point history, which this assembly does not carry' )
-
       IF ( ListCheckPrefix( Material, 'Pre Stress' ) .OR. &
            ListCheckPrefix( Material, 'Pre Strain' ) ) CALL Fatal( Caller, &
           '"Pre Stress" / "Pre Strain" are not implemented here. They enter '// &
@@ -2064,10 +2212,6 @@ CONTAINS
 
     BF => GetBodyForce()
     IF ( ASSOCIATED( BF ) ) THEN
-      IF ( ListCheckPresent( BF, 'Gravitational Prestress Advection' ) ) &
-          CALL Fatal( Caller, '"Gravitational Prestress Advection" is not '// &
-          'implemented here' )
-
       IF ( ListCheckPresent( BF, 'Stress Bodyforce at IP' ) ) CALL Fatal( Caller, &
           '"Stress Bodyforce at IP" is not implemented here: the body force is '// &
           'interpolated from nodal values' )
@@ -2871,7 +3015,8 @@ CONTAINS
        LoadVector, InertialLoad, ElasticModulus, NodalPoisson, NodalDensity, NodalDamping, &
        AxialSymmetry,PlaneStress,NodalHeatExpansion, NodalTemperature, Element, n, ntot, &
        Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
-       LargeDeflection, NodalStressLoad, NodalStrainLoad, LinearIncompressible )
+       LargeDeflection, NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
+       MaxwellHere, NodalViscosity, PrevLocalDispl, GotGPA, NodalGPA )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
@@ -2884,6 +3029,8 @@ CONTAINS
 
     LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli, LargeDeflection
     LOGICAL :: LinearIncompressible
+    LOGICAL :: MaxwellHere, GotGPA
+    REAL(KIND=dp) :: NodalViscosity(:), PrevLocalDispl(:,:), NodalGPA(:)
 
     TYPE(Element_t) :: Element
     TYPE(Nodes_t) :: Nodes
@@ -2906,6 +3053,20 @@ CONTAINS
     ! the elastic law does not see. StressOffset is what the two collapse into.
     REAL(KIND=dp) :: StressLoad(6), StrainLoad(6), StressOffset(3,3), EigenStrain(3,3)
     LOGICAL :: GotOffset, GotVoigtLoad, NeedHeat
+
+    ! Maxwell viscoelasticity at this integration point. xPhi is the relaxation
+    ! factor 1/(1 + mu/eta dt) that scales the whole stiffness; LagStress is the
+    ! history read from the previous step and NewLagStress what replaces it;
+    ! ElasticStress is the UNRELAXED response, which the update needs and the
+    ! assembly does not. Pres/Pres0 are the mixed formulation's pressure now and at
+    ! the previous step, zero without it.
+    REAL(KIND=dp) :: xPhi, ShearModulus, MaxVisc, MuDer
+    REAL(KIND=dp) :: LagStress(3,3), NewLagStress(3,3), ElasticStress(3,3)
+    REAL(KIND=dp) :: LagVec(6), Pres, Pres0
+    REAL(KIND=dp) :: NodalVelo(3,ntot)
+    INTEGER :: VeBase, VeIdx, nIP
+    ! rho*g at this point, for the gravitational prestress advection term.
+    REAL(KIND=dp) :: GPAatIP
 
     REAL(KIND=dp) :: dDefG(3,3),dStress1(3,3)
     REAL(KIND=dp) :: dDefGU(3,3),dStrainU(3,3),dStress2U(3,3),dStress1U(3,3)
@@ -3067,7 +3228,7 @@ CONTAINS
                    ANY( NodalStrainLoad(1:6,1:n) /= 0.0_dp )
     NeedHeat = ANY( NodalTemperature(1:ntot) /= 0.0_dp ) .AND. &
                ANY( NodalHeatExpansion(1:3,1:3,1:n) /= 0.0_dp )
-    GotOffset = GotVoigtLoad .OR. NeedHeat
+    GotOffset = GotVoigtLoad .OR. NeedHeat .OR. MaxwellHere
 
     !-------------------------------------------------------
     !    Integration stuff
@@ -3079,6 +3240,38 @@ CONTAINS
     W_Integ => IntegStuff % w
     S_Integ => IntegStuff % s
     N_Integ =  IntegStuff % n
+
+    !--------------------------------------------------------------------------
+    ! MAXWELL: the element's slice of the integration point lag stress, and the
+    ! history this step is measured from.
+    !
+    ! The lag stress that CONVERGED at the end of the previous timestep is the
+    ! reference for the whole of this one, while the assembly overwrites the current
+    ! values as it goes. So it is saved once here, at the first nonlinear iteration
+    ! of the first coupled iteration, rather than tested for at every integration
+    ! point -- which is where StressSolve saves it too.
+    !
+    ! The velocity that a non-Newtonian viscosity is a function of is the
+    ! displacement increment over the step. Formed for the whole element here, as
+    ! StressSolve forms it, so EffectiveViscosity sees the same nodal field.
+    !--------------------------------------------------------------------------
+    IF ( MaxwellHere ) THEN
+       VeBase = VeStress % Perm( Element % ElementIndex )
+       nIP = VeStress % Perm( Element % ElementIndex + 1 ) - VeBase
+       IF ( nIP /= N_Integ ) CALL Fatal( Caller, 'Element '// &
+            I2S(Element % ElementIndex)//' integrates over '//I2S(N_Integ)// &
+            ' points but "ve_stress" was allocated '//I2S(nIP)//' of them' )
+
+       IF ( GetNonlinIter() == 1 .AND. GetCoupledIter() == 1 ) &
+            VeStress % PrevValues( nve*VeBase+1 : nve*(VeBase+nIP), 1 ) = &
+            VeStress % Values( nve*VeBase+1 : nve*(VeBase+nIP) )
+
+       NodalVelo = 0.0_dp
+       DO i=1,cdim
+          NodalVelo(i,1:ntot) = ( LocalDisplacement(i,1:ntot) - &
+               PrevLocalDispl(i,1:ntot) ) / dt
+       END DO
+    END IF
 
     DO t=1,N_Integ
 
@@ -3121,6 +3314,10 @@ CONTAINS
        ! local matrix; three runs of the same case NaNed twice.
        Density = SUM( NodalDensity(1:n)*Basis(1:n) )
        Damping = SUM( NodalDamping(1:n)*Basis(1:n) )
+
+       ! rho*g for the gravitational prestress advection, zero unless asked for.
+       GPAatIP = 0.0_dp
+       IF ( GotGPA ) GPAatIP = SUM( NodalGPA(1:n)*Basis(1:n) )
 
        ! The thermal state at this point. NodalTemperature is already the
        ! DIFFERENCE from the reference temperature, taken where it is gathered.
@@ -3282,6 +3479,49 @@ CONTAINS
           MatPoint % Strain = EigenStrain
           CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
           StressOffset = StressOffset - MatResponse % Stress
+
+          !-------------------------------------------------------------------
+          ! MAXWELL: the lag stress carried over from the previous step is an
+          ! additive stress too, so it goes through this same channel. The
+          ! relaxation factor is formed here because the offset needs it as well
+          ! as the stiffness does.
+          !
+          ! THE SIGN IS WHERE THE TWO SOLVERS PART, and it is not arbitrary:
+          ! StressSolve keeps the NEGATIVE of an additive offset in its own
+          ! StressLoad -- "StressLoad = MATMUL(C,StrainLoad) - StressLoad" is what
+          ! establishes that convention -- and adds it to the force vector, where
+          ! this assembly adds the offset to the stress and the residual then
+          ! subtracts it. So what goes in here is minus the tensor
+          ! ViscoElasticLoad hands back.
+          !-------------------------------------------------------------------
+          IF ( MaxwellHere ) THEN
+             MaxVisc = SUM( NodalViscosity(1:n) * Basis(1:n) )
+             MaxVisc = EffectiveViscosity( MaxVisc, Density, NodalVelo(1,:), &
+                  NodalVelo(2,:), NodalVelo(3,:), GetCurrentElement(), Nodes, &
+                  n, ntot, u, v, w, MuDer, LocalIP=t )
+
+             ! The shear modulus IS the second Lame parameter, in both
+             ! formulations: E/(2(1+nu)) where the ratio is read, and E/3 where the
+             ! incompressible branch set it above. StressSolve writes the two cases
+             ! out as separate expressions and they come to the same number.
+             ShearModulus = Lame2
+             xPhi = 1.0_dp / ( 1.0_dp + ShearModulus / MaxVisc * dt )
+
+             ! The mixed formulation's pressure now and at the previous step. Over
+             ! the corner nodes only, the pressure living on the lowest-order basis.
+             Pres = 0.0_dp
+             Pres0 = 0.0_dp
+             IF ( LinearIncompressible ) THEN
+                Pres  = SUM( Basis(1:n) * LocalDisplacement(DOFs,1:n) )
+                Pres0 = SUM( Basis(1:n) * PrevLocalDispl(DOFs,1:n) )
+             END IF
+
+             VeIdx = nve * ( VeBase + t - 1 )
+             CALL Vector62Tensor( VeStress % PrevValues(VeIdx+1:VeIdx+nve,1), &
+                  LagStress, cdim, AxialSymmetry )
+
+             StressOffset = StressOffset - xPhi * ( LagStress - Pres0*Identity )
+          END IF
        END IF
 
        !------------------------------------------------------------------
@@ -3340,9 +3580,34 @@ CONTAINS
        CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
        Stress2 = MatResponse % Stress
 
+       !----------------------------------------------------------------------
+       ! MAXWELL: the whole response is relaxed by xPhi. Scaling the STRESS rather
+       ! than the moduli the model was handed is what keeps the unrelaxed response
+       ! available -- the history update below needs C : eps itself, and dividing it
+       ! back out of a scaled stress would be both wasteful and inexact.
+       !----------------------------------------------------------------------
+       IF ( MaxwellHere ) THEN
+          ElasticStress = Stress2
+          Stress2 = xPhi * Stress2
+       END IF
+
        ! The affine offset, and the ONE place it may be added: the residual stress
        ! and nothing that a derivative is taken of. See where it is formed above.
        IF ( GotOffset ) Stress2 = Stress2 + StressOffset
+
+       !----------------------------------------------------------------------
+       ! MAXWELL: advance the lag stress at this point. Written into the variable's
+       ! current values, from which the next timestep's first iteration will save
+       ! the converged result as its own history -- so the last nonlinear iteration
+       ! to run is the one that counts, which is why the scheme asks for at least
+       ! two of them.
+       !----------------------------------------------------------------------
+       IF ( MaxwellHere ) THEN
+          NewLagStress = ( 1.0_dp - xPhi ) * ElasticStress + &
+               xPhi * ( LagStress - Pres0*Identity ) + Pres*Identity
+          CALL Tensor26Vector( NewLagStress, LagVec, cdim, AxialSymmetry )
+          VeStress % Values(VeIdx+1:VeIdx+nve) = LagVec(1:nve)
+       END IF
 
        !--------------------------------------------------
        ! The first Piola-Kirchhoff stress
@@ -3358,6 +3623,8 @@ CONTAINS
        MatPoint % Strain = dStrainU
        CALL MatModel % Stress( MatPoint, MatProps(1:nProps), MatState, MatResponse )
        dStress2U = MatResponse % Stress
+       ! Relaxed with the same factor as the stress it is the derivative of.
+       IF ( MaxwellHere ) dStress2U = xPhi * dStress2U
        dStress1U = MATMUL(DefG,dStress2U)
        IF (LargeDeflection) dStress1U = dStress1U + MATMUL(dDefGU,Stress2)
 
@@ -3401,6 +3668,11 @@ CONTAINS
        ! The adjoint of the tensor, not the tensor: see MatPropsT above.
        CALL ConstitutiveStresses( MatModel, MatPoint, MatPropsT(1:nProps), &
             MatState, cdim*ntot, dStrains, dStresses )
+
+       ! MAXWELL: the stiffness is relaxed by the same factor as the stress, which
+       ! is the whole of what the rheology does to the tangent -- the lag stress
+       ! enters the residual and not this.
+       IF ( MaxwellHere ) dStresses(:,:,1:cdim*ntot) = xPhi * dStresses(:,:,1:cdim*ntot)
 
        !----------------------------------------------------------------------------
        ! Loop over the test functions (stiffness matrix for Newton linearization):
@@ -3466,6 +3738,36 @@ CONTAINS
                 DO q = 1,ntot
                    StiffMatrix(DOFs*(p-1)+i,DOFs*q) = StiffMatrix(DOFs*(p-1)+i,DOFs*q) &
                         - Basis(q)*dBasisdx(p,i)*s
+                END DO
+             END IF
+
+             !--------------------------------------------------------------------
+             ! The gravitational prestress advection term: rho*g times the gradient
+             ! of the trial function against the test function's value, in the
+             ! column of the VERTICAL displacement -- the last coordinate component.
+             ! A stiffness and nothing else, so it needs no counterpart in the
+             ! residual: the two residual terms of this assembly cancel for a linear
+             ! law, leaving the load, and an addition to the matrix alone is
+             ! therefore exactly an addition to the operator.
+             !
+             ! ADDED AS ITS SYMMETRIC PART, which is not a modelling choice made
+             ! here but a reproduction of one made there. StressSolve symmetrises
+             ! its whole local stiffness wholesale before gluing it in --
+             ! "STIFF = (STIFF + TRANSPOSE(STIFF))/2" -- and every other term it
+             ! assembles is already symmetric, so the operator that reaches its
+             ! linear solver contains only the symmetric half of this one. Assembling
+             ! the term as written instead moves the earth cases 2.6%. The sifs
+             ! concerned also declare "Linear System Symmetric", so a non-symmetric
+             ! operator would not survive their solver either.
+             !--------------------------------------------------------------------
+             IF ( GotGPA ) THEN
+                DO q = 1,ntot
+                   StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+cdim) = &
+                        StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+cdim) &
+                        + 0.5_dp*GPAatIP*dBasisdx(q,i)*Basis(p)*s
+                   StiffMatrix(DOFs*(q-1)+cdim,DOFs*(p-1)+i) = &
+                        StiffMatrix(DOFs*(q-1)+cdim,DOFs*(p-1)+i) &
+                        + 0.5_dp*GPAatIP*dBasisdx(q,i)*Basis(p)*s
                 END DO
              END IF
           END DO
