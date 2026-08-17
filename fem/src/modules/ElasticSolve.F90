@@ -300,6 +300,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   LOGICAL :: UseUMAT, InitializeStateVars, HenckyStrain
   LOGICAL :: LargeDeflection
   LOGICAL :: MixedFormulation
+  ! "Incompressible": the LINEAR mixed formulation, a pressure unknown with the
+  ! div u = 0 constraint. Read per call and not SAVEd, like the rest of the
+  ! per-call state -- this solver can be entered while it is already running.
+  LOGICAL :: LinearIncompressible
+  ! Either mixed formulation: all that the boundary assembly and the stress
+  ! postprocessing need to know is that the local stride carries a pressure.
+  LOGICAL :: PressureUnknown
   LOGICAL :: PseudoTraction, GlobalPseudoTraction
   LOGICAL :: PlaneStress, CalculateStrains, CalculateStresses
   LOGICAL :: CalcPrincipalAngle, CalcPrincipal
@@ -532,7 +539,50 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       ListGetLogical( SolverParams, 'Mixed Formulation', GotIt )
   IF (MixedFormulation .AND. (STDOFs /= (dim + 1))) CALL Fatal(Caller, &
       'With mixed formulation variable DOFs should equal to space dimensions + 1')
-  
+
+  !----------------------------------------------------------------------------
+  ! "Incompressible" -- StressSolve's mixed formulation for a LINEAR material
+  ! that is truly incompressible. It is the small strain specialisation of what
+  ! "Mixed Formulation" does for the neo-Hookean law: the same pressure unknown
+  ! and the same lowest-order pressure basis, but the constraint is div u = 0
+  ! rather than a linearised det F = 1, so it belongs in LocalMatrix and not in
+  ! NeoHookeanLocalMatrix. The two keywords are therefore exclusive.
+  !
+  ! Note that this ignores "Poisson Ratio" and takes mu = E/3, which is what
+  ! StressSolve does: the ratio is not read as a value near 1/2, it is 1/2 by
+  ! construction and the volumetric part is carried by the pressure instead.
+  !
+  ! Only the tests whose data is to hand are made here. "Large Deflection" is read
+  ! further down, and plane stress and isotropy are per element, so they are
+  ! refused in the assembly loop where THIS element's equation and material are
+  ! known -- a migration sif with bodies through both solvers must not be refused
+  ! for what the other solver's bodies ask.
+  !----------------------------------------------------------------------------
+  LinearIncompressible = ListGetLogical( SolverParams, 'Incompressible', GotIt )
+  IF ( LinearIncompressible ) THEN
+    IF ( MixedFormulation .OR. NeoHookeanMaterial ) CALL Fatal(Caller, &
+        '"Incompressible" is the linear mixed formulation and cannot be combined '// &
+        'with the neo-Hookean one')
+    IF ( UseUMAT ) CALL Fatal(Caller, &
+        '"Incompressible" is implemented by LocalMatrix and not by the UMAT assembly')
+    IF ( STDOFs /= dim + 1 ) CALL Fatal(Caller, &
+        '"Incompressible" needs one more variable DOF than there are dimensions, '// &
+        'for the pressure: '//I2S(STDOFs)//' given for dim '//I2S(dim))
+    IF ( AxialSymmetry ) CALL Fatal(Caller, &
+        '"Incompressible" is not implemented under axial symmetry: the hoop term '// &
+        'reaches the constraint as well as the divergence, and StressSolve refuses '// &
+        'the same combination')
+    ! Accepted, not refused -- see the assembly loop for why -- but not in silence.
+    ! Once, rather than once per timestep: the Maxwell sifs this is here for run
+    ! twenty steps, and a warning repeated twenty times reads as noise.
+    IF ( Solver % DoneTime <= 1 .AND. &
+        ListGetLogicalAnyEquation( Model, 'Plane Stress' ) ) CALL Warn(Caller, &
+        '"Incompressible" overrides "Plane Stress": div u = 0 in the plane is the '// &
+        'plane strain constraint. StressSolve ignores the keyword here as well, '// &
+        'without saying so.')
+  END IF
+  PressureUnknown = MixedFormulation .OR. LinearIncompressible
+
   !----------------------------------------------------------------------------
   ! The affine offset channel -- "Stress Load" and "Strain Load" -- is
   ! implemented by LocalMatrix and by neither of the other two assembly
@@ -815,6 +865,13 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
 
   IF (.NOT. LargeDeflection) HenckyStrain = .FALSE.
 
+  ! The linear mixed formulation is a small strain one: its constraint is div u = 0
+  ! and the residual it rides assumes that one Newton step is exact, which holds
+  ! only while the kinematics are linear.
+  IF ( LinearIncompressible .AND. LargeDeflection ) CALL Fatal(Caller, &
+      '"Incompressible" is a small strain formulation: set "Large Deflection = False", '// &
+      'or use the neo-Hookean mixed formulation for a finite strain one')
+
   !-----------------------------------------------------------------------------
   ! MODEL LUMPING: reduce the body to a 6x6 spring matrix for one boundary, by
   ! solving six load cases -- three translations and three rotations, imposed
@@ -882,17 +939,6 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   IF ( ListCheckPresent( SolverParams, 'Maxwell material' ) ) CALL Fatal( Caller, &
       '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
       'per-integration-point history' )
-
-  ! StressSolve's own mixed formulation for a nearly incompressible LINEAR material,
-  ! solving for a pressure alongside the displacement. This solver has a mixed
-  ! formulation, but only for the neo-Hookean law ("Mixed Formulation" plus
-  ! "Neo-Hookean Material"), so the keyword would otherwise be read and dropped and
-  ! a compressible answer returned in silence. Every sif that sets it is a Maxwell
-  ! one, so this refusal and the one above will fall together.
-  IF ( ListCheckPresent( SolverParams, 'Incompressible' ) ) CALL Fatal( Caller, &
-      '"Incompressible" is not implemented here: the mixed formulation of this '// &
-      'solver is the neo-Hookean one, "Mixed Formulation" with '// &
-      '"Neo-Hookean Material"' )
 
   ! Set anywhere in the model, in any material or body force? Then the assembly
   ! loop will test the lists this element actually uses. See the note above.
@@ -1143,6 +1189,17 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         PlaneStress = GetLogical( Equation, 'Plane Stress', GotIt )
         PoissonRatio = 0.0d0
 
+        ! The constraint div u = 0 in two dimensions is the plane STRAIN statement, so
+        ! it contradicts plane stress -- where it is the out-of-plane strain that
+        ! preserves the volume. StressSolve resolves that by ignoring the keyword
+        ! outright: its mixed branch never consults it, and a sif setting both gets
+        ! the same answer as one setting neither, measured. Every Maxwell sif in the
+        ! tree sets both, so the combination has to be accepted rather than refused --
+        ! but said out loud, once, where StressSolve says nothing. Warned before the
+        ! loop; here the flag is only cleared, so the rest of the assembly and the
+        ! postprocessing agree about what is being solved.
+        IF ( LinearIncompressible ) PlaneStress = .FALSE.
+
         IF (UseUMAT) THEN
            CALL GetConstRealArray( Material, MaterialConstants, 'Material Constants', GotIt)
            IF ( SIZE(MaterialConstants,1) < NPROPS) &
@@ -1155,6 +1212,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
             ELSE
               CALL InputTensor( ElasticModulus, Isotropic, &
                    'Youngs Modulus', Material, n, NodeIndexes )
+
+              ! Isotropy is known only now, from this element's own material, which
+              ! is where the other half of the "Incompressible" refusal belongs.
+              IF ( LinearIncompressible .AND. .NOT. Isotropic ) CALL Fatal(Caller, &
+                  '"Incompressible" is implemented for an isotropic material only, as '// &
+                  'in StressSolve, which takes mu = E/3 rather than a matrix of moduli')
               !------------------------------------------------------------------------------
               ! Check whether the rotation transformation of elastic modulus is necessary...
               !------------------------------------------------------------------------------
@@ -1351,7 +1414,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 PoissonRatio,Density,Damping,AxialSymmetry,PlaneStress,HeatExpansionCoeff, &
                 LocalTemperature,CurrentElement,n,ntot,ElementNodes,LocalDisplacement, &
                 Isotropic, RotateModuli, TransformMatrix, LargeDeflection, &
-                NodalStressLoad, NodalStrainLoad )
+                NodalStressLoad, NodalStrainLoad, LinearIncompressible )
           END IF
         END IF
 
@@ -1587,7 +1650,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                CurrentElement, n, ntot, ParentElement, ParentElement % TYPE % NumberOfNodes, &
                nd, ParentNodes, FlowElement, FlowNOFNodes, FlowNodes, Velocity,  &
                Pressure, Viscosity, Density, CompressibilityDefined, AxialSymmetry, &
-               NormalTangential, PseudoTraction, MixedFormulation, LargeDeflection)
+               NormalTangential, PseudoTraction, PressureUnknown, LargeDeflection)
 
            IF (UseUmat .AND. Iter == 1) THEN
              ! ---------------------------------------------------------------------------
@@ -1853,7 +1916,7 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
               CALL ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, StressPerm, &
                    PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, NeoHookeanMaterial, &
                    CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, MixedFormulation, &
-                   LargeDeflection)
+                   LargeDeflection, LinearIncompressible)
            END IF
 
            IF ( EigenModes > 0 ) CALL ElasticityStoreEigenmode( Solver, Mesh, i, l == 2 )
@@ -2808,7 +2871,7 @@ CONTAINS
        LoadVector, InertialLoad, ElasticModulus, NodalPoisson, NodalDensity, NodalDamping, &
        AxialSymmetry,PlaneStress,NodalHeatExpansion, NodalTemperature, Element, n, ntot, &
        Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
-       LargeDeflection, NodalStressLoad, NodalStrainLoad )
+       LargeDeflection, NodalStressLoad, NodalStrainLoad, LinearIncompressible )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
@@ -2820,6 +2883,7 @@ CONTAINS
     REAL(KIND=dp), DIMENSION(:) :: ForceVector, NodalPoisson
 
     LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli, LargeDeflection
+    LOGICAL :: LinearIncompressible
 
     TYPE(Element_t) :: Element
     TYPE(Nodes_t) :: Nodes
@@ -2855,7 +2919,7 @@ CONTAINS
 
     REAL(KIND=dp) :: Temperature, HeatExpansion(3,3)
 
-    INTEGER :: i,j,k,l,p,q,t,dim,cdim
+    INTEGER :: i,j,k,l,p,q,t,dim,cdim,DOFs
 
     REAL(KIND=dp) :: s,u,v,w,r
 
@@ -2887,7 +2951,7 @@ CONTAINS
        dim = cdim
     END IF
 
-    IF (Isotropic) THEN 
+    IF (Isotropic) THEN
        IF ( PlaneStress ) THEN
           NodalLame1(1:n) = ElasticModulus(1,1,1:n) * NodalPoisson(1:n) /  &
                ( (1.0d0 - NodalPoisson(1:n)**2) )
@@ -2897,6 +2961,24 @@ CONTAINS
        END IF
 
        NodalLame2(1:n) = ElasticModulus(1,1,1:n)  / ( 2* (1.0d0 + NodalPoisson(1:n)) )
+    END IF
+
+    !-------------------------------------------------------------------------
+    ! The linear mixed formulation. The Poisson ratio is not read as a number
+    ! near 1/2: it IS 1/2, so lambda is dropped altogether and the pressure
+    ! unknown carries the volumetric part, while mu = E / (2(1+1/2)) = E/3.
+    ! That is what StressSolve's own "Incompressible" branch assembles, term for
+    ! term, and it is why the ratio in the material may be absent or absurd
+    ! without changing the answer.
+    !
+    ! DOFs is the stride of the local matrix, one more than the displacement
+    ! components, with the pressure last at each node.
+    !-------------------------------------------------------------------------
+    DOFs = cdim
+    IF ( LinearIncompressible ) THEN
+       DOFs = cdim + 1
+       NodalLame1(1:n) = 0.0d0
+       NodalLame2(1:n) = ElasticModulus(1,1,1:n) / 3.0d0
     END IF
 
 
@@ -3332,7 +3414,7 @@ CONTAINS
 
              IF (AxialSymmetry) THEN
 
-                ForceVector(cdim*(p-1)+i) = ForceVector(cdim*(p-1)+i) &
+                ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
                      +Basis(p)*InertialForce(i)*Density &
                      -DDOTPROD(dDefG,Stress1,dim) &
@@ -3343,13 +3425,13 @@ CONTAINS
                       SELECT CASE(j)
                       CASE(1)
                          ! (r, z, phi): the radial row, the r-z shear and the hoop.
-                         StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                              = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                         StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
+                              = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                               + (dBasisdx(q,1)*dStress1(1,1) + dBasisdx(q,2)*dStress1(1,2) &
                               + 1.0d0/r*Basis(q)*dStress1(3,3))*s
                       CASE(2)
-                         StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
-                              = StiffMatrix(cdim*(p-1)+i,cdim*(q-1)+j) &
+                         StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
+                              = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                               + (dBasisdx(q,1)*dStress1(2,1) + dBasisdx(q,2)*dStress1(2,2) ) * s
                       END SELECT
                    END DO
@@ -3357,7 +3439,7 @@ CONTAINS
 
              ELSE
 
-                ForceVector(dim*(p-1)+i) = ForceVector(dim*(p-1)+i) &
+                ForceVector(DOFs*(p-1)+i) = ForceVector(DOFs*(p-1)+i) &
                      +(Basis(p)*Force(i)*DetDefG &
                      +Basis(p)*InertialForce(i)*Density &
                      -DOT_PRODUCT(dBasisdx(p,:),Stress1(i,:)) &
@@ -3365,13 +3447,42 @@ CONTAINS
 
                 DO q = 1,ntot
                    DO j = 1,dim
-                      StiffMatrix(dim*(p-1)+i,dim*(q-1)+j) &
-                           = StiffMatrix(dim*(p-1)+i,dim*(q-1)+j) &
+                      StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
+                           = StiffMatrix(DOFs*(p-1)+i,DOFs*(q-1)+j) &
                            + DOT_PRODUCT(dBasisdx(q,:),dStress1(j,:))*s
                    END DO
                 END DO
              END IF
+
+             !--------------------------------------------------------------------
+             ! The pressure column of this momentum row: -p div v. The pressure is
+             ! NOT put into the stress here, the way the affine offset of "Stress
+             ! Load" is, because it is an UNKNOWN of the same system -- it has to
+             ! reach the matrix, not the residual, or the monolithic solve becomes
+             ! a Picard iteration on the pressure and the sifs that ask for one
+             ! nonlinear iteration would return a half-solved system.
+             !--------------------------------------------------------------------
+             IF ( LinearIncompressible ) THEN
+                DO q = 1,ntot
+                   StiffMatrix(DOFs*(p-1)+i,DOFs*q) = StiffMatrix(DOFs*(p-1)+i,DOFs*q) &
+                        - Basis(q)*dBasisdx(p,i)*s
+                END DO
+             END IF
           END DO
+
+          !-----------------------------------------------------------------------
+          ! The constraint equation, once per test function rather than per
+          ! component: -div u tested with the pressure basis. Its residual is
+          ! identically zero, so there is nothing to add to ForceVector.
+          !-----------------------------------------------------------------------
+          IF ( LinearIncompressible ) THEN
+             DO q = 1,ntot
+                DO j = 1,cdim
+                   StiffMatrix(DOFs*p,DOFs*(q-1)+j) = StiffMatrix(DOFs*p,DOFs*(q-1)+j) &
+                        - dBasisdx(q,j)*Basis(p)*s
+                END DO
+             END DO
+          END IF
        END DO
 
 
@@ -3380,8 +3491,8 @@ CONTAINS
        DO p = 1,ntot
          DO q = 1,ntot
            DO i = 1,cdim
-             MassMatrix(cdim*(p-1)+i,cdim*(q-1)+i) &
-                 = MassMatrix(cdim*(p-1)+i,cdim*(q-1)+i) &
+             MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
+                 = MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
                  + Basis(p)*Basis(q)*Density*s
            END DO
          END DO
@@ -3392,16 +3503,33 @@ CONTAINS
        IF( GotDamping ) THEN
          DO p = 1,ntot
            DO q = 1,ntot
-             DO i = 1,cdim               
-               DampMatrix(cdim*(p-1)+i,cdim*(q-1)+i) &
-                   = DampMatrix(cdim*(p-1)+i,cdim*(q-1)+i) &
+             DO i = 1,cdim
+               DampMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
+                   = DampMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
                    + Basis(p)*Basis(q)*Damping*s
              END DO
            END DO
          END DO
        END IF
-       
+
     END DO
+
+    !--------------------------------------------------------------------------
+    ! The pressure lives on the lowest-order basis only, so the bubble and other
+    ! higher-order pressure degrees of freedom are eliminated with a unit
+    ! diagonal -- the MINI element, and the same elimination StressSolve writes.
+    ! It is done after the integration loop because it clears whole rows and
+    ! columns, which an integration point may not do.
+    !--------------------------------------------------------------------------
+    IF ( LinearIncompressible ) THEN
+       DO p = n+1,ntot
+          i = DOFs*p
+          ForceVector(i)   = 0.0d0
+          StiffMatrix(i,:) = 0.0d0
+          StiffMatrix(:,i) = 0.0d0
+          StiffMatrix(i,i) = 1.0d0
+       END DO
+    END IF
 !------------------------------------------------------------------------------
   END SUBROUTINE LocalMatrix
 !------------------------------------------------------------------------------
@@ -4308,13 +4436,14 @@ CONTAINS
   SUBROUTINE ComputeStressAndStrain( Displacement, NodalStrain, NodalStress, VonMises, Perm, &
        PrincipalStress, PrincipalStrain, Tresca, PrincipalAngle, AxialSymmetry, &
        NeoHookeanMaterial, CalculateStrains, CalculateStresses, CalcPrincipal, &
-       CalcPrincipalAngle, MixedFormulation, LargeDeflection)
+       CalcPrincipalAngle, MixedFormulation, LargeDeflection, LinearIncompressible)
 !--------------------------------------------------------------------------------
     REAL(KIND=dp) :: Displacement(:), NodalStrain(:), NodalStress(:), VonMises(:), &
          PrincipalStress(:), PrincipalStrain(:), Tresca(:), PrincipalAngle(:) 
     INTEGER, POINTER :: Perm(:)
     LOGICAL :: CalculateStrains, CalculateStresses, CalcPrincipal, CalcPrincipalAngle, &
          NeoHookeanMaterial, AxialSymmetry, MixedFormulation, LargeDeflection
+    LOGICAL :: LinearIncompressible
 !--------------------------------------------------------------------------------
     TYPE(Solver_t), POINTER :: StSolver
     TYPE(Nodes_t) :: Nodes
@@ -4348,6 +4477,8 @@ CONTAINS
     ! The temperature difference at the integration point. Not called Temperature:
     ! that name belongs to the host's temperature FIELD, which this routine reads.
     REAL(KIND=dp) :: TempAtIp
+    ! The pressure unknown of the linear mixed formulation at the integration point.
+    REAL(KIND=dp) :: Pressure
     LOGICAL :: NeedHeat
     ! The plane stress out-of-plane strain coefficients, filled by the condensation
     ! and meaningful only under plane stress. See CondensePlaneElasticityMatrix.
@@ -4380,8 +4511,10 @@ CONTAINS
        dim = cdim
     END IF
 
-    IF (MixedFormulation) THEN
-      DOFs = cdim + 1 
+    ! Either mixed formulation puts the pressure last at each node, so the stride
+    ! is one more than the displacement components in both.
+    IF (MixedFormulation .OR. LinearIncompressible) THEN
+      DOFs = cdim + 1
     ELSE
       DOFs = cdim
     END IF
@@ -4551,6 +4684,17 @@ CONTAINS
             END IF
           END IF
           NodalLame2(1:n) = ElasticModulus(1,1,1:n)  / ( 2* (1.0d0 + PoissonRatio(1:n)) )
+
+          ! The linear mixed formulation, as in the assembly: the ratio is 1/2 by
+          ! construction rather than read, so lambda goes and mu is E/3. Set after
+          ! the branch above so that whatever the material said about the ratio is
+          ! overridden here too, and the reported stress follows the same law the
+          ! system was assembled from.
+          IF ( LinearIncompressible ) THEN
+            NodalLame1(1:n) = 0.0d0
+            NodalLame2(1:n) = ElasticModulus(1,1,1:n) / 3.0d0
+            PlaneStress = .FALSE.
+          END IF
        ELSE IF ( dim == 2 ) THEN
           ! An anisotropic material in the plane needs the assumption too, since it
           ! decides which out-of-plane component the condensation leaves to be
@@ -4722,6 +4866,21 @@ CONTAINS
           END IF
           CALL MatModel % Stress( MatPoint, MatProps, MatState, MatResponse )
           Stress2 = MatResponse % Stress
+
+          ! The linear mixed formulation's stress is sigma = 2 mu eps - p I, and the
+          ! pressure part is added here rather than inside the model for the same
+          ! reason the affine offset of "Stress Load" is: the assembly's tangent
+          ! calls the law on strain increments through the same MaterialPoint_t, so a
+          ! pressure carried in the model would enter the derivative as well. It is
+          ! the identity of the state of STRESS, so it is CDim-diagonal here just as
+          ! it is in the constraint the pressure came from.
+          IF ( LinearIncompressible ) THEN
+             Pressure = SUM( LocalDisplacement(DOFs,1:n) * Basis(1:n) )
+             DO i = 1,cdim
+                Stress2(i,i) = Stress2(i,i) - Pressure
+             END DO
+          END IF
+
           Stress =  1.0d0/DetDefG * MATMUL( MATMUL(DefG,Stress2), TRANSPOSE(DefG) )
 
           ! The plane strain counterpart of the recovery above: here it is the
