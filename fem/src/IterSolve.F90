@@ -908,8 +908,12 @@ END FUNCTION MaskedNorm
     ! local part straight to CRS_ComplexMatrixVectorMultiply, and the local ILU
     ! factorizes this same matrix, so both want the view built here just as in
     ! serial.
+    ! On by default. The view costs roughly 40% of the matrix on top of the
+    ! scalar form it is derived from, so "Linear System Block CRS = False"
+    ! turns it off where memory is tighter than time.
     BlockCRS = ComplexSystem
-    IF( BlockCRS ) BlockCRS = ListGetLogical( Params,'Linear System Block CRS', Found )
+    IF( BlockCRS ) BlockCRS = ListGetLogical( Params,'Linear System Block CRS', &
+        Found, DefValue = .TRUE. )
     IF( BlockCRS ) CALL CRS_BuildBlockCRS( A )
 
     IF ( .NOT. PRESENT(PrecF) ) THEN
@@ -1193,8 +1197,8 @@ END FUNCTION MaskedNorm
         ! A complex matrix is stored fourfold redundantly as 2N real rows of
         ! 2x2 blocks. Taking the product against a compact block view of it
         ! instead is worth roughly 1.8x on the product itself, at the cost of
-        ! carrying the view alongside the scalar form. Opt-in for now. The view
-        ! itself was built above, ahead of the preconditioner.
+        ! carrying the view alongside the scalar form. The view itself was
+        ! built above, ahead of the preconditioner.
         IF( BlockCRS ) THEN
           mvProc = AddrFunc( CRS_BlockComplexMatrixVectorProd )
         ELSE
