@@ -4236,6 +4236,15 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     INTEGER :: i,j,k,l,m,n,p,istat
     INTEGER, POINTER :: Cols(:),Rows(:),Diag(:)
     REAL(KIND=dp), POINTER ::  Values(:)
+    ! Scattering a row of A into the dense work row is the only place the
+    ! factorization touches A itself; everything below it already works on the
+    ! compact complex factors. Read the block view of A where one exists, which
+    ! is a contiguous walk over one COMPLEX per block rather than a strided one
+    ! over a fourfold redundant real array. The scalar path stays as the
+    ! fallback: the view is optional and the preconditioner cannot depend on it.
+    LOGICAL :: UseBlock
+    INTEGER, POINTER :: BCols(:),BRows(:)
+    COMPLEX(KIND=dp), POINTER :: CValues(:)
     COMPLEX(KIND=dp), POINTER :: ILUValues(:)
     INTEGER, POINTER :: ILUCols(:),ILURows(:),ILUDiag(:)
     TYPE(Matrix_t), POINTER :: A1
@@ -4259,6 +4268,18 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     ELSE
       CALL Info( 'CRS_ComplexIncompleteLU', 'Factorizing the primary matrix', Level=20 )
       Values => A % Values
+    END IF
+
+    ! The block view mirrors A % Values, so it may only stand in for the scalar
+    ! read when that is what is being factorized. Factorizing PrecValues has to
+    ! keep the scalar path.
+    UseBlock = ASSOCIATED( A % BCols ) .AND. ASSOCIATED( A % CValues ) .AND. &
+        .NOT. ASSOCIATED( A % PrecValues )
+    IF( UseBlock ) THEN
+      BRows   => A % BRows
+      BCols   => A % BCols
+      CValues => A % CValues
+      CALL Info( 'CRS_ComplexIncompleteLU', 'Reading rows from the block view', Level=20 )
     END IF
 
     IF ( .NOT.ASSOCIATED(A % CILUValues) ) THEN
@@ -4348,9 +4369,15 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
        ! Convert current row to full form for speed,
        ! only flagging the nonzero entries:
        ! -------------------------------------------
-       DO k = Rows(2*i-1), Rows(2*i)-1,2
-          T((Cols(k)+1)/2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
-       END DO
+       IF( UseBlock ) THEN
+          DO k = BRows(i), BRows(i+1)-1
+             T(BCols(k)) = CValues(k)
+          END DO
+       ELSE
+          DO k = Rows(2*i-1), Rows(2*i)-1,2
+             T((Cols(k)+1)/2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
+          END DO
+       END IF
 
        DO j=ILURows(i), ILUDiag(i)
           C(ILUCols(j)) = .TRUE.
@@ -4382,9 +4409,15 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
        ! Convert the row back to  CRS format:
        ! ------------------------------------
-       DO k = Rows(2*i-1), Rows(2*i)-1,2
-         T((Cols(k)+1)/2) =  0._dp
-       END DO
+       IF( UseBlock ) THEN
+         DO k = BRows(i), BRows(i+1)-1
+           T(BCols(k)) =  0._dp
+         END DO
+       ELSE
+         DO k = Rows(2*i-1), Rows(2*i)-1,2
+           T((Cols(k)+1)/2) =  0._dp
+         END DO
+       END IF
 
        DO k=ILURows(i), ILUDiag(i)
          ILUValues(k)  = S(ILUCols(k))
@@ -4406,9 +4439,15 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
          C(ILUCols(k)) = .TRUE.
        END DO
 
-       DO k = Rows(2*i-1), Rows(2*i)-1,2
-         S((Cols(k)+1)/2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
-       END DO
+       IF( UseBlock ) THEN
+         DO k = BRows(i), BRows(i+1)-1
+           S(BCols(k)) = CValues(k)
+         END DO
+       ELSE
+         DO k = Rows(2*i-1), Rows(2*i)-1,2
+           S((Cols(k)+1)/2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
+         END DO
+       END IF
 
        ! This is the factorization part for the current row:
        ! ---------------------------------------------------

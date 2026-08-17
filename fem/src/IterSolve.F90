@@ -543,6 +543,7 @@ END FUNCTION MaskedNorm
     LOGICAL :: ComponentwiseStopC, NormwiseStopC, RowEquilibration
     LOGICAL :: Condition,GotIt, Refactorize,Found,GotDiagFactor,Robust
     LOGICAL :: ComplexSystem, PseudoComplexSystem, DoFatal, LeftOriented
+    LOGICAL :: BlockCRS
     
     REAL(KIND=dp) :: ILUT_TOL, DiagFactor
 
@@ -898,6 +899,14 @@ END FUNCTION MaskedNorm
     END SELECT
 
     
+    ! Build the block view here rather than at the matvec selection further
+    ! down: the preconditioner is set up in between, and the complex ILU reads
+    ! the view when it is present. Refreshing it afterwards would have the
+    ! factorization see the values of the previous solve.
+    BlockCRS = ComplexSystem .AND. .NOT. PRESENT(MatvecF)
+    IF( BlockCRS ) BlockCRS = ListGetLogical( Params,'Linear System Block CRS', Found )
+    IF( BlockCRS ) CALL CRS_BuildBlockCRS( A )
+
     IF ( .NOT. PRESENT(PrecF) ) THEN
       str = ListGetString( Params, 'Linear System Preconditioning',gotit )
       IF ( .NOT.gotit ) str = 'none'
@@ -1179,9 +1188,9 @@ END FUNCTION MaskedNorm
         ! A complex matrix is stored fourfold redundantly as 2N real rows of
         ! 2x2 blocks. Taking the product against a compact block view of it
         ! instead is worth roughly 1.8x on the product itself, at the cost of
-        ! carrying the view alongside the scalar form. Opt-in for now.
-        IF( ListGetLogical( Params,'Linear System Block CRS', Found ) ) THEN
-          CALL CRS_BuildBlockCRS( A )
+        ! carrying the view alongside the scalar form. Opt-in for now. The view
+        ! itself was built above, ahead of the preconditioner.
+        IF( BlockCRS ) THEN
           mvProc = AddrFunc( CRS_BlockComplexMatrixVectorProd )
         ELSE
           mvProc = AddrFunc( CRS_ComplexMatrixVectorProd )
