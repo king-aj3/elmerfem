@@ -2979,7 +2979,16 @@ SUBROUTINE SParCMatrixVector( u, v, ipar )
   END DO
 
   ! Local SpMV (overlaps with MPI). This defines v, it does not add to it.
-  CALL CRS_ComplexMatrixVectorMultiply( InsideMatrix, u, v )
+  ! Where a block view of the local matrix has been built, take the product
+  ! against that instead: one contiguous COMPLEX per block rather than two
+  ! reals strided out of the fourfold redundant real form. Only the local part
+  ! benefits; the interface blocks above are BasicMatrix_t and keep their own
+  ! strided walk.
+  IF ( ASSOCIATED( InsideMatrix % BCols ) ) THEN
+    CALL CRS_BlockComplexMatrixVectorMultiply( InsideMatrix, u, v )
+  ELSE
+    CALL CRS_ComplexMatrixVectorMultiply( InsideMatrix, u, v )
+  END IF
 
   ! Wait for receives and accumulate into v through its real view
   CALL C_F_POINTER( C_LOC(v(1)), vr, [2*n] )

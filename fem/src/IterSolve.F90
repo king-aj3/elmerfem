@@ -903,7 +903,12 @@ END FUNCTION MaskedNorm
     ! down: the preconditioner is set up in between, and the complex ILU reads
     ! the view when it is present. Refreshing it afterwards would have the
     ! factorization see the values of the previous solve.
-    BlockCRS = ComplexSystem .AND. .NOT. PRESENT(MatvecF)
+    ! In parallel A is the SplittedMatrix InsideMatrix and MatvecF is present,
+    ! so the product below stays SParCMatrixVector -- but that routine hands the
+    ! local part straight to CRS_ComplexMatrixVectorMultiply, and the local ILU
+    ! factorizes this same matrix, so both want the view built here just as in
+    ! serial.
+    BlockCRS = ComplexSystem
     IF( BlockCRS ) BlockCRS = ListGetLogical( Params,'Linear System Block CRS', Found )
     IF( BlockCRS ) CALL CRS_BuildBlockCRS( A )
 
