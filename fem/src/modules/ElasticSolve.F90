@@ -1819,14 +1819,21 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                  'a boundary condition' )
            END IF
 
+           ! On the VALUE, not on the presence -- see the body force half for why.
            IF ( ImagLoadInBC ) THEN
-             IF ( ListCheckPresent( BC, 'Force 1 im' ) .OR. &
-                  ListCheckPresent( BC, 'Force 2 im' ) .OR. &
-                  ListCheckPresent( BC, 'Force 3 im' ) .OR. &
-                  ListCheckPresent( BC, 'Normal Force im' ) ) CALL Fatal( Caller, &
-                 'The imaginary part of a boundary load is not implemented here: this '// &
-                 'solver assembles the real system only, so "Force N im" and "Normal '// &
-                 'Force im" would be read and dropped' )
+             DO i = 1,4
+               IF ( i <= 3 ) THEN
+                 str = 'Force '//I2S(i)//' im'
+               ELSE
+                 str = 'Normal Force im'
+               END IF
+               IF ( .NOT. ListCheckPresent( BC, str ) ) CYCLE
+               Work(1,1,1:n) = GetReal( BC, str, GotIt )
+               IF ( ANY( Work(1,1,1:n) /= 0.0_dp ) ) CALL Fatal( Caller, &
+                   'The imaginary part of a boundary load is not implemented here: '// &
+                   'this solver assembles the real system only, so "'//TRIM(str)//'" '// &
+                   'would be read and dropped' )
+             END DO
            END IF
 
            GotFSIBC = GetLogical( BC, 'FSI BC', GotIt )
@@ -2328,6 +2335,10 @@ CONTAINS
 !------------------------------------------------------------------------------
     TYPE(ValueList_t), POINTER :: BF
     LOGICAL :: Found
+    ! For the value test on the imaginary load below. N is the host's
+    ! Mesh % MaxElementDOFs, so this covers any element.
+    REAL(KIND=dp) :: Imag(N)
+    INTEGER :: ic
 !------------------------------------------------------------------------------
     IF ( ASSOCIATED( Material ) ) THEN
       IF ( ListCheckPrefix( Material, 'Pre Stress' ) .OR. &
@@ -2353,14 +2364,21 @@ CONTAINS
     BF => GetBodyForce()
     IF ( ASSOCIATED( BF ) ) THEN
       ! The imaginary half of a harmonic load. This solver assembles the real system
-      ! only, so an imaginary body force would be read and dropped -- and the two
-      ! harmonic tests that set one set it to zero, which is why nothing has noticed.
-      IF ( ListCheckPresent( BF, 'Stress Bodyforce 1 im' ) .OR. &
-           ListCheckPresent( BF, 'Stress Bodyforce 2 im' ) .OR. &
-           ListCheckPresent( BF, 'Stress Bodyforce 3 im' ) ) CALL Fatal( Caller, &
-          'The imaginary part of a body force is not implemented here: this solver '// &
-          'assembles the real system only, so "Stress Bodyforce N im" would be read '// &
-          'and dropped' )
+      ! only, so an imaginary body force would be read and dropped.
+      !
+      ! Refused on its VALUE and not on its presence, which matters here rather than
+      ! being fastidious: HelmholtzStructure2 and 3 both declare
+      ! "Stress Bodyforce 1 im = Real 0.0", and a zero imaginary load is no load at
+      ! all -- nothing is dropped, so there is nothing to refuse. A refusal belongs on
+      ! what would be lost, not on what was mentioned.
+      DO ic = 1,3
+        IF ( .NOT. ListCheckPresent( BF, 'Stress Bodyforce '//I2S(ic)//' im' ) ) CYCLE
+        Imag(1:n) = GetReal( BF, 'Stress Bodyforce '//I2S(ic)//' im', Found )
+        IF ( ANY( Imag(1:n) /= 0.0_dp ) ) CALL Fatal( Caller, &
+            'The imaginary part of a body force is not implemented here: this solver '// &
+            'assembles the real system only, so "Stress Bodyforce '//I2S(ic)//' im" '// &
+            'would be read and dropped' )
+      END DO
 
       ! A pressure-like body load, which StressSolve contracts with the divergence of
       ! the test function. Not the same thing as "Stress Volume Source", which this

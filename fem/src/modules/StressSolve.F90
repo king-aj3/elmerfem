@@ -41,7 +41,205 @@
 !------------------------------------------------------------------------------
 !> Initialization for the primary solver: StressSolver. 
 !------------------------------------------------------------------------------
+!> THE FRONT.
+!>
+!> This solver's assembly has moved into ElasticSolve, which now contains it as a
+!> verified special case: with "Large Deflection = False" the two agree to round-off
+!> on every test of this one, the swap survey having been the instrument for saying
+!> so. What is left here is a front. It sets that kinematic default, carries the few
+!> keywords the two solvers spell differently, and hands the same Solver_t to
+!> ElasticSolve's entry points.
+!>
+!> The delegation goes through GetProcAddr and ExecSolver, which is how the core
+!> itself invokes a solver, so nothing links StressSolve.so against ElasticSolve.so
+!> and either can be rebuilt alone.
+!>
+!> Old sifs keep working unchanged, which is the whole point: a sif naming
+!> "StressSolve" "StressSolver", and one naming the built-in equation
+!> "Stress Analysis" that the core maps to the same pair, both arrive here.
+!>
+!> "Legacy Assembly = Logical True" in the solver section runs the old assembly
+!> instead, which is what makes the change reversible one sif at a time and lets the
+!> two be compared without rebuilding anything. The code it reaches is untouched.
+!------------------------------------------------------------------------------
+MODULE StressSolveFront
+  USE DefUtils
+  USE LoadMod, ONLY: ExecSolver
+  IMPLICIT NONE
+
+CONTAINS
+
+!------------------------------------------------------------------------------
+!> Whether this sif asks for the old assembly rather than the front.
+!------------------------------------------------------------------------------
+  FUNCTION LegacyAssembly( Solver ) RESULT( Legacy )
+    TYPE(Solver_t) :: Solver
+    LOGICAL :: Legacy, Found
+
+    Legacy = ListGetLogical( Solver % Values, 'Legacy Assembly', Found )
+  END FUNCTION LegacyAssembly
+
+!------------------------------------------------------------------------------
+!> Call one of ElasticSolve's entry points with this solver. The name is resolved
+!> at run time, as the core resolves any solver, so the two shared objects stay
+!> independent of one another.
+!------------------------------------------------------------------------------
+  SUBROUTINE DelegateToElasticSolve( Entry, Model, Solver, dt, Transient )
+    CHARACTER(LEN=*) :: Entry
+    TYPE(Model_t) :: Model
+    TYPE(Solver_t) :: Solver
+    REAL(KIND=dp) :: dt
+    LOGICAL :: Transient
+
+    TYPE(C_FUNPTR) :: Proc
+
+    Proc = GetProcAddr( 'ElasticSolve '//TRIM(Entry), abort = .FALSE. )
+    IF ( .NOT. C_ASSOCIATED( Proc ) ) CALL Fatal( 'StressSolver', &
+        'This solver is a front for ElasticSolve and "'//TRIM(Entry)//'" could not '// &
+        'be found. Is ElasticSolve.so installed beside StressSolve.so?' )
+
+    CALL ExecSolver( Proc, Model, Solver, dt, Transient )
+  END SUBROUTINE DelegateToElasticSolve
+
+!------------------------------------------------------------------------------
+!> The keywords the two solvers do not share, mapped once before ElasticSolve's own
+!> initialization reads them.
+!------------------------------------------------------------------------------
+  SUBROUTINE MapStressSolveKeywords( Solver )
+    TYPE(Solver_t) :: Solver
+
+    TYPE(ValueList_t), POINTER :: Params
+    LOGICAL :: Found
+
+    Params => Solver % Values
+
+    ! THE KINEMATICS, and the one mapping that decides whether any of the rest
+    ! matters: this solver is a small strain one and ElasticSolve defaults to finite
+    ! strain. ListAddNew rather than ListAdd, so a sif that asks for the geometrically
+    ! nonlinear kinematics through this front is taken at its word.
+    CALL ListAddNewLogical( Params, 'Large Deflection', .FALSE. )
+
+    ! The stress projection shares the "stress:" keyword namespace in both solvers,
+    ! and this is the one default the old initialization set for it.
+    CALL ListAddNewLogical( Params, 'stress: Linear System Save', .FALSE. )
+
+    ! Superseded rather than ported: the library computes the velocity of any
+    ! solver's own variable from "Calculate Velocity", so the solver level keyword
+    ! and its "Displacement Velocity" have no work left to do. Said out loud because
+    ! the variable NAME differs, which a sif may depend on.
+    IF ( ListGetLogical( Params, 'Calculate Velocities', Found ) ) CALL Warn( 'StressSolver', &
+        '"Calculate Velocities" is superseded by the library keyword '// &
+        '"Calculate Velocity", which computes the velocity of this solver''s own '// &
+        'variable. The variable is then named after it rather than '// &
+        '"Displacement Velocity".' )
+
+    ! The block preconditioner's Schur variable was set up here for a Maxwell
+    ! material only, and no sif in the tree combines the two. Warned rather than
+    ! carried, so that a sif which does combine them is not left wondering.
+    IF ( ListGetLogical( Params, 'Block Preconditioner', Found ) .AND. &
+        ListGetLogicalAnyMaterial( CurrentModel, 'Maxwell material' ) ) &
+        CALL Warn( 'StressSolver', 'The "elast schur" block preconditioner variable '// &
+        'this solver used to declare for a Maxwell material is not set up by the '// &
+        'front; declare "Block Matrix Schur Variable" in the sif if it is wanted.' )
+  END SUBROUTINE MapStressSolveKeywords
+
+END MODULE StressSolveFront
+
+
+!------------------------------------------------------------------------------
+!> The front's three entry points. Each either delegates or, when the sif asks for
+!> it, runs the old assembly it shares this file with.
+!------------------------------------------------------------------------------
 SUBROUTINE StressSolver_Init0( Model,Solver,dt,Transient )
+  USE StressSolveFront
+  IMPLICIT NONE
+  TYPE(Model_t)  :: Model
+  TYPE(Solver_t) :: Solver
+  REAL(KIND=dp) :: dt
+  LOGICAL :: Transient
+
+  INTERFACE
+    SUBROUTINE StressSolverLegacy_Init0( Model,Solver,dt,Transient )
+      USE Types
+      TYPE(Model_t)  :: Model
+      TYPE(Solver_t) :: Solver
+      REAL(KIND=dp) :: dt
+      LOGICAL :: Transient
+    END SUBROUTINE StressSolverLegacy_Init0
+  END INTERFACE
+
+  IF ( LegacyAssembly( Solver ) ) THEN
+    CALL StressSolverLegacy_Init0( Model, Solver, dt, Transient )
+    RETURN
+  END IF
+
+  CALL MapStressSolveKeywords( Solver )
+  CALL DelegateToElasticSolve( 'ElasticSolver_Init0', Model, Solver, dt, Transient )
+END SUBROUTINE StressSolver_Init0
+
+
+SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
+  USE StressSolveFront
+  IMPLICIT NONE
+  TYPE(Model_t)  :: Model
+  TYPE(Solver_t) :: Solver
+  REAL(KIND=dp) :: dt
+  LOGICAL :: Transient
+
+  INTERFACE
+    SUBROUTINE StressSolverLegacy_Init( Model,Solver,dt,Transient )
+      USE Types
+      TYPE(Model_t)  :: Model
+      TYPE(Solver_t) :: Solver
+      REAL(KIND=dp) :: dt
+      LOGICAL :: Transient
+    END SUBROUTINE StressSolverLegacy_Init
+  END INTERFACE
+
+  IF ( LegacyAssembly( Solver ) ) THEN
+    CALL StressSolverLegacy_Init( Model, Solver, dt, Transient )
+    RETURN
+  END IF
+
+  ! Also here, and not only in _Init0: a sif that names the built-in equation
+  ! "Stress Analysis" instead of a Procedure gets its Procedure keyword from the core
+  ! AFTER the _Init0 pass has been and gone, so _Init0 never runs for it. This is the
+  ! entry point both routes reach.
+  CALL MapStressSolveKeywords( Solver )
+  CALL DelegateToElasticSolve( 'ElasticSolver_Init', Model, Solver, dt, Transient )
+END SUBROUTINE StressSolver_Init
+
+
+SUBROUTINE StressSolver( Model,Solver,dt,Transient )
+  USE StressSolveFront
+  IMPLICIT NONE
+  TYPE(Model_t)  :: Model
+  TYPE(Solver_t) :: Solver
+  REAL(KIND=dp) :: dt
+  LOGICAL :: Transient
+
+  INTERFACE
+    SUBROUTINE StressSolverLegacy( Model,Solver,dt,Transient )
+      USE Types
+      TYPE(Model_t)  :: Model
+      TYPE(Solver_t) :: Solver
+      REAL(KIND=dp) :: dt
+      LOGICAL :: Transient
+    END SUBROUTINE StressSolverLegacy
+  END INTERFACE
+
+  IF ( LegacyAssembly( Solver ) ) THEN
+    CALL StressSolverLegacy( Model, Solver, dt, Transient )
+    RETURN
+  END IF
+
+  CALL MapStressSolveKeywords( Solver )
+  CALL DelegateToElasticSolve( 'ElasticSolver', Model, Solver, dt, Transient )
+END SUBROUTINE StressSolver
+
+
+!------------------------------------------------------------------------------
+SUBROUTINE StressSolverLegacy_Init0( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
     USE DefUtils
     IMPLICIT NONE
@@ -59,14 +257,14 @@ SUBROUTINE StressSolver_Init0( Model,Solver,dt,Transient )
     CALL ListAddLogical( SolverParams,'Solid Solver',.TRUE.)
     
 !------------------------------------------------------------------------------
-  END SUBROUTINE StressSolver_Init0
+  END SUBROUTINE StressSolverLegacy_Init0
 !------------------------------------------------------------------------------
 
 
 !------------------------------------------------------------------------------
 !> Initialization for the primary solver: StressSolver. 
 !------------------------------------------------------------------------------
-SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
+SUBROUTINE StressSolverLegacy_Init( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
     USE DefUtils
     USE StressLocal, ONLY: SymTensorComponents, StressFieldDefinition
@@ -220,7 +418,7 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
    
     
 !------------------------------------------------------------------------------
-  END SUBROUTINE StressSolver_Init
+  END SUBROUTINE StressSolverLegacy_Init
 !------------------------------------------------------------------------------
 
 
@@ -230,7 +428,7 @@ SUBROUTINE StressSolver_Init( Model,Solver,dt,Transient )
 !> various kinds of stresses may be computed. Also some basic features for
 !> model lumping and contact analysis exist.
 !------------------------------------------------------------------------------
-   SUBROUTINE StressSolver( Model,Solver,dt,Transient )
+   SUBROUTINE StressSolverLegacy( Model,Solver,dt,Transient )
 !------------------------------------------------------------------------------
 
     USE CoordinateSystems
@@ -1980,7 +2178,7 @@ CONTAINS
 !------------------------------------------------------------------------------
 
 
-  END SUBROUTINE StressSolver
+  END SUBROUTINE StressSolverLegacy
 !------------------------------------------------------------------------------
 
 
