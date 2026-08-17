@@ -119,7 +119,11 @@ SUBROUTINE ElasticSolver_Init( Model,Solver,dt,Transient )
     CALL ListAddInteger( SolverParams, 'Variable DOFs', DOFs )
   END IF
 
-  CALL ListAddInteger( SolverParams,'Time derivative order', 2 )
+  ! Second order in time is this solver's default, but let a sif ask for the first
+  ! order transient StressSolve has always offered: it is the same keyword, and
+  ! ListAddInteger would overwrite the value the user gave. The core reads it too
+  ! (Solver % TimeOrder), so the assembly and the time history have to agree.
+  CALL ListAddNewInteger( SolverParams,'Time derivative order', 2 )
   CALL ListAddNewLogical( SolverParams,'Bubbles in Global System',.TRUE.)
   CALL ListAddNewLogical( SolverParams,'Displace Mesh At Init',.TRUE.)
 
@@ -350,7 +354,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   REAL(KIND=dp), POINTER :: UmatEnergy0(:),UmatStress0(:), UmatState0(:)
   LOGICAL, ALLOCATABLE :: UmatInitDone(:)
   LOGICAL :: AnyDamping, GotDamping, GotRayleighAlpha, GotRayleighBeta, NeedMass
-  REAL(KIND=dp) :: RayleighAlpha, RayleighBeta  
+  REAL(KIND=dp) :: RayleighAlpha, RayleighBeta
+
+  ! "Time derivative order": whether the inertial term is integrated at all. Read
+  ! once per call rather than per element as StressSolve does, and deliberately not
+  ! SAVEd -- this solver can be entered while it is already running.
+  LOGICAL :: SecondOrderTime
   
   ! Model lumping: six load cases whose reactions become one 6x6 spring matrix for
   ! the boundary. State of the run, deliberately NOT in any SAVE list -- it has to
@@ -487,6 +496,16 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
     NeedMass = .FALSE.
   ELSE
     NeedMass = EigenOrHarmonicAnalysis() .OR. HarmonicAnalysis
+  END IF
+
+  ! Anything other than two means the first order transient: the mass matrix is
+  ! dropped and the damping matrix carries the time derivative, as in StressSolve.
+  ! Absent counts as two, so that a sif that never mentions the keyword keeps the
+  ! behaviour this solver has always had even if _Init did not run.
+  SecondOrderTime = .TRUE.
+  IF( TransientSimulation ) THEN
+    i = ListGetInteger( SolverParams,'Time derivative order', GotIt )
+    IF( GotIt ) SecondOrderTime = ( i == 2 )
   END IF
     
   
@@ -1342,8 +1361,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
         !        matrix and global RHS vector
         !------------------------------------------------------------------------------
         IF ( TransientSimulation ) THEN
-           CALL Default2ndOrderTime( LocalMassMatrix, LocalDampMatrix, &
-                LocalStiffMatrix, LocalForce )
+           IF( SecondOrderTime ) THEN
+             CALL Default2ndOrderTime( LocalMassMatrix, LocalDampMatrix, &
+                  LocalStiffMatrix, LocalForce )
+           ELSE
+             CALL Default1stOrderTime( LocalDampMatrix, LocalStiffMatrix, LocalForce )
+           END IF
         END IF
         !------------------------------------------------------------------------------
         !        Update global matrices from local matrices
@@ -1577,8 +1600,12 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
               LocalDampMatrix = 0._dp
               LocalMassMatrix = 0._dp
 
-              CALL Default2ndOrderTime( LocalMassMatrix, LocalDampMatrix, &
-                   LocalStiffMatrix, LocalForce )
+              IF( SecondOrderTime ) THEN
+                CALL Default2ndOrderTime( LocalMassMatrix, LocalDampMatrix, &
+                     LocalStiffMatrix, LocalForce )
+              ELSE
+                CALL Default1stOrderTime( LocalDampMatrix, LocalStiffMatrix, LocalForce )
+              END IF
            END IF
 
            CALL DefaultUpdateEquations( LocalStiffMatrix, LocalForce )              
