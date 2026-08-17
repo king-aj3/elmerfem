@@ -296,6 +296,12 @@ MODULE Types
     COMPLEX(KIND=dp),  POINTER :: CValues(:)=>NULL(),CILUValues(:)=>NULL()
     COMPLEX(KIND=dp),  POINTER :: CMassValues(:)=>NULL(),CDampValues(:)=>NULL()
 
+!   Optional block CRS view of a complex matrix: NumberOfRows/2 block rows and
+!   one COMPLEX coefficient per 2x2 [Re -Im; Im Re] block, in BRows/BCols and
+!   the CValues slot above. Built on demand by CRS_BuildBlockCRS, used by
+!   CRS_BlockComplexMatrixVectorMultiply. Not present unless asked for.
+    INTEGER, POINTER :: BRows(:)=>NULL(), BCols(:)=>NULL()
+
 ! For Flux Corrected Transport 
     REAL(KIND=dp), POINTER :: FCT_D(:) => NULL()
     REAL(KIND=dp), POINTER :: MassValuesLumped(:) => NULL()

@@ -153,6 +153,10 @@ CONTAINS
      IF ( ASSOCIATED( Matrix % CValues ) )     DEALLOCATE( Matrix % CValues )
      IF ( ASSOCIATED( Matrix % CILUValues ) )  DEALLOCATE( Matrix % CILUValues )
 
+     ! Block CRS view, if one was built alongside the scalar form
+     IF ( ASSOCIATED( Matrix % BRows ) )       DEALLOCATE( Matrix % BRows )
+     IF ( ASSOCIATED( Matrix % BCols ) )       DEALLOCATE( Matrix % BCols )
+
      IF ( ASSOCIATED(Matrix % CMassValues) )  DEALLOCATE( Matrix % CMassValues )
      IF ( ASSOCIATED(Matrix % CDampValues) )  DEALLOCATE( Matrix % CDampValues )
 

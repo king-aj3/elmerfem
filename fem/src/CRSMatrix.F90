@@ -1451,6 +1451,7 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
     NULLIFY( A % ILUValues )
     NULLIFY( A % CILUValues )
+    NULLIFY( A % BRows, A % BCols, A % CValues )
 
     A % ndeg = ndeg
     A % NumberOfRows = n
@@ -2307,6 +2308,148 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
 !------------------------------------------------------------------------------
    END SUBROUTINE CRS_MergeMatrix
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Build (or refresh) a block CRS view of a complex matrix.
+!>
+!> A complex system is stored as 2N real rows of 2x2 blocks [Re -Im; Im Re],
+!> which is fourfold redundant: the even row is determined by the odd one and
+!> the column index is repeated four times per block. The odd row already IS
+!> the block row, so the structure costs nothing to derive --
+!>     block row i runs Rows(2*i-1) .. Rows(2*i)-1 in steps of two
+!>     block column   = (Cols(j)+1)/2
+!> and only the coefficients have to be gathered. CMPLX(V(j),-V(j+1)) recovers
+!> a rather than conj(a), since the odd row physically stores (Re,-Im).
+!>
+!> This is the same structure CRS_ComplexIncompleteLU derives for the ILU
+!> factors, which have been held in compact complex form all along. Aliasing
+!> BRows/BCols onto ILURows/ILUCols would save the structure arrays whenever
+!> the factorisation has no fill, but only ILU0 guarantees that: ILUT drops and
+!> adds, so an equal nonzero count would not prove an equal structure, and the
+!> matvec would then outlive an ILU rebuild pointing at freed memory. Own the
+!> arrays instead; they are the small part.
+!>
+!> The structure is built once and the values refreshed on every call, because
+!> assembly writes the scalar form, which stays canonical.
+!------------------------------------------------------------------------------
+  SUBROUTINE CRS_BuildBlockCRS( A )
+!------------------------------------------------------------------------------
+    TYPE(Matrix_t) :: A
+!------------------------------------------------------------------------------
+    INTEGER :: i,j,k,n,nb,istat
+!------------------------------------------------------------------------------
+    n  = A % NumberOfRows / 2
+    nb = ( A % Rows(A % NumberOfRows+1) - 1 ) / 4
+
+    IF( .NOT. ASSOCIATED( A % BCols ) ) THEN
+      ALLOCATE( A % BRows(n+1), A % BCols(nb), STAT=istat )
+      IF( istat /= 0 ) CALL Fatal('CRS_BuildBlockCRS', &
+          'Memory allocation error for block structure of size: '//I2S(nb))
+
+      k = 1
+      DO i=1,n
+        A % BRows(i) = k
+        DO j=A % Rows(2*i-1), A % Rows(2*i)-1, 2
+          A % BCols(k) = ( A % Cols(j) + 1 ) / 2
+          k = k + 1
+        END DO
+      END DO
+      A % BRows(n+1) = k
+
+      CALL Info('CRS_BuildBlockCRS','Block view: '//I2S(n)//' block rows, '// &
+          I2S(nb)//' blocks, from '//I2S(A % NumberOfRows)//' scalar rows and '// &
+          I2S(A % Rows(A % NumberOfRows+1)-1)//' scalar entries',Level=6)
+    END IF
+
+    IF( .NOT. ASSOCIATED( A % CValues ) ) THEN
+      ALLOCATE( A % CValues(nb), STAT=istat )
+      IF( istat /= 0 ) CALL Fatal('CRS_BuildBlockCRS', &
+          'Memory allocation error for block values of size: '//I2S(nb))
+    END IF
+
+    k = 1
+    DO i=1,n
+      DO j=A % Rows(2*i-1), A % Rows(2*i)-1, 2
+        A % CValues(k) = CMPLX( A % Values(j), -A % Values(j+1), KIND=dp )
+        k = k + 1
+      END DO
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE CRS_BuildBlockCRS
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Release the block CRS view, if one was built. The sparsity pattern may
+!> change between solves; this drops the view so it is rederived.
+!------------------------------------------------------------------------------
+  SUBROUTINE CRS_FreeBlockCRS( A )
+!------------------------------------------------------------------------------
+    TYPE(Matrix_t) :: A
+!------------------------------------------------------------------------------
+    IF( ASSOCIATED( A % BRows ) )   DEALLOCATE( A % BRows )
+    IF( ASSOCIATED( A % BCols ) )   DEALLOCATE( A % BCols )
+    IF( ASSOCIATED( A % CValues ) ) DEALLOCATE( A % CValues )
+    NULLIFY( A % BRows, A % BCols, A % CValues )
+!------------------------------------------------------------------------------
+  END SUBROUTINE CRS_FreeBlockCRS
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+!> Matrix vector product (v = Au) against the block CRS view. Same arithmetic
+!> as CRS_ComplexMatrixVectorMultiply, but reading one contiguous COMPLEX per
+!> block instead of two reals strided out of a fourfold redundant array, and
+!> one block column index instead of four scalar ones.
+!------------------------------------------------------------------------------
+  SUBROUTINE CRS_BlockComplexMatrixVectorMultiply( A,u,v )
+!------------------------------------------------------------------------------
+    COMPLEX(KIND=dp), DIMENSION(*), INTENT(IN) :: u   !< Vector to be multiplied
+    COMPLEX(KIND=dp), DIMENSION(*), INTENT(OUT) :: v  !< Result vector
+    TYPE(Matrix_t), INTENT(IN) :: A                   !< Structure holding matrix
+!------------------------------------------------------------------------------
+    INTEGER, POINTER :: BCols(:),BRows(:)
+    COMPLEX(KIND=dp), POINTER :: CValues(:)
+    INTEGER :: i,j,k,n
+    COMPLEX(KIND=dp) :: r1,r2,r3,r4
+!------------------------------------------------------------------------------
+    n = A % NumberOfRows / 2
+    BRows   => A % BRows
+    BCols   => A % BCols
+    CValues => A % CValues
+
+    ! The sum is split over four partial sums so that the products do not have
+    ! to wait on each other, exactly as the CASE DEFAULT branch of
+    ! CRS_ComplexMatrixVectorMultiply does. Matching its grouping is not just
+    ! for speed: summation order decides the rounding, and keeping the two the
+    ! same is what makes this product bit-for-bit identical to the scalar one.
+    ! k counts the blocks of the row, one complex entry each.
+    !
+    ! No ndeg-blocked variants here yet. They would pay off the same way as in
+    ! the scalar product -- for even ndeg > 2 the block columns of a step run
+    ! consecutively, so u(BCols(j)+1) etc. could replace the repeated BCols
+    ! loads -- but ndeg is 2 for an ordinary complex field, which lands here.
+!$omp parallel do private(j,k,r1,r2,r3,r4) schedule(guided)
+    DO i=1,n
+       r1 = 0.0_dp; r2 = 0.0_dp; r3 = 0.0_dp; r4 = 0.0_dp
+       k = BRows(i+1) - BRows(i)
+!DIR$ IVDEP
+       DO j=BRows(i),BRows(i)+4*(k/4)-1,4
+          r1 = r1 + CValues(j)   * u(BCols(j))
+          r2 = r2 + CValues(j+1) * u(BCols(j+1))
+          r3 = r3 + CValues(j+2) * u(BCols(j+2))
+          r4 = r4 + CValues(j+3) * u(BCols(j+3))
+       END DO
+       DO j=BRows(i)+4*(k/4),BRows(i+1)-1
+          r1 = r1 + CValues(j) * u(BCols(j))
+       END DO
+       v(i) = r1 + r2 + r3 + r4
+    END DO
+!$omp end parallel do
+!------------------------------------------------------------------------------
+  END SUBROUTINE CRS_BlockComplexMatrixVectorMultiply
 !------------------------------------------------------------------------------
 
 
@@ -5189,6 +5332,27 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
 
 !------------------------------------------------------------------------------
+!>    As CRS_ComplexMatrixVectorProd, but the untransposed product is taken
+!>    against the block CRS view. The transposed branch stays on the scalar
+!>    path: it is a scatter rather than a gather and gains nothing here.
+!------------------------------------------------------------------------------
+  SUBROUTINE CRS_BlockComplexMatrixVectorProd( u,v,ipar )
+!------------------------------------------------------------------------------
+    INTEGER, DIMENSION(*), INTENT(IN) :: ipar      !< Structure holding info HUTIter-iterative solver package
+    COMPLEX(KIND=dp), INTENT(IN) :: u(HUTI_NDIM)   !< vector to multiply u
+    COMPLEX(KIND=dp) :: v(HUTI_NDIM)               !< result vector
+!------------------------------------------------------------------------------
+    IF ( HUTI_EXTOP_MATTYPE == HUTI_MAT_NOTTRPSED ) THEN
+      CALL CRS_BlockComplexMatrixVectorMultiply( GlobalMatrix, u, v )
+    ELSE
+      CALL CRS_ComplexMatrixVectorProd( u, v, ipar )
+    END IF
+
+  END SUBROUTINE CRS_BlockComplexMatrixVectorProd
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Check the matrix for correctness.
 !------------------------------------------------------------------------------
   SUBROUTINE CRS_InspectMatrix( A )
@@ -5500,7 +5664,11 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
       DEALLOCATE(Cols0,Rows0)
       InitDone = .FALSE.
       
-      A % ndeg = -1 
+      A % ndeg = -1
+
+      ! Any block CRS view describes the old sparsity pattern and is now wrong.
+      CALL CRS_FreeBlockCRS( A )
+
       CALL Info('CRS_ChangeTopology','Matrix topology changed',Level=30)
     END IF
           
