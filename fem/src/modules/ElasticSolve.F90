@@ -364,6 +364,10 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! integration point lag stress it keeps its history in, and how many independent
   ! components that tensor has in this configuration.
   LOGICAL :: MaxwellMaterial, MaxwellHere
+  ! The prestressed eigen analyses: which of the two keywords is active, whether the
+  ! term is live on THIS pass (it is not on the static first one), and the sif's own
+  ! "Eigen Analysis" setting, which the two passes toggle between.
+  LOGICAL :: StabilityAnalysis, GeometricStiffness, GeometricActive, OrigEigenAnalysis
   ! "Gravitational Prestress Advection": whether this element's body force asks for
   ! the term, and the rho*g it is scaled by.
   LOGICAL :: GotGPA
@@ -1020,6 +1024,54 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   END IF
 
   !-----------------------------------------------------------------------------
+  ! GEOMETRIC STIFFNESS, and STABILITY ANALYSIS, which is the same term put in a
+  ! different matrix. Both are prestressed EIGENVALUE analyses and neither is a
+  ! constitutive matter: the term is
+  !
+  !   INT sigma_ij d(phi_p)/dx_i d(phi_q)/dx_j , diagonal in the components,
+  !
+  ! with sigma the stress of the state the structure is already in. So it takes
+  ! TWO passes and that is the whole of the orchestration: the first solves the
+  ! static problem with the eigen analysis switched OFF, and the second builds the
+  ! term from what the first found and solves the eigenproblem with it. Exactly as
+  ! StressSolve does it, including forcing both iteration bounds to two so the
+  ! convergence tests cannot stop after the static pass.
+  !
+  ! Where they differ is which matrix the term lands in, and that is what makes one
+  ! a vibration problem and the other a buckling problem:
+  !
+  ! - "Geometric Stiffness" adds it to the STIFFNESS, so the eigenvalues are
+  !   frequencies of a prestressed structure against the ordinary mass matrix;
+  ! - "Stability Analysis" puts MINUS it in the MASS slot INSTEAD of the density
+  !   mass, so the eigenvalues are the load multipliers at which the stiffness
+  !   loses definiteness -- the critical loads. This is why the density mass matrix
+  !   must not be assembled at all in that case.
+  !-----------------------------------------------------------------------------
+  StabilityAnalysis = ListGetLogical( SolverParams, 'Stability Analysis', GotIt )
+  GeometricStiffness = ListGetLogical( SolverParams, 'Geometric Stiffness', GotIt )
+
+  IF ( StabilityAnalysis .OR. GeometricStiffness ) THEN
+    IF ( StabilityAnalysis .AND. GeometricStiffness ) CALL Fatal( Caller, &
+        '"Stability Analysis" and "Geometric Stiffness" are the same term in '// &
+        'different matrices and cannot both be active' )
+    IF ( CoordinateSystem /= Cartesian ) CALL Fatal( Caller, &
+        'The geometric stiffness is implemented in cartesian coordinates only, as '// &
+        'in StressSolve' )
+    IF ( LargeDeflection ) CALL Fatal( Caller, &
+        'The geometric stiffness is already part of the tangent under '// &
+        '"Large Deflection", where it comes from the current iterate rather than '// &
+        'from a prestressed state. Set "Large Deflection = False" to ask for the '// &
+        'prestressed eigen analysis these keywords mean' )
+    IF ( UseUMAT .OR. NeoHookeanMaterial ) CALL Fatal( Caller, &
+        'The geometric stiffness is implemented by LocalMatrix, so not with UMAT '// &
+        'or the neo-Hookean model' )
+
+    NonlinearIter = 2
+    MinNonlinearIter = 2
+    OrigEigenAnalysis = ListGetLogical( SolverParams, 'Eigen Analysis', GotIt )
+  END IF
+
+  !-----------------------------------------------------------------------------
   ! STRESSSOLVE KEYWORDS THIS SOLVER DOES NOT IMPLEMENT, refused rather than
   ! ignored. The two solvers are being merged, so sifs will be pointed here that
   ! were written for there, and a keyword that is read and dropped looks exactly
@@ -1040,15 +1092,6 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   ! logical per element, and only a sif that does set one pays for the precise
   ! per-element test in the assembly loop, where it Fatals on the first element.
   !-----------------------------------------------------------------------------
-  IF ( ListCheckPresent( SolverParams, 'Stability Analysis' ) ) CALL Fatal( Caller, &
-      '"Stability Analysis" is not implemented here: it needs the geometric '// &
-      'stiffness as a mass matrix, which this solver does not build' )
-
-  IF ( ListCheckPresent( SolverParams, 'Geometric Stiffness' ) ) CALL Fatal( Caller, &
-      '"Geometric Stiffness" is not implemented here as a keyword. This solver '// &
-      'carries the geometric term through "Large Deflection" instead, where it is '// &
-      'part of the tangent rather than an addition to a small strain analysis' )
-
   ! Set anywhere in the model, in any material or body force? Then the assembly
   ! loop will test the lists this element actually uses. See the note above.
   StressOnlyKeywords = &
@@ -1199,6 +1242,18 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
   CALL DefaultStart()
 
   DO iter=1,NonlinearIter
+
+     ! The two passes of a prestressed eigen analysis. The first is a static solve
+     ! whose only purpose is the stress state, so the eigen analysis is switched off
+     ! for it and the geometric term is not yet there to add; the second has both.
+     ! The keyword is rewritten rather than a flag kept, because it is the core that
+     ! reads it when the system is solved.
+     GeometricActive = .FALSE.
+     IF ( StabilityAnalysis .OR. GeometricStiffness ) THEN
+       GeometricActive = ( iter > 1 )
+       CALL ListAddLogical( SolverParams, 'Eigen Analysis', &
+           GeometricActive .AND. OrigEigenAnalysis )
+     END IF
 
      at  = CPUTime()
      at0 = RealTime()
@@ -1566,7 +1621,8 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
                 LocalTemperature,CurrentElement,n,ntot,ElementNodes,LocalDisplacement, &
                 Isotropic, RotateModuli, TransformMatrix, LargeDeflection, &
                 NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
-                MaxwellHere, MaxwellViscosity, PrevLocalDisplacement, GotGPA, NodalGPA )
+                MaxwellHere, MaxwellViscosity, PrevLocalDisplacement, GotGPA, NodalGPA, &
+                GeometricActive, StabilityAnalysis )
           END IF
         END IF
 
@@ -3016,7 +3072,8 @@ CONTAINS
        AxialSymmetry,PlaneStress,NodalHeatExpansion, NodalTemperature, Element, n, ntot, &
        Nodes, LocalDisplacement, Isotropic, RotateModuli, TransformMatrix, &
        LargeDeflection, NodalStressLoad, NodalStrainLoad, LinearIncompressible, &
-       MaxwellHere, NodalViscosity, PrevLocalDispl, GotGPA, NodalGPA )
+       MaxwellHere, NodalViscosity, PrevLocalDispl, GotGPA, NodalGPA, &
+       GeometricActive, StabilityAnalysis )
 !------------------------------------------------------------------------------
 
     REAL(KIND=dp) :: StiffMatrix(:,:),MassMatrix(:,:),DampMatrix(:,:), &
@@ -3030,6 +3087,7 @@ CONTAINS
     LOGICAL :: AxialSymmetry,PlaneStress, Isotropic, RotateModuli, LargeDeflection
     LOGICAL :: LinearIncompressible
     LOGICAL :: MaxwellHere, GotGPA
+    LOGICAL :: GeometricActive, StabilityAnalysis
     REAL(KIND=dp) :: NodalViscosity(:), PrevLocalDispl(:,:), NodalGPA(:)
 
     TYPE(Element_t) :: Element
@@ -3067,6 +3125,10 @@ CONTAINS
     INTEGER :: VeBase, VeIdx, nIP
     ! rho*g at this point, for the gravitational prestress advection term.
     REAL(KIND=dp) :: GPAatIP
+    ! The stress the geometric stiffness is built from -- the constitutive response
+    ! of the current iterate, before any relaxation or affine offset, which is the
+    ! stress StressSolve's own separate LocalStress call for this term returns.
+    REAL(KIND=dp) :: GeomStress(3,3), InnerProd
 
     REAL(KIND=dp) :: dDefG(3,3),dStress1(3,3)
     REAL(KIND=dp) :: dDefGU(3,3),dStrainU(3,3),dStress2U(3,3),dStress1U(3,3)
@@ -3586,6 +3648,12 @@ CONTAINS
        ! available -- the history update below needs C : eps itself, and dividing it
        ! back out of a scaled stress would be both wasteful and inexact.
        !----------------------------------------------------------------------
+       ! The stress the geometric stiffness is built from: the constitutive response
+       ! at this iterate, taken before the relaxation below and before the affine
+       ! offset, which is what StressSolve's separate LocalStress call for this term
+       ! gives it.
+       GeomStress = Stress2
+
        IF ( MaxwellHere ) THEN
           ElasticStress = Stress2
           Stress2 = xPhi * Stress2
@@ -3800,15 +3868,54 @@ CONTAINS
 
        !      Integrate mass matrix:
        !      ----------------------
-       DO p = 1,ntot
-         DO q = 1,ntot
-           DO i = 1,cdim
-             MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
-                 = MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
-                 + Basis(p)*Basis(q)*Density*s
+       ! Not under stability analysis: there the mass slot carries the geometric
+       ! stiffness instead, and a density mass added to it would turn the buckling
+       ! eigenproblem into something that is neither buckling nor vibration.
+       IF ( .NOT. StabilityAnalysis ) THEN
+         DO p = 1,ntot
+           DO q = 1,ntot
+             DO i = 1,cdim
+               MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
+                   = MassMatrix(DOFs*(p-1)+i,DOFs*(q-1)+i) &
+                   + Basis(p)*Basis(q)*Density*s
+             END DO
            END DO
          END DO
-       END DO
+       END IF
+
+       !------------------------------------------------------------------------
+       ! THE GEOMETRIC STIFFNESS of the state this iterate is in:
+       !
+       !   INT sigma_ij d(phi_p)/dx_i d(phi_q)/dx_j
+       !
+       ! diagonal in the displacement components, since it is the work done by the
+       ! existing stress against the rotation of a fibre and that is the same for
+       ! each component. Live on the second pass only -- see the loop that switches
+       ! it on -- and into the stiffness or, negated, into the mass, which is what
+       ! separates a prestressed vibration problem from a buckling one.
+       !------------------------------------------------------------------------
+       IF ( GeometricActive ) THEN
+         DO p = 1,ntot
+           DO q = 1,ntot
+             InnerProd = 0.0d0
+             DO i = 1,dim
+               DO j = 1,dim
+                 InnerProd = InnerProd + dBasisdx(p,i)*dBasisdx(q,j)*GeomStress(i,j)
+               END DO
+             END DO
+
+             DO k = 1,cdim
+               IF ( StabilityAnalysis ) THEN
+                 MassMatrix(DOFs*(p-1)+k,DOFs*(q-1)+k) &
+                     = MassMatrix(DOFs*(p-1)+k,DOFs*(q-1)+k) - s * InnerProd
+               ELSE
+                 StiffMatrix(DOFs*(p-1)+k,DOFs*(q-1)+k) &
+                     = StiffMatrix(DOFs*(p-1)+k,DOFs*(q-1)+k) + s * InnerProd
+               END IF
+             END DO
+           END DO
+         END DO
+       END IF
 
        !      Utilize the nodal damping:
        !      -----------------------------
