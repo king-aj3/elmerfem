@@ -167,6 +167,15 @@ MODULE StressLocal
      REAL(KIND=dp) :: StressTensor(3,3), StrainTensor(3,3), ElasticStress(3,3), &
                       InnerProd, NodalViscosity(n)
      REAL(KIND=dp) :: StressLoad(6), StrainLoad(6), PreStress(6), PreStrain(6)
+     ! The viscoelastic lag stress load, kept apart from StressLoad rather than
+     ! written over it. The two are separate contributions to the same force term,
+     ! and while they shared one array a Maxwell material silently discarded
+     ! whatever "Stress Load" and "Strain Load" had put there: this routine set
+     ! StressLoad from those keywords and ViscoElasticLoad then overwrote it,
+     ! Tensor26Vector zeroing its output first. Nothing said a keyword was dropped,
+     ! and NeedPreStress was forced true immediately after, so the mechanism carried
+     ! on with the lag stress alone.
+     REAL(KIND=dp) :: VeLoad(6)
 
      INTEGER :: i,j,k,l,p,q,t,dim,NBasis
 
@@ -468,6 +477,8 @@ MODULE StressLocal
              NodalDisplacement,Basis,dBasisdx,Nodes,dim,n,ntot )
        END IF
 
+       StressLoad = 0.0d0
+       VeLoad = 0.0d0
        IF( NeedPreStress ) THEN
          DO i=1,6
            PreStrain(i) = SUM( NodalPreStrain(i,1:n)*Basis(1:n) )
@@ -532,7 +543,7 @@ MODULE StressLocal
                 SOL, Basis, dBasisdx, Nodes, dim, n, ntot, .FALSE. )
          END IF
 
-         xPhi = ViscoElasticLoad( ve_stress, t, ElasticStress, StressLoad )
+         xPhi = ViscoElasticLoad( ve_stress, t, ElasticStress, VeLoad )
          NeedPreStress = .TRUE.
        ELSE
          xPhi = 1
@@ -557,7 +568,7 @@ MODULE StressLocal
          IF( NeedPreStress ) THEN
            DO i=1,dim
              DO j=1,6
-               LoadAtIp(i) = LoadAtIp(i) + StressLoad(j) * G(i,j)
+               LoadAtIp(i) = LoadAtIp(i) + ( StressLoad(j) + VeLoad(j) ) * G(i,j)
              END DO
            END DO
          END IF
@@ -733,11 +744,11 @@ MODULE StressLocal
 CONTAINS
 
 !------------------------------------------------------------------------------
-   FUNCTION ViscoElasticLoad(ve_stress, ip, ElasticStress, StressLoad) RESULT(xPhi)
+   FUNCTION ViscoElasticLoad(ve_stress, ip, ElasticStress, LagLoad) RESULT(xPhi)
 !------------------------------------------------------------------------------
      TYPE(Variable_t) :: ve_stress
      INTEGER :: ip
-     REAL(KIND=dp) :: ElasticStress(3,3), StressLoad(6), xPhi
+     REAL(KIND=dp) :: ElasticStress(3,3), LagLoad(6), xPhi
 !------------------------------------------------------------------------------
      INTEGER :: i
      REAL(KIND=dp) :: D_new(3,3), PrevD(3,3), VeVec(6), Pres, Pres0, ShearModulus
@@ -761,7 +772,7 @@ CONTAINS
 
      ! RHS contribution from stored lag stress (no LocalStress call needed):
      StressTensor = xPhi * (PrevD - Pres0 * Ident)
-     CALL Tensor26Vector( StressTensor, StressLoad, dim, CSymmetry )
+     CALL Tensor26Vector( StressTensor, LagLoad, dim, CSymmetry )
 
      ! Update lag stress: d_new = (1-xPhi)*C:u + xPhi*(d_prev - p0*I) + p*I
      D_new = (1._dp - xPhi)*ElasticStress + xPhi*(PrevD - Pres0*Ident) + Pres*Ident
