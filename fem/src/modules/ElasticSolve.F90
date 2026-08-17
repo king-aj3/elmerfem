@@ -3756,9 +3756,19 @@ CONTAINS
              ! "STIFF = (STIFF + TRANSPOSE(STIFF))/2" -- and every other term it
              ! assembles is already symmetric, so the operator that reaches its
              ! linear solver contains only the symmetric half of this one. Assembling
-             ! the term as written instead moves the earth cases 2.6%. The sifs
-             ! concerned also declare "Linear System Symmetric", so a non-symmetric
-             ! operator would not survive their solver either.
+             ! the term as written instead moves the earth cases 2.6%, and their
+             ! published reference norms are the symmetric-half ones.
+             !
+             ! THIS TERM IS GENUINELY NOT SYMMETRIC, and whether the symmetric half
+             ! is the intended model is an OPEN QUESTION, not something this comment
+             ! settles: it couples the gradient of the VERTICAL displacement to every
+             ! test component, and its transpose is a different operator. Nothing in
+             ! the sifs that use it forces the choice either -- they solve with GCR
+             ! and do not declare "Linear System Symmetric", so they could carry a
+             ! non-symmetric operator as they stand. So this reproduces StressSolve
+             ! because the merger requires it to, and if the answer is that the full
+             ! term belongs in the system, both solvers change together and the earth
+             ! reference norms move with them.
              !--------------------------------------------------------------------
              IF ( GotGPA ) THEN
                 DO q = 1,ntot
