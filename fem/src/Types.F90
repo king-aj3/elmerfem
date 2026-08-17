@@ -134,6 +134,12 @@ MODULE Types
     INTEGER, ALLOCATABLE :: GRows(:), RowOwner(:)
     REAL(KIND=dp), ALLOCATABLE :: Values(:),MassValues(:), &
         DampValues(:),ILUValues(:),PrecValues(:)
+!   Block view of a complex interface matrix, as for Matrix_t: NumberOfRows/2
+!   block rows and one COMPLEX per 2x2 block. The local column index is folded
+!   in from IfLCols, and rows this rank owns and entries with no local column
+!   are dropped at build time, so the product needs no test at all.
+    INTEGER, ALLOCATABLE :: BRows(:), BCols(:)
+    COMPLEX(KIND=dp), ALLOCATABLE :: CValues(:)
   END TYPE BasicMatrix_t
 
 
