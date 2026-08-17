@@ -883,6 +883,17 @@ SUBROUTINE ElasticSolver( Model, Solver, dt, TransientSimulation )
       '"Maxwell material" is not implemented here: the viscoelastic law needs '// &
       'per-integration-point history' )
 
+  ! StressSolve's own mixed formulation for a nearly incompressible LINEAR material,
+  ! solving for a pressure alongside the displacement. This solver has a mixed
+  ! formulation, but only for the neo-Hookean law ("Mixed Formulation" plus
+  ! "Neo-Hookean Material"), so the keyword would otherwise be read and dropped and
+  ! a compressible answer returned in silence. Every sif that sets it is a Maxwell
+  ! one, so this refusal and the one above will fall together.
+  IF ( ListCheckPresent( SolverParams, 'Incompressible' ) ) CALL Fatal( Caller, &
+      '"Incompressible" is not implemented here: the mixed formulation of this '// &
+      'solver is the neo-Hookean one, "Mixed Formulation" with '// &
+      '"Neo-Hookean Material"' )
+
   ! Set anywhere in the model, in any material or body force? Then the assembly
   ! loop will test the lists this element actually uses. See the note above.
   StressOnlyKeywords = &
