@@ -517,6 +517,67 @@ END FUNCTION MaskedNorm
 !> 2) The internal MODULE IterativeMethods that includes some classic iterative
 !>    methods and also some more recent Krylov methods. 
 !------------------------------------------------------------------------------
+!------------------------------------------------------------------------------
+!> May the scalar 2N values of a complex matrix be released for the duration of a
+!> solve? Factored out of IterSolver so the test reads as one thing and each
+!> clause can carry the reason it is there.
+!>
+!> IT IS A WHITELIST, and deliberately so: the consumers reach the matrix through
+!> GlobalMatrix and cannot be enumerated by grep, so this admits only what has
+!> been checked by experiment rather than excluding what happened to be noticed.
+!> "Linear System Poison Scalar Values" is that experiment -- it fills the array
+!> with 1e300 over the same window and restores the exact bits after -- and every
+!> clause below traces to something it caught or confirmed.
+!------------------------------------------------------------------------------
+  FUNCTION FreeEligible( A, Params, PCondType, StopcProc, BlockCRS, &
+      PoisonVals, MatvecF, MatvecReadsNoValues ) RESULT( OK )
+!------------------------------------------------------------------------------
+    TYPE(Matrix_t) :: A
+    TYPE(ValueList_t), POINTER :: Params
+    INTEGER :: PCondType
+    INTEGER(KIND=AddrInt) :: StopcProc
+    LOGICAL :: BlockCRS, PoisonVals, OK
+    INTEGER(KIND=AddrInt), OPTIONAL :: MatvecF
+    LOGICAL, OPTIONAL :: MatvecReadsNoValues
+    LOGICAL :: Found
+!------------------------------------------------------------------------------
+    OK = BlockCRS .AND. .NOT. PoisonVals
+    IF( OK .AND. .NOT. ASSOCIATED( A % Values ) ) OK = .FALSE.
+
+    ! A caller-supplied product may read anything, so it has to say otherwise.
+    IF( OK .AND. PRESENT( MatvecF ) ) THEN
+      OK = .FALSE.
+      IF( PRESENT( MatvecReadsNoValues ) ) OK = MatvecReadsNoValues
+    END IF
+
+    ! The backward-error criteria read the coefficients directly, e.g.
+    ! SUM(GlobalMatrix % Values**2) in BackwardError.F90.
+    IF( OK ) OK = ( StopcProc == 0 )
+
+    ! Every preconditioner here reads the block view or the compact factors.
+    ! Anything else -- multigrid, Vanka, block, circuit, the auxiliary space
+    ! solver -- has not been probed and stays out.
+    IF( OK ) OK = ( PCondType == PRECOND_NONE .OR. &
+        PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT .OR. &
+        ( PCondType == PRECOND_DIAGONAL .AND. ASSOCIATED( A % BDiag ) ) )
+
+    ! ParallelUtils used to point InsideMatrix % Values at MassValues, and
+    ! DEALLOCATE on a pointer that was pointer-assigned is undefined. That idiom
+    ! is gone, but ASSOCIATED(a,b) is the one thing testable here, so test it.
+    IF( OK ) OK = &
+        .NOT. ASSOCIATED( A % Values, A % MassValues ) .AND. &
+        .NOT. ASSOCIATED( A % Values, A % DampValues ) .AND. &
+        .NOT. ASSOCIATED( A % Values, A % PrecValues ) .AND. &
+        .NOT. ASSOCIATED( A % Values, A % BulkValues ) .AND. &
+        .NOT. ASSOCIATED( A % Values, A % ILUValues )
+
+    IF( OK ) OK = ListGetLogical( Params, &
+        'Linear System Free Scalar Values', Found, DefValue = .TRUE. )
+!------------------------------------------------------------------------------
+  END FUNCTION FreeEligible
+!------------------------------------------------------------------------------
+
+
   RECURSIVE SUBROUTINE IterSolver( A,x,b,Solver,ndim,DotF, &
               NormF,MatvecF,PrecF,StopcF,MatvecReadsNoValues )
 !------------------------------------------------------------------------------
@@ -543,7 +604,7 @@ END FUNCTION MaskedNorm
 !   external stopfun
     REAL(KIND=dp), ALLOCATABLE :: work(:,:)
     INTEGER :: i,j,k,N,ipar(HUTI_IPAR_DFLTSIZE),wsize,istat,IterType,PCondType,ILUn,Blocks
-    LOGICAL :: PoisonVals, FreeVals
+    LOGICAL :: PoisonVals, FreeVals, ValsFreed
     INTEGER :: nScalarVals
     REAL(KIND=dp), ALLOCATABLE :: SaveVals(:)
     LOGICAL :: Internal, NullEdges
@@ -922,6 +983,26 @@ END FUNCTION MaskedNorm
     IF( BlockCRS ) BlockCRS = ListGetLogical( Params,'Linear System Block CRS', &
         Found, DefValue = .TRUE. )
     IF( BlockCRS ) CALL CRS_BuildBlockCRS( A )
+
+    ! PROBE. Poison the scalar values from here -- the moment the view exists --
+    ! through to the end of the iteration, and restore the exact bits after. The
+    ! window deliberately covers the PRECONDITIONER SETUP as well as the Krylov
+    ! loop, because that is where the next increment of peak memory is: the
+    ! factors are allocated while the matrix is still resident. Anything in
+    ! either phase that still reads A % Values turns the solve into Inf/NaN and
+    ! says so, which is how the release's eligibility list was arrived at and is
+    ! what any widening of it has to be justified with.
+    ValsFreed = .FALSE.
+    PoisonVals = .FALSE.
+    IF( BlockCRS ) PoisonVals = ListGetLogical( Params, &
+        'Linear System Poison Scalar Values', Found )
+    IF( PoisonVals ) THEN
+      ALLOCATE( SaveVals(SIZE(A % Values)) )
+      SaveVals = A % Values
+      A % Values = 1.0e300_dp
+      CALL Info('IterSolver', &
+          'PROBE: scalar values poisoned from the view onwards',Level=5)
+    END IF
 
     IF ( .NOT. PRESENT(PrecF) ) THEN
       str = ListGetString( Params, 'Linear System Preconditioning',gotit )
@@ -1446,44 +1527,23 @@ END FUNCTION MaskedNorm
       ! path, and DEALLOCATE on a pointer that was pointer-assigned rather than
       ! allocated is undefined. ASSOCIATED(a,b) is the one thing that can be
       ! tested here, so test it.
-      FreeVals = BlockCRS
-      IF( FreeVals .AND. PRESENT( MatvecF ) ) THEN
-        ! A caller-supplied product may read anything, so it has to say.
-        FreeVals = .FALSE.
-        IF( PRESENT( MatvecReadsNoValues ) ) FreeVals = MatvecReadsNoValues
-      END IF
-      IF( FreeVals ) FreeVals = ( StopcProc == 0 )
-      IF( FreeVals ) FreeVals = ( PCondType == PRECOND_NONE .OR. &
-          PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT .OR. &
-          ( PCondType == PRECOND_DIAGONAL .AND. ASSOCIATED( A % BDiag ) ) )
-      IF( FreeVals ) FreeVals = &
-          .NOT. ASSOCIATED( A % Values, A % MassValues ) .AND. &
-          .NOT. ASSOCIATED( A % Values, A % DampValues ) .AND. &
-          .NOT. ASSOCIATED( A % Values, A % PrecValues ) .AND. &
-          .NOT. ASSOCIATED( A % Values, A % BulkValues ) .AND. &
-          .NOT. ASSOCIATED( A % Values, A % ILUValues )
-      IF( FreeVals ) FreeVals = ListGetLogical( Params, &
-          'Linear System Free Scalar Values', Found, DefValue = .TRUE. )
-
-      PoisonVals = .FALSE.
-      IF( BlockCRS ) PoisonVals = ListGetLogical( Params, &
-          'Linear System Poison Scalar Values', Found )
-      IF( PoisonVals ) FreeVals = .FALSE.
-
-      IF( PoisonVals ) THEN
-        ALLOCATE( SaveVals(SIZE(A % Values)) )
-        SaveVals = A % Values
-        A % Values = 1.0e300_dp
-        CALL Info('IterSolver', &
-            'PROBE: scalar values poisoned across the iteration',Level=5)
-      END IF
-
-      IF( FreeVals ) THEN
-        nScalarVals = SIZE( A % Values )
-        DEALLOCATE( A % Values )
-        A % Values => NULL()
-        CALL Info('IterSolver','Released the scalar values across the iteration: '// &
-            I2S(nScalarVals)//' reals',Level=8)
+      ! Released for the iteration and not earlier, deliberately. Releasing before
+      ! the factorization instead was built and measured and gained NOTHING: the
+      ! peak of a run like this is set by mesh handling and assembly, well before
+      ! the solve, so all a release can do is clip the solve phase back under
+      ! that ceiling. Once it is under, freeing sooner or freeing more is
+      ! invisible. See section 7p of complex-storage-estimate.txt.
+      IF( .NOT. ValsFreed ) THEN
+        FreeVals = FreeEligible( A, Params, PCondType, StopcProc, &
+            BlockCRS, PoisonVals, MatvecF, MatvecReadsNoValues )
+        IF( FreeVals ) THEN
+          nScalarVals = SIZE( A % Values )
+          DEALLOCATE( A % Values )
+          A % Values => NULL()
+          ValsFreed = .TRUE.
+          CALL Info('IterSolver','Released the scalar values across the iteration: '// &
+              I2S(nScalarVals)//' reals',Level=8)
+        END IF
       END IF
 
       IF (LeftOriented) THEN
@@ -1494,9 +1554,10 @@ END FUNCTION MaskedNorm
             mvProc, pconddProc, pcondProc, dotProc, normProc, stopcProc )
       END IF
 
-      IF( FreeVals ) THEN
+      IF( ValsFreed ) THEN
         ALLOCATE( A % Values(nScalarVals) )
         CALL CRS_ExpandBlockCRS( A )
+        ValsFreed = .FALSE.
       END IF
 
       IF( PoisonVals ) THEN
