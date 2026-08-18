@@ -2689,6 +2689,33 @@ END SUBROUTINE SolveHutiter
   INTEGER, DIMENSION(*) :: ipar
   REAL(KIND=dp), DIMENSION(*) :: u, v
 
+  ! ipar is a vestige of the HUTI callback signature and is not read; the
+  ! matrix comes from GlobalData.
+  CALL SParMatrixVectorVals( u, v, .FALSE. )
+
+END SUBROUTINE SParMatrixVector
+!----------------------------------------------------------------------
+
+
+!----------------------------------------------------------------------
+!> The parallel product, against either the stiffness or the mass coefficients.
+!>
+!> UseMass selects which sibling array the coefficients come from. It used to be
+!> expressed by the caller writing MassValues over Values -- a deep copy for
+!> each interface block and a pointer swap for the inside matrix -- and putting
+!> it all back afterwards. Selecting here costs nothing and leaves the matrix
+!> alone, which also means A % Values is never pointer-assigned to a sibling and
+!> so is always owned by the matrix.
+!----------------------------------------------------------------------
+SUBROUTINE SParMatrixVectorVals( u,v,UseMass )
+!----------------------------------------------------------------------
+
+  IMPLICIT NONE
+
+  REAL(KIND=dp), DIMENSION(*) :: u, v
+  LOGICAL :: UseMass
+  REAL(KIND=dp), POINTER :: IfVals(:)
+
   INTEGER :: i, j, k, l, n, ni, nj, iseg, nneigh, ColInd, ierr
   TYPE(IfVecT),       POINTER :: IfV
   TYPE(IfLColsT),     POINTER :: IfL
@@ -2724,6 +2751,11 @@ END SUBROUTINE SolveHutiter
     IF ( CurrIf % NumberOfRows == 0 ) CYCLE
     IfV    => SP % IfVecs(i)
     IfL    => SP % IfLCols(i)
+    IF ( UseMass ) THEN
+      IfVals => CurrIf % MassValues
+    ELSE
+      IfVals => CurrIf % Values
+    END IF
 
     !$OMP PARALLEL PRIVATE(ColInd,j,k)
     !$OMP DO
@@ -2737,7 +2769,7 @@ END SUBROUTINE SolveHutiter
         DO k = CurrIf % Rows(j), CurrIf % Rows(j+1) - 1
           ColInd = IfL % IfVec(k)
           IF ( ColInd > 0 ) &
-            IfV % IfVec(j) = IfV % IfVec(j) + CurrIf % Values(k) * u(ColInd)
+            IfV % IfVec(j) = IfV % IfVec(j) + IfVals(k) * u(ColInd)
         END DO
       END IF
     END DO
@@ -2764,7 +2796,12 @@ END SUBROUTINE SolveHutiter
   END DO
 
   ! Local SpMV (overlaps with MPI). This defines v, it does not add to it.
-  CALL CRS_MatrixVectorMultiply( InsideMatrix, u, v )
+  IF ( UseMass ) THEN
+    CALL CRS_MatrixVectorMultiply( InsideMatrix, u, v, &
+        UseValues = InsideMatrix % MassValues )
+  ELSE
+    CALL CRS_MatrixVectorMultiply( InsideMatrix, u, v )
+  END IF
 
   ! Wait for receives and accumulate into v
   CALL Recv_LocIf_Wait( SP, n, v, nneigh, SP % MVNeigh, &
@@ -2773,7 +2810,7 @@ END SUBROUTINE SolveHutiter
   ! Release the send buffers for the next product
   CALL MPI_Waitall( nneigh, SP % MVSendRequests, MPI_STATUSES_IGNORE, ierr )
 
-END SUBROUTINE SParMatrixVector
+END SUBROUTINE SParMatrixVectorVals
 !----------------------------------------------------------------------
 
 
@@ -2790,6 +2827,26 @@ END SUBROUTINE SParMatrixVector
 
   INTEGER, DIMENSION(*) :: ipar
   REAL(KIND=dp), DIMENSION(*) :: u, v
+
+  ! ipar is not read; see SParMatrixVector.
+  CALL SParABSMatrixVectorVals( u, v, .FALSE. )
+
+END SUBROUTINE SParABSMatrixVector
+!----------------------------------------------------------------------
+
+
+!----------------------------------------------------------------------
+!> The parallel absolute-value product, against stiffness or mass
+!> coefficients; see SParMatrixVectorVals.
+!----------------------------------------------------------------------
+SUBROUTINE SParABSMatrixVectorVals( u,v,UseMass )
+!----------------------------------------------------------------------
+
+  IMPLICIT NONE
+
+  REAL(KIND=dp), DIMENSION(*) :: u, v
+  LOGICAL :: UseMass
+  REAL(KIND=dp), POINTER :: IfVals(:)
 
   INTEGER :: i, j, k, l, n, ni, nj, iseg, ColInd, nneigh, ierr
   TYPE(IfVecT),        POINTER :: IfV
@@ -2826,6 +2883,11 @@ END SUBROUTINE SParMatrixVector
     i = SP % MVNeigh(ni) + 1; CurrIf => SP % IfMatrix(i)
     IF ( CurrIf % NumberOfRows == 0 ) CYCLE
     IfV => SP % IfVecs(i); IfL => SP % IfLCols(i)
+    IF ( UseMass ) THEN
+      IfVals => CurrIf % MassValues
+    ELSE
+      IfVals => CurrIf % Values
+    END IF
     !$OMP PARALLEL PRIVATE(ColInd,j,k)
     !$OMP DO
     DO j = 1, CurrIf % NumberOfRows; IfV % IfVec(j) = 0.0_dp; END DO
@@ -2835,7 +2897,7 @@ END SUBROUTINE SParMatrixVector
       IF ( CurrIf % RowOwner(j) /= ParEnv % MyPE ) THEN
         DO k = CurrIf % Rows(j), CurrIf % Rows(j+1) - 1
           ColInd = IfL % IfVec(k)
-          IF ( ColInd > 0 ) IfV % IfVec(j) = IfV % IfVec(j) + ABS(CurrIf % Values(k)) * u(ColInd)
+          IF ( ColInd > 0 ) IfV % IfVec(j) = IfV % IfVec(j) + ABS(IfVals(k)) * u(ColInd)
         END DO
       END IF
     END DO
@@ -2860,10 +2922,14 @@ END SUBROUTINE SParMatrixVector
 
   Rows => InsideMatrix % Rows
   Cols => InsideMatrix % Cols
-  Vals => InsideMatrix % Values
+  IF ( UseMass ) THEN
+    Vals => InsideMatrix % MassValues
+  ELSE
+    Vals => InsideMatrix % Values
+  END IF
 
   IF ( C_ASSOCIATED(GlobalMatrix % MatvecSubr) ) THEN
-    ALLOCATE(Abs_Vals(SIZE(InsideMatrix % Values)))
+    ALLOCATE(Abs_Vals(SIZE(Vals)))
     Abs_Vals = ABS(Vals)
     CALL MatVecSubrExt(GlobalMatrix % MatVecSubr, &
         GlobalMatrix % SpMV, n,Rows,Cols,Abs_Vals,u,v,0)
@@ -2887,7 +2953,7 @@ END SUBROUTINE SParMatrixVector
   CALL MPI_Waitall( nneigh, SP % MVSendRequests, MPI_STATUSES_IGNORE, ierr )
 
 !----------------------------------------------------------------------
-END SUBROUTINE SParABSMatrixVector
+END SUBROUTINE SParABSMatrixVectorVals
 !----------------------------------------------------------------------
 
 

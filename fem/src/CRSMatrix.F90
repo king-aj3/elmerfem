@@ -1530,11 +1530,15 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 !------------------------------------------------------------------------------
 !>    Matrix vector product (v = Au) for a matrix given in CRS format.
 !------------------------------------------------------------------------------
-  SUBROUTINE CRS_MatrixVectorMultiply( A,u,v )
+  SUBROUTINE CRS_MatrixVectorMultiply( A,u,v,UseValues )
 !------------------------------------------------------------------------------
     REAL(KIND=dp), DIMENSION(*), INTENT(IN) :: u   !< Vector to be multiplied
     REAL(KIND=dp), DIMENSION(*), INTENT(OUT) :: v  !< Result vector
     TYPE(Matrix_t), INTENT(IN) :: A                !< Structure holding matrix
+    !> Coefficients to use in place of A % Values, sharing A's structure. Lets a
+    !> caller take the product against a sibling array -- the mass matrix, say --
+    !> without repointing A % Values at it and putting it back afterwards.
+    REAL(KIND=dp), DIMENSION(:), TARGET, OPTIONAL, INTENT(IN) :: UseValues
 !------------------------------------------------------------------------------
      INTEGER, POINTER  CONTIG :: Cols(:),Rows(:)
      REAL(KIND=dp), POINTER  CONTIG :: Values(:)
@@ -1560,6 +1564,7 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     Rows   => A % Rows
     Cols   => A % Cols
     Values => A % Values
+    IF( PRESENT( UseValues ) ) Values => UseValues
     
     IF  ( C_ASSOCIATED(A % MatvecSubr) ) THEN
       CALL MatVecSubrExt(A % MatVecSubr,A % SpMV, n,Rows,Cols,Values,u,v,0)
@@ -1884,11 +1889,13 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 !>  components. This special mv subroutine may be needed in connection with
 !>  certain stopping criteria for iterative linear solvers. 
 !------------------------------------------------------------------------------
-  SUBROUTINE CRS_ABSMatrixVectorMultiply( A,u,v )
+  SUBROUTINE CRS_ABSMatrixVectorMultiply( A,u,v,UseValues )
 !------------------------------------------------------------------------------
     REAL(KIND=dp), DIMENSION(*), INTENT(IN) :: u   !< The vector u
     REAL(KIND=dp), DIMENSION(*), INTENT(OUT) :: v  !< The result vector v
     TYPE(Matrix_t), INTENT(IN) :: A                !< The structure holding the matrix A
+    !> Coefficients to use in place of A % Values; see CRS_MatrixVectorMultiply.
+    REAL(KIND=dp), DIMENSION(:), TARGET, OPTIONAL, INTENT(IN) :: UseValues
 !------------------------------------------------------------------------------
     INTEGER, POINTER  CONTIG :: Cols(:),Rows(:)
     REAL(KIND=dp), POINTER  CONTIG :: Values(:), Abs_Values(:)
@@ -1902,6 +1909,7 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     Rows   => A % Rows
     Cols   => A % Cols
     Values => A % Values
+    IF( PRESENT( UseValues ) ) Values => UseValues
 
     IF  ( C_ASSOCIATED(A % MatvecSubr) ) THEN
       ALLOCATE(Abs_Values(SIZE(A % Values)))
