@@ -156,6 +156,7 @@ CONTAINS
      ! Block CRS view, if one was built alongside the scalar form
      IF ( ASSOCIATED( Matrix % BRows ) )       DEALLOCATE( Matrix % BRows )
      IF ( ASSOCIATED( Matrix % BCols ) )       DEALLOCATE( Matrix % BCols )
+     IF ( ASSOCIATED( Matrix % BDiag ) )       DEALLOCATE( Matrix % BDiag )
      IF ( ASSOCIATED( Matrix % CPrecValues ) ) DEALLOCATE( Matrix % CPrecValues )
 
      IF ( ASSOCIATED(Matrix % CMassValues) )  DEALLOCATE( Matrix % CMassValues )

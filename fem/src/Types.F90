@@ -314,7 +314,7 @@ MODULE Types
 !   PrecValues when it is present, so without this the view is bypassed exactly
 !   on the cases that have one -- which includes every VectorHelmholtz case
 !   carrying a damping coefficient.
-    INTEGER, POINTER :: BRows(:)=>NULL(), BCols(:)=>NULL()
+    INTEGER, POINTER :: BRows(:)=>NULL(), BCols(:)=>NULL(), BDiag(:)=>NULL()
     COMPLEX(KIND=dp), POINTER :: CPrecValues(:)=>NULL()
 
 ! For Flux Corrected Transport 

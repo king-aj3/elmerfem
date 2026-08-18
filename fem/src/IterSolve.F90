@@ -1418,8 +1418,14 @@ END FUNCTION MaskedNorm
       ! enumerated by grep (they reach the matrix through GlobalMatrix), so the
       ! rule admits only what has been checked rather than excluding what has
       ! been noticed. Known in-window readers that must keep the array:
-      !   CRS_ComplexDiagPrecondition   CRSMatrix.F90, reads Values every
-      !                                 iteration -- hence ILU/none only
+      !   CRS_ComplexDiagPrecondition   used to read Values every iteration and
+      !                                 excluded diagonal preconditioning
+      !                                 outright; it now takes the diagonal
+      !                                 block from the view, so it is admitted
+      !                                 whenever BDiag exists. Re-checked with
+      !                                 the poison probe below, which failed on
+      !                                 this case before the conversion and
+      !                                 passes after it.
       !   the backward-error stop criteria, e.g. SUM(GlobalMatrix % Values**2)
       !                                 in BackwardError.F90 -- hence StopcProc==0
       !   a caller-supplied product, which may do anything -- hence no MatvecF,
@@ -1437,7 +1443,8 @@ END FUNCTION MaskedNorm
       FreeVals = BlockCRS .AND. .NOT. PRESENT( MatvecF )
       IF( FreeVals ) FreeVals = ( StopcProc == 0 )
       IF( FreeVals ) FreeVals = ( PCondType == PRECOND_NONE .OR. &
-          PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT )
+          PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT .OR. &
+          ( PCondType == PRECOND_DIAGONAL .AND. ASSOCIATED( A % BDiag ) ) )
       IF( FreeVals ) FreeVals = &
           .NOT. ASSOCIATED( A % Values, A % MassValues ) .AND. &
           .NOT. ASSOCIATED( A % Values, A % DampValues ) .AND. &

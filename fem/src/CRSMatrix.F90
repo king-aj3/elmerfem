@@ -1451,7 +1451,7 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
     NULLIFY( A % ILUValues )
     NULLIFY( A % CILUValues )
-    NULLIFY( A % BRows, A % BCols, A % CValues, A % CPrecValues )
+    NULLIFY( A % BRows, A % BCols, A % BDiag, A % CValues, A % CPrecValues )
 
     A % ndeg = ndeg
     A % NumberOfRows = n
@@ -2352,19 +2352,35 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     nb = ( A % Rows(A % NumberOfRows+1) - 1 ) / 4
 
     IF( .NOT. ASSOCIATED( A % BCols ) ) THEN
-      ALLOCATE( A % BRows(n+1), A % BCols(nb), STAT=istat )
+      ALLOCATE( A % BRows(n+1), A % BCols(nb), A % BDiag(n), STAT=istat )
       IF( istat /= 0 ) CALL Fatal('CRS_BuildBlockCRS', &
           'Memory allocation error for block structure of size: '//I2S(nb))
 
+      ! BDiag(i) locates the diagonal block of block row i, the counterpart of
+      ! Diag for the scalar form. Noted here rather than searched for later: the
+      ! complex diagonal preconditioner wants exactly this, once per iteration.
+      A % BDiag = 0
       k = 1
       DO i=1,n
         A % BRows(i) = k
         DO j=A % Rows(2*i-1), A % Rows(2*i)-1, 2
           A % BCols(k) = ( A % Cols(j) + 1 ) / 2
+          IF( A % BCols(k) == i ) A % BDiag(i) = k
           k = k + 1
         END DO
       END DO
       A % BRows(n+1) = k
+
+      ! A block row with no diagonal block leaves BDiag at zero, and a consumer
+      ! indexing CValues(0) would read rubbish rather than fail. Drop the whole
+      ! array in that case so consumers fall back to the scalar diagonal, which
+      ! is no worse off than it was before the view existed.
+      IF( ANY( A % BDiag(1:n) == 0 ) ) THEN
+        CALL Info('CRS_BuildBlockCRS', &
+            'Some block row has no diagonal block; no block diagonal offered',Level=6)
+        DEALLOCATE( A % BDiag )
+        NULLIFY( A % BDiag )
+      END IF
 
       CALL Info('CRS_BuildBlockCRS','Block view: '//I2S(n)//' block rows, '// &
           I2S(nb)//' blocks, from '//I2S(A % NumberOfRows)//' scalar rows and '// &
@@ -2461,9 +2477,10 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 !------------------------------------------------------------------------------
     IF( ASSOCIATED( A % BRows ) )   DEALLOCATE( A % BRows )
     IF( ASSOCIATED( A % BCols ) )   DEALLOCATE( A % BCols )
+    IF( ASSOCIATED( A % BDiag ) )   DEALLOCATE( A % BDiag )
     IF( ASSOCIATED( A % CValues ) ) DEALLOCATE( A % CValues )
     IF( ASSOCIATED( A % CPrecValues ) ) DEALLOCATE( A % CPrecValues )
-    NULLIFY( A % BRows, A % BCols, A % CValues, A % CPrecValues )
+    NULLIFY( A % BRows, A % BCols, A % BDiag, A % CValues, A % CPrecValues )
 !------------------------------------------------------------------------------
   END SUBROUTINE CRS_FreeBlockCRS
 !------------------------------------------------------------------------------
@@ -2834,12 +2851,31 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
        GlobalMatrix % Ordered = .TRUE.
     END IF
 
-    !$OMP PARALLEL DO PRIVATE(A)
-    DO i=1,n/2
-       A = CMPLX( Values(Diag(2*i-1)), -Values(Diag(2*i-1)+1), KIND=dp )
-       u(i) = v(i) / A
-    END DO
-    !$OMP END PARALLEL DO
+    ! Take the diagonal block straight from the view when there is one. This is
+    ! the only preconditioner that reads the coefficients on EVERY iteration, so
+    ! it is also the only one where the compact read is worth anything in time
+    ! rather than only in what the scalar form is still needed for.
+    !
+    ! Note the sort above: it reorders Cols and Values, which would leave a view
+    ! built earlier misaligned. It is dead in practice -- SParIterSolver sorts
+    ! InsideMatrix during setup and CRS_SortMatrix marks it Ordered, so by the
+    ! time IterSolver derives the view the branch is never taken -- but anything
+    ! that reordered a matrix under a live view would corrupt it silently.
+    IF( ASSOCIATED( GlobalMatrix % BDiag ) .AND. &
+        ASSOCIATED( GlobalMatrix % CValues ) ) THEN
+      !$OMP PARALLEL DO
+      DO i=1,n/2
+         u(i) = v(i) / GlobalMatrix % CValues( GlobalMatrix % BDiag(i) )
+      END DO
+      !$OMP END PARALLEL DO
+    ELSE
+      !$OMP PARALLEL DO PRIVATE(A)
+      DO i=1,n/2
+         A = CMPLX( Values(Diag(2*i-1)), -Values(Diag(2*i-1)+1), KIND=dp )
+         u(i) = v(i) / A
+      END DO
+      !$OMP END PARALLEL DO
+    END IF
 !------------------------------------------------------------------------------
   END SUBROUTINE CRS_ComplexDiagPrecondition
 !------------------------------------------------------------------------------
