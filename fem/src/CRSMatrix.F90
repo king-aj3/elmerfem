@@ -1451,7 +1451,7 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
     NULLIFY( A % ILUValues )
     NULLIFY( A % CILUValues )
-    NULLIFY( A % BRows, A % BCols, A % CValues )
+    NULLIFY( A % BRows, A % BCols, A % CValues, A % CPrecValues )
 
     A % ndeg = ndeg
     A % NumberOfRows = n
@@ -2384,6 +2384,27 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
         k = k + 1
       END DO
     END DO
+
+    ! A separate preconditioning matrix shares this structure, so view it too --
+    ! it is what the complex ILU factorizes whenever it exists.
+    IF( ASSOCIATED( A % PrecValues ) ) THEN
+      IF( .NOT. ASSOCIATED( A % CPrecValues ) ) THEN
+        ALLOCATE( A % CPrecValues(nb), STAT=istat )
+        IF( istat /= 0 ) CALL Fatal('CRS_BuildBlockCRS', &
+            'Memory allocation error for block prec values of size: '//I2S(nb))
+        CALL Info('CRS_BuildBlockCRS', &
+            'Block view of the preconditioning matrix too',Level=6)
+      END IF
+
+      k = 1
+      DO i=1,n
+        DO j=A % Rows(2*i-1), A % Rows(2*i)-1, 2
+          A % CPrecValues(k) = CMPLX( A % PrecValues(j), &
+              -A % PrecValues(j+1), KIND=dp )
+          k = k + 1
+        END DO
+      END DO
+    END IF
 !------------------------------------------------------------------------------
   END SUBROUTINE CRS_BuildBlockCRS
 !------------------------------------------------------------------------------
@@ -2441,7 +2462,8 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
     IF( ASSOCIATED( A % BRows ) )   DEALLOCATE( A % BRows )
     IF( ASSOCIATED( A % BCols ) )   DEALLOCATE( A % BCols )
     IF( ASSOCIATED( A % CValues ) ) DEALLOCATE( A % CValues )
-    NULLIFY( A % BRows, A % BCols, A % CValues )
+    IF( ASSOCIATED( A % CPrecValues ) ) DEALLOCATE( A % CPrecValues )
+    NULLIFY( A % BRows, A % BCols, A % CValues, A % CPrecValues )
 !------------------------------------------------------------------------------
   END SUBROUTINE CRS_FreeBlockCRS
 !------------------------------------------------------------------------------
@@ -4319,15 +4341,21 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
       Values => A % Values
     END IF
 
-    ! The block view mirrors A % Values, so it may only stand in for the scalar
-    ! read when that is what is being factorized. Factorizing PrecValues has to
-    ! keep the scalar path.
-    UseBlock = ASSOCIATED( A % BCols ) .AND. ASSOCIATED( A % CValues ) .AND. &
-        .NOT. ASSOCIATED( A % PrecValues )
+    ! Read the rows from whichever view mirrors the array being factorized. The
+    ! two share BRows and BCols; only the coefficients differ.
+    UseBlock = ASSOCIATED( A % BCols )
+    IF( UseBlock ) THEN
+      IF( ASSOCIATED( A % PrecValues ) ) THEN
+        UseBlock = ASSOCIATED( A % CPrecValues )
+        IF( UseBlock ) CValues => A % CPrecValues
+      ELSE
+        UseBlock = ASSOCIATED( A % CValues )
+        IF( UseBlock ) CValues => A % CValues
+      END IF
+    END IF
     IF( UseBlock ) THEN
       BRows   => A % BRows
       BCols   => A % BCols
-      CValues => A % CValues
       CALL Info( 'CRS_ComplexIncompleteLU', 'Reading rows from the block view', Level=20 )
     END IF
 
