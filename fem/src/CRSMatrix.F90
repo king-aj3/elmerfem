@@ -2382,6 +2382,47 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 
 
 !------------------------------------------------------------------------------
+!> Rebuild the scalar 2N values of a complex matrix from its block view, i.e.
+!> the exact inverse of the value pass of CRS_BuildBlockCRS. Block row i owns
+!> scalar rows 2i-1 and 2i, holding (x,-y) and (y,x) for a coefficient x+iy, so
+!> nothing here rounds -- component extraction and negation are exact -- and the
+!> array comes back with the bits it had before it was released.
+!>
+!> A % Values must already be allocated to its original length. The structure
+!> arrays are untouched throughout, so they are still the ones the view was
+!> derived from.
+!------------------------------------------------------------------------------
+  SUBROUTINE CRS_ExpandBlockCRS( A )
+!------------------------------------------------------------------------------
+    TYPE(Matrix_t) :: A
+!------------------------------------------------------------------------------
+    INTEGER :: i,k,n,t,nj,o,e
+!------------------------------------------------------------------------------
+    IF( .NOT. ASSOCIATED( A % CValues ) .OR. .NOT. ASSOCIATED( A % BRows ) ) THEN
+      CALL Fatal('CRS_ExpandBlockCRS','No block view to expand from')
+    END IF
+
+    n = A % NumberOfRows / 2
+
+    k = 1
+    DO i=1,n
+      o  = A % Rows(2*i-1)
+      e  = A % Rows(2*i)
+      nj = e - o
+      DO t=0,nj-1,2
+        A % Values(o+t)   =  REAL(  A % CValues(k), KIND=dp )
+        A % Values(o+t+1) = -AIMAG( A % CValues(k) )
+        A % Values(e+t)   =  AIMAG( A % CValues(k) )
+        A % Values(e+t+1) =  REAL(  A % CValues(k), KIND=dp )
+        k = k + 1
+      END DO
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE CRS_ExpandBlockCRS
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
 !> Release the block CRS view, if one was built. The sparsity pattern may
 !> change between solves; this drops the view so it is rederived.
 !------------------------------------------------------------------------------

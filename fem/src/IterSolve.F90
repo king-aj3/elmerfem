@@ -539,6 +539,9 @@ END FUNCTION MaskedNorm
 !   external stopfun
     REAL(KIND=dp), ALLOCATABLE :: work(:,:)
     INTEGER :: i,j,k,N,ipar(HUTI_IPAR_DFLTSIZE),wsize,istat,IterType,PCondType,ILUn,Blocks
+    LOGICAL :: PoisonVals, FreeVals
+    INTEGER :: nScalarVals
+    REAL(KIND=dp), ALLOCATABLE :: SaveVals(:)
     LOGICAL :: Internal, NullEdges
     LOGICAL :: ComponentwiseStopC, NormwiseStopC, RowEquilibration
     LOGICAL :: Condition,GotIt, Refactorize,Found,GotDiagFactor,Robust
@@ -1404,12 +1407,83 @@ END FUNCTION MaskedNorm
 
       CALL Info('IterSolver','Calling complex iterative solver',Level=32)
 
+      ! Release the scalar values across the iteration. Once the block view
+      ! carries the product and the ILU factors are built, nothing in the Krylov
+      ! loop reads A % Values -- and that array is two thirds of the matrix,
+      ! dropped exactly where the footprint peaks, with factors, matrix and
+      ! Krylov work vectors all resident at once. It is rebuilt from the view on
+      ! the way out, exactly, so nothing downstream can tell.
+      !
+      ! ELIGIBILITY IS A WHITELIST, and deliberately so: the readers cannot be
+      ! enumerated by grep (they reach the matrix through GlobalMatrix), so the
+      ! rule admits only what has been checked rather than excluding what has
+      ! been noticed. Known in-window readers that must keep the array:
+      !   CRS_ComplexDiagPrecondition   CRSMatrix.F90, reads Values every
+      !                                 iteration -- hence ILU/none only
+      !   the backward-error stop criteria, e.g. SUM(GlobalMatrix % Values**2)
+      !                                 in BackwardError.F90 -- hence StopcProc==0
+      !   a caller-supplied product, which may do anything -- hence no MatvecF,
+      !                                 which also keeps the parallel path out
+      !                                 until its reads have been checked too
+      ! Established by poisoning the array and watching what breaks, not by
+      ! reading: "Linear System Poison Scalar Values" below is that probe, kept
+      ! because it is what any widening of this list has to be justified with.
+      !
+      ! The aliasing guard is not decoration. ParallelUtils points
+      ! InsideMatrix % Values at InsideMatrix % MassValues for part of the eigen
+      ! path, and DEALLOCATE on a pointer that was pointer-assigned rather than
+      ! allocated is undefined. ASSOCIATED(a,b) is the one thing that can be
+      ! tested here, so test it.
+      FreeVals = BlockCRS .AND. .NOT. PRESENT( MatvecF )
+      IF( FreeVals ) FreeVals = ( StopcProc == 0 )
+      IF( FreeVals ) FreeVals = ( PCondType == PRECOND_NONE .OR. &
+          PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT )
+      IF( FreeVals ) FreeVals = &
+          .NOT. ASSOCIATED( A % Values, A % MassValues ) .AND. &
+          .NOT. ASSOCIATED( A % Values, A % DampValues ) .AND. &
+          .NOT. ASSOCIATED( A % Values, A % PrecValues ) .AND. &
+          .NOT. ASSOCIATED( A % Values, A % BulkValues ) .AND. &
+          .NOT. ASSOCIATED( A % Values, A % ILUValues )
+      IF( FreeVals ) FreeVals = ListGetLogical( Params, &
+          'Linear System Free Scalar Values', Found, DefValue = .TRUE. )
+
+      PoisonVals = .FALSE.
+      IF( BlockCRS ) PoisonVals = ListGetLogical( Params, &
+          'Linear System Poison Scalar Values', Found )
+      IF( PoisonVals ) FreeVals = .FALSE.
+
+      IF( PoisonVals ) THEN
+        ALLOCATE( SaveVals(SIZE(A % Values)) )
+        SaveVals = A % Values
+        A % Values = 1.0e300_dp
+        CALL Info('IterSolver', &
+            'PROBE: scalar values poisoned across the iteration',Level=5)
+      END IF
+
+      IF( FreeVals ) THEN
+        nScalarVals = SIZE( A % Values )
+        DEALLOCATE( A % Values )
+        A % Values => NULL()
+        CALL Info('IterSolver','Released the scalar values across the iteration: '// &
+            I2S(nScalarVals)//' reals',Level=8)
+      END IF
+
       IF (LeftOriented) THEN
         CALL IterCall( iterProc, xC, bC, ipar, dpar, workC, &
             mvProc, pcondProc, pconddProc, dotProc, normProc, stopcProc )
       ELSE
         CALL IterCall( iterProc, xC, bC, ipar, dpar, workC, &
             mvProc, pconddProc, pcondProc, dotProc, normProc, stopcProc )
+      END IF
+
+      IF( FreeVals ) THEN
+        ALLOCATE( A % Values(nScalarVals) )
+        CALL CRS_ExpandBlockCRS( A )
+      END IF
+
+      IF( PoisonVals ) THEN
+        A % Values = SaveVals
+        DEALLOCATE( SaveVals )
       END IF
 
       ! No copy-back needed: xC aliases x.
