@@ -3437,7 +3437,7 @@ SUBROUTINE GlueFinalize( SourceMatrix, SplittedMatrix, ParallelInfo )
   INTEGER :: i, j, k, l, RowInd, Rows, ColInd, ColIndA, lstart, lstop
   TYPE (BasicMatrix_t), DIMENSION(:), ALLOCATABLE :: RecvdIfMatrix
 
-  LOGICAL :: Found, NeedMass, NeedDamp, NeedPrec, NeedILU
+  LOGICAL :: Found, NeedMass, NeedDamp, NeedPrec, NeedILU, Cplx
 
   !*******************************************************************
 
@@ -3463,8 +3463,19 @@ SUBROUTINE GlueFinalize( SourceMatrix, SplittedMatrix, ParallelInfo )
   ALLOCATE( RecvdIfMatrix(ParEnv % PEs) )
   RecvdIfMatrix(:) % NumberOfRows = 0
 
+  ! Half of a complex interface block is derivable from the other half, so
+  ! offer the exchange the chance to send odd rows only. This is a hint and not
+  ! an assertion: ExchangeIfValues checks the form of each block itself and
+  ! falls back to the whole one per neighbour. The keyword exists to measure
+  ! against, the saving being once per solve rather than per iteration.
+  Cplx = SourceMatrix % COMPLEX
+  IF ( Cplx .AND. ASSOCIATED(SourceMatrix % Solver) ) THEN
+    Cplx = ListGetLogical( SourceMatrix % Solver % Values, &
+        'Linear System Halve Interface Exchange', Found, DefValue = .TRUE. )
+  END IF
+
   CALL ExchangeIfValues(SplittedMatrix % NbsIfMatrix, &
-     RecvdIfMatrix, NeedMass, NeedDamp, NeedPrec, NeedILU )
+     RecvdIfMatrix, NeedMass, NeedDamp, NeedPrec, NeedILU, Cplx )
 
   !----------------------------------------------------------------------
   !
