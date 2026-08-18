@@ -4957,6 +4957,9 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
       LOGICAL :: C(n)
       COMPLEX(KIND=dp) :: S(n)
       REAL(KIND=dp), ALLOCATABLE :: RowNorms(:)
+      INTEGER, POINTER CONTIG :: BRows(:), BCols(:)
+      COMPLEX(KIND=dp), POINTER CONTIG :: CValues(:)
+      LOGICAL :: UseBlock
 !------------------------------------------------------------------------------
 
       Diag => A % Diag
@@ -4966,6 +4969,25 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
         Values => A % PrecValues
       ELSE
         Values => A % Values
+      END IF
+
+      ! Read the rows from the block view mirroring whatever is being
+      ! factorized, as CRS_ComplexIncompleteLU does. Both views share BRows and
+      ! BCols; only the coefficients differ.
+      UseBlock = ASSOCIATED( A % BCols )
+      IF( UseBlock ) THEN
+        IF( ASSOCIATED( A % PrecValues ) ) THEN
+          UseBlock = ASSOCIATED( A % CPrecValues )
+          IF( UseBlock ) CValues => A % CPrecValues
+        ELSE
+          UseBlock = ASSOCIATED( A % CValues )
+          IF( UseBlock ) CValues => A % CValues
+        END IF
+      END IF
+      IF( UseBlock ) THEN
+        BRows => A % BRows
+        BCols => A % BCols
+        CALL Info( 'CRS_ComplexILUT','Reading rows from the block view', Level=20 )
       END IF
 
       ALLOCATE( A % ILURows(n+1),A % ILUDiag(n),STAT=istat )
@@ -4982,9 +5004,18 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
       END IF
 !     Precompute row norms for drop tolerance
       ALLOCATE( RowNorms(n) )
+      ! The block form of the odd scalar row is (x1,-y1,x2,-y2,...), so building
+      ! that sequence back and handing it to the same intrinsic keeps the norm
+      ! bit-identical. It matters: RowNorms sets the drop tolerance, so a
+      ! last-bit difference would silently change which entries ILUT keeps.
       !$OMP PARALLEL DO
       DO i=1,n
-        RowNorms(i) = NORM2( Values(Rows(2*i-1):Rows(2*i)-1) )
+        IF( UseBlock ) THEN
+          RowNorms(i) = NORM2( [ ( REAL(CValues(k),KIND=dp), &
+              -AIMAG(CValues(k)), k=BRows(i),BRows(i+1)-1 ) ] )
+        ELSE
+          RowNorms(i) = NORM2( Values(Rows(2*i-1):Rows(2*i)-1) )
+        END IF
       END DO
       !$OMP END PARALLEL DO
 
@@ -5000,16 +5031,28 @@ SUBROUTINE CRS_RowSumInfo( A, Values )
 !        Convert the current row to full form for speed,
 !        only flagging the nonzero entries:
 !        -----------------------------------------------
-         DO k=Rows(2*i-1), Rows(2*i)-1,2
-            C((Cols(k)+1) / 2) = .TRUE.
-            S((Cols(k)+1) / 2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
-         END DO
+         IF( UseBlock ) THEN
+            DO k=BRows(i), BRows(i+1)-1
+               C(BCols(k)) = .TRUE.
+               S(BCols(k)) = CValues(k)
+            END DO
+         ELSE
+            DO k=Rows(2*i-1), Rows(2*i)-1,2
+               C((Cols(k)+1) / 2) = .TRUE.
+               S((Cols(k)+1) / 2) = CMPLX( Values(k), -Values(k+1), KIND=dp )
+            END DO
+         END IF
 !
 !        Check bandwidth for speed, bandwidth optimization
 !        helps here A LOT, use it!
 !        -------------------------------------------------
-         RowMin = (Cols(Rows(2*i-1)) + 1) / 2
-         RowMax = (Cols(Rows(2*i)-1) + 1) / 2
+         IF( UseBlock ) THEN
+            RowMin = BCols(BRows(i))
+            RowMax = BCols(BRows(i+1)-1)
+         ELSE
+            RowMin = (Cols(Rows(2*i-1)) + 1) / 2
+            RowMax = (Cols(Rows(2*i)-1) + 1) / 2
+         END IF
 !
 !        Here is the factorization part for the current row:
 !        ---------------------------------------------------
