@@ -518,7 +518,7 @@ END FUNCTION MaskedNorm
 !>    methods and also some more recent Krylov methods. 
 !------------------------------------------------------------------------------
   RECURSIVE SUBROUTINE IterSolver( A,x,b,Solver,ndim,DotF, &
-              NormF,MatvecF,PrecF,StopcF )
+              NormF,MatvecF,PrecF,StopcF,MatvecReadsNoValues )
 !------------------------------------------------------------------------------
     USE huti_sfe
     USE ListMatrix
@@ -530,6 +530,10 @@ END FUNCTION MaskedNorm
     TYPE(Solver_t) :: Solver
     REAL(KIND=dp), DIMENSION(:), TARGET CONTIG :: x,b
     TYPE(Matrix_t), TARGET :: A
+    !> Set by a caller supplying MatvecF to assert that its product does not
+    !> read A % Values. Only the caller can know this, and it decides whether
+    !> the scalar values may be released across the iteration.
+    LOGICAL, OPTIONAL :: MatvecReadsNoValues
     INTEGER, OPTIONAL :: ndim
     INTEGER(KIND=AddrInt), OPTIONAL :: DotF, NormF, MatVecF, PrecF, StopcF
 !------------------------------------------------------------------------------
@@ -1428,9 +1432,11 @@ END FUNCTION MaskedNorm
       !                                 passes after it.
       !   the backward-error stop criteria, e.g. SUM(GlobalMatrix % Values**2)
       !                                 in BackwardError.F90 -- hence StopcProc==0
-      !   a caller-supplied product, which may do anything -- hence no MatvecF,
-      !                                 which also keeps the parallel path out
-      !                                 until its reads have been checked too
+      !   a caller-supplied product, which may read anything, so it has to
+      !                                 assert otherwise through
+      !                                 MatvecReadsNoValues. SParCMatrixVector
+      !                                 does, on the strength of the poison
+      !                                 probe run at np4.
       ! Established by poisoning the array and watching what breaks, not by
       ! reading: "Linear System Poison Scalar Values" below is that probe, kept
       ! because it is what any widening of this list has to be justified with.
@@ -1440,7 +1446,12 @@ END FUNCTION MaskedNorm
       ! path, and DEALLOCATE on a pointer that was pointer-assigned rather than
       ! allocated is undefined. ASSOCIATED(a,b) is the one thing that can be
       ! tested here, so test it.
-      FreeVals = BlockCRS .AND. .NOT. PRESENT( MatvecF )
+      FreeVals = BlockCRS
+      IF( FreeVals .AND. PRESENT( MatvecF ) ) THEN
+        ! A caller-supplied product may read anything, so it has to say.
+        FreeVals = .FALSE.
+        IF( PRESENT( MatvecReadsNoValues ) ) FreeVals = MatvecReadsNoValues
+      END IF
       IF( FreeVals ) FreeVals = ( StopcProc == 0 )
       IF( FreeVals ) FreeVals = ( PCondType == PRECOND_NONE .OR. &
           PCondType == PRECOND_ILUn .OR. PCondType == PRECOND_ILUT .OR. &

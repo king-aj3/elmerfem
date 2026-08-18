@@ -2620,9 +2620,14 @@ SUBROUTINE SolveHutiter( SourceMatrix, SplittedMatrix, ParallelInfo, &
      IF ( ListGetLogical( Solver % Values,'Linear System Block CRS', GotIt, &
          DefValue = .TRUE. ) ) CALL SParCBuildIfBlocks( SplittedMatrix )
 
+     ! SParCMatrixVector takes the local half against the block view and the
+     ! interface half against the interface blocks' own arrays, so it never
+     ! reads InsideMatrix % Values. Verified by poisoning that array across the
+     ! iteration at np4 and getting bit-identical norms, not by reading the
+     ! code. That lets IterSolver release it here as it does in serial.
      CALL IterSolver( SplittedMatrix % InsideMatrix, TmpXVec, &
        TmpRHSVec, Solver, DotF=AddrFunc(SParCDotProd), NormF=AddrFunc(SParCNorm), &
-         MatVecF=AddrFunc(SParCMatrixVector) )
+         MatVecF=AddrFunc(SParCMatrixVector), MatvecReadsNoValues = .TRUE. )
   END IF
 
   IF (ASSOCIATED(CM)) THEN
